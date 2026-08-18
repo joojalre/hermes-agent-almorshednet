@@ -21024,7 +21024,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sid:
             return None, None
         max_turns = self._goal_max_turns_from_config()
-        return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
+        manager = await asyncio.to_thread(
+            GoalManager,
+            session_id=sid,
+            default_max_turns=max_turns,
+        )
+        return manager, session_entry
 
     async def _get_heartbeat_manager_for_event(self, event: "MessageEvent"):
         """Return a HeartbeatManager bound to the session for this event.
