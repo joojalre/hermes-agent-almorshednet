@@ -111,6 +111,13 @@ class TestConfigYamlRouting:
         assert "not a recognized config key" not in capsys.readouterr().out
         assert "script_timeout_seconds: 600" in _read_config(_isolated_hermes_home)
 
+    def test_memory_nudge_interval_is_recognized(self, _isolated_hermes_home, capsys):
+        """The documented background-memory review interval is runtime config."""
+        set_config_value("memory.nudge_interval", "0")
+
+        assert "not a recognized config key" not in capsys.readouterr().out
+        assert "nudge_interval: 0" in _read_config(_isolated_hermes_home)
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)
@@ -120,6 +127,20 @@ class TestConfigYamlRouting:
             "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true" in env_content
             or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
         )
+
+    def test_terminal_docker_shared_key_preserves_string_values(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("terminal.docker_shared_container_key", "off")
+
+        import yaml
+
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["terminal"]["docker_shared_container_key"] == "off"
+        assert "TERMINAL_DOCKER_SHARED_CONTAINER_KEY=off" in _read_env(
+            _isolated_hermes_home
+        )
+        assert "not a recognized config key" not in capsys.readouterr().out
 
     def test_terminal_vercel_runtime_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.vercel_runtime", "python3.13")

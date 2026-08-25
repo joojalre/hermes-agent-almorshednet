@@ -36,6 +36,7 @@ import json
 import logging
 import re
 import shutil
+import threading
 import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,9 +53,25 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
-)
+class _BackgroundReviewReadMarks:
+    """Read marks shared by copied tool contexts within one review run."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._paths: set[str] = set()
+
+    def add(self, path: str) -> None:
+        with self._lock:
+            self._paths.add(path)
+
+    def contains(self, path: str) -> bool:
+        with self._lock:
+            return path in self._paths
+
+
+_background_review_read_paths: (
+    "_ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]]"
+) = _ctxvars.ContextVar("background_review_read_paths", default=None)
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -77,9 +94,11 @@ def mark_background_review_skill_read(path: Path) -> None:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    marks = _background_review_read_paths.get()
+    if marks is None:
+        marks = _BackgroundReviewReadMarks()
+        _background_review_read_paths.set(marks)
+    marks.add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -87,12 +106,13 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    marks = _background_review_read_paths.get()
+    return marks is not None and marks.contains(resolved)
 
 
 def _reset_background_review_read_marks() -> None:
-    """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    """Start a fresh, isolated read set for the current review context."""
+    _background_review_read_paths.set(_BackgroundReviewReadMarks())
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
@@ -272,16 +292,30 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
 
 
 def _pinned_guard(name: str) -> Optional[str]:
-    """Return a refusal message if *name* is pinned, else None.
+    """Return a refusal message if *name* is pinned or essential, else None.
 
     Pin protects a skill from **deletion** — both the curator's auto-archive
     passes and the agent's ``skill_manage(action="delete")`` tool call. The
     agent can still patch/edit pinned skills; pin only guards against
     irrecoverable loss, not against content evolution.
 
+    Essential skills (``agent/skill_utils.ESSENTIAL_SKILLS``, e.g.
+    ``hermes-agent``) are treated as permanently pinned: the system prompt
+    always references them, so deleting one leaves a dangling instruction.
+
     Best-effort: if the sidecar is unreadable we let the delete through
     rather than block on a broken telemetry file.
     """
+    try:
+        from agent.skill_utils import ESSENTIAL_SKILLS
+        if name in ESSENTIAL_SKILLS:
+            return (
+                f"Skill '{name}' is essential to Hermes (the agent's own "
+                f"operating manual referenced by the system prompt) and "
+                f"cannot be deleted. Patches and edits are still allowed."
+            )
+    except Exception:
+        logger.debug("essential-guard lookup failed for %s", name, exc_info=True)
     try:
         from tools import skill_usage
         rec = skill_usage.get_record(name)
@@ -937,9 +971,10 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write SKILL.md atomically
+    # Write instructional documents with a readable mode while preserving
+    # the mode of an existing file across the atomic replacement.
     skill_md = skill_dir / "SKILL.md"
-    atomic_write_text(skill_md, content)
+    atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
@@ -1032,13 +1067,13 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
 
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
-    atomic_write_text(skill_md, content)
+    atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            atomic_write_text(skill_md, original_content)
+            atomic_write_text(skill_md, original_content, preserve_mode=True)
         return {"success": False, "error": scan_error}
 
     # Extract description from new content for verbose notifications
@@ -1161,12 +1196,12 @@ def _patch_skill(
             }
 
     original_content = content  # for rollback
-    atomic_write_text(target, new_content)
+    atomic_write_text(target, new_content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
-        atomic_write_text(target, original_content)
+        atomic_write_text(target, original_content, preserve_mode=True)
         return {"success": False, "error": scan_error}
 
     result = {
@@ -1340,13 +1375,13 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    atomic_write_text(target, file_content)
+    atomic_write_text(target, file_content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            atomic_write_text(target, original_content)
+            atomic_write_text(target, original_content, preserve_mode=True)
         else:
             target.unlink(missing_ok=True)
         return {"success": False, "error": scan_error}

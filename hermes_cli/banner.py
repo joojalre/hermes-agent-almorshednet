@@ -361,6 +361,17 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             return None
         if head_rev == target_rev:
             return 0
+        # A shallow checkout can still carry local commits on top of the
+        # fetched tip.  Prefer the local ancestry proof before asking GitHub
+        # to compare a revision that may not be published there.
+        local_ahead = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", target_rev, head_rev],
+            capture_output=True,
+            timeout=5,
+            cwd=str(repo_dir),
+        )
+        if local_ahead.returncode == 0:
+            return 0
         # Tips differ but the shallow boundary hides the history between them.
         # Recover the exact count from the GitHub compare API when possible
         # (ahead_by == 0 means local-ahead ⇒ up to date); otherwise report the

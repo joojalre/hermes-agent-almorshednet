@@ -22,7 +22,11 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
         "Preferred workflow: call with "
         "action='capture' (mode='som' gives numbered element overlays), "
         "then click by `element` index for reliability. Pixel coordinates "
-        "are supported for models trained on them. Works on any window — "
+        "are supported for models trained on them. Image captures include a "
+        "shareable `screenshot_path`; when the user asks to receive the image "
+        "and the current surface supports attachments, deliver that file using "
+        "the platform's native MEDIA attachment syntax. Do not automatically "
+        "send screenshots used only for computer control. Works on any window — "
         "hidden, minimized, or behind another app. Requires cua-driver to "
         "be installed."
     ),
@@ -83,12 +87,12 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "Optional. Limit capture/action to a specific app "
                     "(by name, e.g. 'Safari', or bundle ID, "
                     "'com.apple.Safari'). If omitted, operates on the "
-                    "frontmost app's window. Pass app='screen' (or "
-                    "'desktop') to capture the OS desktop/shell surface — "
-                    "e.g. to see the wallpaper or click the taskbar. Note: "
-                    "capture is per-window; a single image cannot span "
-                    "multiple monitors, so on a multi-screen setup capture "
-                    "one window or display at a time."
+                    "frontmost app's window. Pass app='screen' to capture "
+                    "everything currently displayed (a composited "
+                    "full-screen grab; image only, no clickable elements). "
+                    "Pass app='desktop' to target the OS desktop/shell "
+                    "surface itself (wallpaper, desktop icons, taskbar) "
+                    "with its clickable elements."
                 ),
             },
             "pid": {

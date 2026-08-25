@@ -9,6 +9,7 @@ import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
+import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import {
@@ -28,9 +29,17 @@ import { dropSessionState, publishSessionState } from '@/store/session-states'
 import { $wakeWord, resetWakeWordState } from '@/store/wake-word'
 import type { SessionInfo } from '@/types/hermes'
 
+import { clearSingleFlightSessionResumeState } from './single-flight-resume'
 import type { SubmitTextOptions } from './utils'
 
 import { uploadComposerAttachment, usePromptActions } from '.'
+
+// Suites in this file reuse the same stored-id constants. The module-level
+// single-flight resume map (and drift-recovery cache) would otherwise leak a
+// never-settling in-flight promise from one test into the next.
+beforeEach(() => {
+  clearSingleFlightSessionResumeState()
+})
 
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
@@ -1201,6 +1210,69 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
 
     expect(renderedText).toContain('⊙ Goal set. Starting now.')
     expect(renderedText).not.toContain('/goal: no output')
+  })
+
+  it('clears the goal card when /goal clear returns a typed exec dispatch (#80348)', async () => {
+    // The gateway can answer `/goal clear` with a TYPED `{ type: "exec" }`
+    // dispatch instead of the plain `{ output }` shape. The typed branch used
+    // to render and return without touching the goal store, so the stale
+    // "Goal paused" card kept showing until the chat was reopened.
+    setSessionGoal(RUNTIME_SESSION_ID, {
+      status: 'paused',
+      title: 'ship the release notes',
+      updatedAt: Date.now()
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'slash.exec') {
+        return { type: 'exec', output: '✓ Goal cleared.' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/goal clear')
+
+    expect($goalsBySession.get()[RUNTIME_SESSION_ID]).toBeUndefined()
+
+    $goalsBySession.set({})
+  })
+
+  it('updates the goal card live when /goal resume returns a typed exec dispatch', async () => {
+    // Sibling of the clear path: a typed exec `▶ Goal resumed: …` must flip
+    // the paused card back to active without a chat reopen.
+    setSessionGoal(RUNTIME_SESSION_ID, {
+      status: 'paused',
+      title: 'ship the release notes',
+      updatedAt: Date.now()
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'slash.exec') {
+        return { type: 'exec', output: '▶ Goal resumed: ship the release notes' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/goal resume')
+
+    expect($goalsBySession.get()[RUNTIME_SESSION_ID]).toMatchObject({
+      status: 'active',
+      title: 'ship the release notes'
+    })
+
+    $goalsBySession.set({})
   })
 
   it('queues the /goal kickoff instead of dropping it when the session is busy (#63352)', async () => {
@@ -2453,7 +2525,6 @@ describe('usePromptActions restoreToMessage', () => {
         session_id: RUNTIME_SESSION_ID,
         text: 'first prompt',
         confirm_truncate: true,
-        truncate_before_user_ordinal: 0,
         truncate_before_message_id: 'u1',
         confirm_empty_truncate: true
       },
@@ -2523,7 +2594,6 @@ describe('usePromptActions restoreToMessage', () => {
         session_id: RUNTIME_SESSION_ID,
         text: 'first prompt',
         confirm_truncate: true,
-        truncate_before_user_ordinal: 0,
         truncate_before_message_id: 'u1',
         confirm_empty_truncate: true
       },
@@ -2571,7 +2641,6 @@ describe('usePromptActions restoreToMessage', () => {
         session_id: RUNTIME_SESSION_ID,
         text: 'first prompt',
         confirm_truncate: true,
-        truncate_before_user_ordinal: 0,
         truncate_before_message_id: 'u1',
         confirm_empty_truncate: true
       },
@@ -4591,6 +4660,147 @@ describe('usePromptActions busy-gateway churn tolerance (#64327)', () => {
     })
   })
 
+  it('submits once through authoritative recovery when routed resume publication lags (#90428)', async () => {
+    const staleStoredId = 'stored-previous-selection'
+    const staleRuntimeId = 'rt-previous-selection'
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: staleStoredId }
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: staleRuntimeId }
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([[staleStoredId, staleRuntimeId]])
+    }
+
+    const resumeStoredSession = vi.fn(async () => undefined)
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'session.resume') {
+        return { session_id: RESUMED_RUNTIME_ID } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId={staleRuntimeId}
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => STORED_ID}
+        getRouteToken={() => `/${STORED_ID}::`}
+        getRuntimeIdForStoredSession={storedId => runtimeIdByStoredSessionIdRef.current.get(storedId) ?? null}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        resumeStoredSession={resumeStoredSession}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={staleStoredId}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    expect(await handle!.submitText('deliver despite lagging local publication')).toBe(true)
+    expect(resumeStoredSession).toHaveBeenCalledOnce()
+    expect(calls).toEqual([
+      {
+        method: 'session.resume',
+        params: { session_id: STORED_ID, source: 'desktop', omit_messages: true }
+      },
+      {
+        method: 'prompt.submit',
+        params: { session_id: RESUMED_RUNTIME_ID, text: 'deliver despite lagging local publication' }
+      }
+    ])
+  })
+
+  it('keeps an explicit background queue target isolated from foreground routed recovery (#90428)', async () => {
+    const FOREGROUND_STORED_ID = 'stored-foreground-b'
+    const FOREGROUND_RUNTIME_ID = 'rt-foreground-b'
+    const QUEUED_STORED_ID = 'stored-queued-c'
+    const QUEUED_RUNTIME_ID = 'rt-queued-c-recovered'
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const stateWrites: { sessionId: string; storedSessionId: null | string | undefined }[] = []
+    // Load-bearing shape (per #91357 review): foreground B must actually NEED
+    // routed recovery — no active runtime and an empty ownership cache — so the
+    // formerly broken foreground-recovery branch is genuinely reachable. With a
+    // pre-bound B this fixture passed even on the broken head.
+    const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: FOREGROUND_STORED_ID }
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: null }
+
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map()
+    }
+
+    // A high-level resume of B FULLY publishes B's runtime + ownership cache:
+    // if the explicit-target guard ever regresses, the submit would adopt B's
+    // recovered runtime and the assertions below catch the mis-delivery.
+    const resumeStoredSession = vi.fn(async () => {
+      activeSessionIdRef.current = FOREGROUND_RUNTIME_ID
+      runtimeIdByStoredSessionIdRef.current.set(FOREGROUND_STORED_ID, FOREGROUND_RUNTIME_ID)
+    })
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'session.resume') {
+        expect(params?.session_id).toBe(QUEUED_STORED_ID)
+
+        return { session_id: QUEUED_RUNTIME_ID } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId={null}
+        activeSessionIdRef={activeSessionIdRef}
+        getRoutedStoredSessionId={() => FOREGROUND_STORED_ID}
+        getRouteToken={() => `/${FOREGROUND_STORED_ID}::`}
+        getRuntimeIdForStoredSession={storedId => runtimeIdByStoredSessionIdRef.current.get(storedId) ?? null}
+        onReady={h => (handle = h)}
+        onUpdateState={(sessionId, storedSessionId) => stateWrites.push({ sessionId, storedSessionId })}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        resumeStoredSession={resumeStoredSession}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        storedSessionId={FOREGROUND_STORED_ID}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    expect(
+      await handle!.submitText('queued prompt for C', {
+        fromQueue: true,
+        sessionId: null,
+        storedSessionId: QUEUED_STORED_ID
+      })
+    ).toBe(true)
+    // No high-level resume of B: the explicit queue target C is authoritative.
+    expect(resumeStoredSession).not.toHaveBeenCalled()
+    expect(calls).toEqual([
+      {
+        method: 'session.resume',
+        params: { session_id: QUEUED_STORED_ID, source: 'desktop', omit_messages: true }
+      },
+      {
+        method: 'prompt.submit',
+        params: { session_id: QUEUED_RUNTIME_ID, text: 'queued prompt for C', queued: true }
+      }
+    ])
+    // No prompt or state write ever touches B, and no foreground
+    // selection/cache mutation leaks out of the background drain.
+    expect(stateWrites.some(write => write.sessionId === FOREGROUND_RUNTIME_ID)).toBe(false)
+    expect(selectedStoredSessionIdRef.current).toBe(FOREGROUND_STORED_ID)
+    expect(activeSessionIdRef.current).toBeNull()
+    expect(runtimeIdByStoredSessionIdRef.current).toEqual(new Map())
+  })
+
   it('still aborts when the user genuinely moves to a different chat mid-submit', async () => {
     // The churn tolerance must not weaken the real guard: selection AND route
     // moving to another actual chat is a user switch and must abort.
@@ -5308,8 +5518,10 @@ describe('usePromptActions editMessage stale-target recovery (#82462)', () => {
     // First attempt only — no plain resubmit that drops truncate_before_user_ordinal.
     expect(submitCalls).toHaveLength(1)
     expect(submitCalls[0]?.[1]).toMatchObject({
-      truncate_before_user_ordinal: 0,
       confirm_truncate: true
     })
+    expect(
+      (submitCalls[0]?.[1] as { truncate_before_user_ordinal?: unknown } | undefined)?.truncate_before_user_ordinal
+    ).toBeUndefined()
   })
 })

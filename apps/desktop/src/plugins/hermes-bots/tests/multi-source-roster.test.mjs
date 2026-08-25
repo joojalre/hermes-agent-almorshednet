@@ -32,7 +32,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;'
+      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__botRosterMeta = botRosterMeta;\nglobalThis.__displayName = displayName;\nglobalThis.__filterBots = filterBots;\nglobalThis.__resolveRosterMentions = resolveRosterMentions;\nglobalThis.__botConnectionRoute = botConnectionRoute;\nglobalThis.__resolveBotConnectionRoute = resolveBotConnectionRoute;'
     )
   vm.runInNewContext(code, context)
   return context
@@ -230,25 +230,74 @@ test('default rows use source identity without borrowing another source title', 
   const { __botRosterKey: key, __botRosterMeta: metaFor, __displayName: name } = runtime()
   const remote = {
     name: 'default',
-    connectionId: 'personal',
+    connectionId: 'other',
     connectionLabel: 'Personal',
     remoteSource: true,
     sourceScoped: true
   }
-  const active = { ...remote, remoteSource: undefined }
-  const metadata = { default: { title: 'Active workspace' } }
+  const active = { ...remote, connectionId: 'personal', remoteSource: undefined }
+  const metadata = {
+    default: { title: 'Legacy local only' },
+    'personal::default': { title: 'Active workspace' }
+  }
 
-  assert.equal(metaFor(remote, metadata), null)
+  assert.equal(metaFor(remote, metadata), undefined)
   assert.equal(name(remote, metaFor(remote, metadata)), 'Personal')
-  assert.equal(key(remote), 'personal::default')
+  assert.equal(key(remote), 'other::default')
 
   // The ACTIVE gateway's own default is the user's main agent — annotation
   // (sourceScoped + connection fields) must NOT rename it to a connection
   // label. Titled: the title wins. Untitled: it stays "Hermes". Regression:
   // remote-gateway desktops showed the main agent as an IP-derived label
   // with no shortname (Aug 17 2026 report).
-  assert.equal(name(active, metadata.default), 'Active workspace')
+  assert.equal(name(active, metadata['personal::default']), 'Active workspace')
   assert.equal(name(active, undefined), 'Hermes')
+})
+
+test('botRosterMeta: a group roster row orphaned by a deleted connection does not throw', () => {
+  const { __botRosterMeta: metaFor } = runtime()
+  // Mirrors the persisted `group-chats` descriptor left behind once its
+  // connection is removed: remoteSource is still true, but connectionId is
+  // gone, so botConnectionRoute has nothing to resolve. This must not crash
+  // rendering the group (#93492) just because one member is unroutable.
+  const orphaned = { name: 'halakukhan', handle: 'halakukhan', connectionId: null, remoteSource: true }
+
+  assert.doesNotThrow(() => metaFor(orphaned, {}))
+  assert.equal(metaFor(orphaned, {}), null)
+})
+
+test('resolveBotConnectionRoute: typed status for resolved / owner_removed / not_scoped, and strict botConnectionRoute still fails closed', () => {
+  const { __resolveBotConnectionRoute: resolve, __botConnectionRoute: strictRoute } = runtime()
+  const orphaned = { name: 'halakukhan', connectionId: null, remoteSource: true }
+  const owned = { name: 'halakukhan', connectionId: 'conn-1', remoteSource: true }
+  const local = { name: 'default' }
+
+  // Passive resolver: typed status, never throws.
+  assert.equal(resolve(orphaned).status, 'owner_removed')
+  assert.equal(resolve(owned).status, 'resolved')
+  assert.equal(resolve(owned).route.connectionId, 'conn-1')
+  assert.equal(resolve(local).status, 'not_scoped')
+
+  // Strict wrapper used by real dispatch (requestForBot, session creation)
+  // must still fail closed on the same orphaned row -- the split only moves
+  // the *passive* lookup off this throw, it does not remove it.
+  assert.throws(() => strictRoute(orphaned), /has no connection owner/)
+  assert.equal(strictRoute(owned).connectionId, 'conn-1')
+})
+
+test('botRosterMeta: an unrelated failure while resolving meta for a live route still propagates', () => {
+  const { __botRosterMeta: metaFor } = runtime()
+  const owned = { name: 'halakukhan', connectionId: 'conn-1', remoteSource: true }
+  // A metaByName lookup that throws for reasons that have nothing to do with
+  // connection ownership must not be caught by botRosterMeta -- only the
+  // owner_removed status is treated as "no meta for this row".
+  const explodingMetaByName = new Proxy({}, {
+    get() {
+      throw new Error('unrelated invariant failure')
+    }
+  })
+
+  assert.throws(() => metaFor(owned, explodingMetaByName), /unrelated invariant failure/)
 })
 
 test('botHandle: precomputed multi-source handle wins; default stays hermes', () => {
@@ -264,7 +313,14 @@ test('filterBots: matches the source device name for remote rows', () => {
   const { __filterBots: filterBots } = runtime()
   const roster = [
     { name: 'research' },
-    { name: 'research', remoteSource: true, connectionLabel: 'Homelab', handle: 'research-homelab' }
+    {
+      name: 'research',
+      connectionId: 'homelab',
+      connectionLabel: 'Homelab',
+      handle: 'research-homelab',
+      remoteSource: true,
+      sourceScoped: true
+    }
   ]
 
   const hits = filterBots(roster, {}, 'homelab')
@@ -378,6 +434,29 @@ test('merge: live-null local window does not treat registry primary as active', 
       .join(','),
     'bob,kai,rook'
   )
+})
+
+test('merge: legacy remote descriptor infers a matching remote primary when local inventory differs', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = { profiles: [{ name: 'default', last_session: { id: 'noah-chat' } }] }
+  const union = {
+    primaryConnectionId: 'noah',
+    agents: [
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'archie', handle: 'archie' },
+      { connectionId: 'noah', connectionKind: 'remote', connectionLabel: 'Noah', profile: 'default', handle: 'default' }
+    ]
+  }
+
+  // Legacy remote descriptors have mode:'remote' but no connectionId, so the
+  // host state is null. The matching primary row must annotate the rich row,
+  // while Archie remains a selectable other-source agent.
+  const out = merge(local, union, null)
+
+  assert.equal(out.profiles.length, 2)
+  assert.equal(out.profiles.find(p => p.name === 'default').connectionId, 'noah')
+  assert.equal(out.profiles.find(p => p.name === 'default').remoteSource, undefined)
+  assert.equal(out.profiles.find(p => p.name === 'archie').connectionId, 'local')
+  assert.equal(out.profiles.find(p => p.name === 'archie').remoteSource, true)
 })
 
 test('merge: previously seen remotes survive a connect-on-demand empty union', () => {
@@ -502,6 +581,51 @@ test('merge: live active id beats primaryConnectionId for active-source matching
   assert.equal(out.profiles.find(p => p.remoteSource).connectionId, 'local')
 })
 
+// Composition of the two dedup layers (#88828 install_id collapse + #88697
+// boot-descriptor connectionId): when the remote PRIMARY is registered under
+// two addresses, buildAgentRoster collapses the twin to ONE union row that
+// carries the PRIMARY's connectionId (collapse prefers the active/primary
+// connection). The boot descriptor now reports that same id as the live id,
+// so the merge must classify those collapsed rows as active-source
+// annotations — collapse first, then merge, with no re-append and no
+// double-collapse of a genuinely distinct source.
+test('merge: install_id-collapsed twin-address primary composes with the live id (no re-append)', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = {
+    profiles: [
+      { name: 'default', last_session: { id: 's-default' } },
+      { name: 'dev', last_session: { id: 's-dev' } }
+    ]
+  }
+  const union = {
+    primaryConnectionId: 'spark-lan',
+    agents: [
+      // Post-#88828 union: the tailscale twin of the primary collapsed into
+      // these rows — one per profile, keyed to the PRIMARY connection id.
+      { connectionId: 'spark-lan', connectionKind: 'remote', connectionLabel: 'Spark', profile: 'default', handle: 'default-spark' },
+      { connectionId: 'spark-lan', connectionKind: 'remote', connectionLabel: 'Spark', profile: 'dev', handle: 'dev' },
+      // A real second backend survives the collapse and stays its own row.
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'default', handle: 'default-this-device' }
+    ]
+  }
+
+  // Live id from the fixed boot descriptor === the collapsed rows' id.
+  const out = merge(local, union, 'spark-lan')
+
+  // 2 annotated primary rows + 1 distinct local row = 3. Pre-fix (live id
+  // null) this was 5: both primary rows re-appended as phantom sources.
+  assert.equal(out.profiles.length, 3)
+  assert.equal(out.profiles.filter(p => p.remoteSource).length, 1)
+
+  const defaultRow = out.profiles.find(p => p.name === 'default' && !p.remoteSource)
+  assert.equal(defaultRow.last_session.id, 's-default')
+  assert.equal(defaultRow.handle, 'default-spark')
+  assert.equal(defaultRow.connectionId, 'spark-lan')
+
+  const localTwin = out.profiles.find(p => p.name === 'default' && p.remoteSource)
+  assert.equal(localTwin.connectionId, 'local')
+})
+
 test('botRosterKey: same name on two sources yields distinct React keys', () => {
   const { __botRosterKey: botRosterKey } = runtime()
 
@@ -582,4 +706,13 @@ test('resolveRosterMentions: @hermes in this chat is not a handoff to yourself',
 
   assert.equal(hits.length, 1)
   assert.equal(hits[0].connectionId, 'mac-mini')
+})
+
+test('source contract: active roster queries use the SDK ambient owner route', () => {
+  assert.doesNotMatch(source, /activeBotRoute/)
+  assert.equal(
+    source.match(/requestForBot\(activeBot, 'profiles\.list', \{\}\)/g)?.length,
+    2,
+    'roster hydration and the session sweep must both use the upstream ambient-owner route'
+  )
 })

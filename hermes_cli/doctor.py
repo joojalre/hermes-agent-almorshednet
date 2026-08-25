@@ -16,6 +16,7 @@ from hermes_cli.config import (
     get_env_path,
     get_hermes_home,
     get_project_root,
+    is_nix_install_method,
     recommended_update_command_for_method,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -34,7 +35,7 @@ from hermes_cli.colors import Colors, color
 from hermes_cli.models import _HERMES_USER_AGENT
 from hermes_cli.vercel_auth import describe_vercel_auth
 from hermes_constants import OPENROUTER_MODELS_URL
-from utils import base_url_host_matches
+from utils import base_url_host_matches, base_url_hostname
 
 
 _PROVIDER_ENV_HINTS = (
@@ -90,7 +91,7 @@ def _sqlite_upgrade_hint(install_method: str | None = None) -> str:
     if method == "docker":
         command = recommended_update_command_for_method(method)
         action = f"run `{command}`, then recreate all Hermes containers"
-    elif method in {"nix", "nixos"}:
+    elif is_nix_install_method(method):
         # The Nix helper is prose guidance, not a literal shell command.
         action = recommended_update_command_for_method(method)
     elif method == "apt":
@@ -265,6 +266,48 @@ def _has_provider_env_config(content: str) -> bool:
     return any(key in content for key in _PROVIDER_ENV_HINTS)
 
 
+def _configured_model_uses_keyless_local_endpoint(config_path: Path) -> bool:
+    """Return True when the selected provider is configured on loopback.
+
+    A local OpenAI-compatible endpoint such as Ollama does not need an API key,
+    so Doctor must not recommend the setup wizard solely because its .env file
+    is intentionally empty.
+    """
+    if not config_path.exists():
+        return False
+
+    try:
+        from hermes_cli.config import read_user_config_raw
+
+        config = read_user_config_raw(config_path)
+        model = config.get("model") or {}
+        provider_name = str(model.get("provider") or "").strip().lower()
+        providers = config.get("providers") or {}
+        if not provider_name or not isinstance(providers, dict):
+            return False
+
+        provider_config = next(
+            (
+                value
+                for name, value in providers.items()
+                if str(name).strip().lower() == provider_name and isinstance(value, dict)
+            ),
+            None,
+        )
+        if not provider_config:
+            return False
+
+        endpoint = str(
+            provider_config.get("api")
+            or provider_config.get("base_url")
+            or model.get("base_url")
+            or ""
+        ).strip()
+        return base_url_hostname(endpoint) in {"localhost", "127.0.0.1", "::1"}
+    except Exception:
+        return False
+
+
 def _honcho_is_configured_for_doctor() -> bool:
     """Return True when Honcho is configured, even if this process has no active session."""
     try:
@@ -293,6 +336,60 @@ def _doctor_tool_availability_detail(toolset: str) -> str:
         return "(runtime-gated; loaded only for dispatcher-spawned workers)"
     return ""
 
+
+def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
+    """Return doctor rows for web search/extract provider readiness (#78412).
+
+    Each row is ``(status, label, detail)`` where *status* is ``ok`` or ``warn``.
+    Uses the same active-provider resolvers as the tools, but reports readiness
+    from ``is_available()`` so an explicitly selected but unconfigured backend
+    does not look healthy.
+    """
+    rows: list[tuple[str, str, str]] = []
+    try:
+        from agent.web_search_registry import (
+            get_active_extract_provider,
+            get_active_search_provider,
+        )
+        from tools.web_tools import _ensure_web_plugins_loaded, _provider_is_ready
+
+        # Doctor runs in a fresh process — bundled web providers register
+        # during plugin discovery, which nothing has triggered yet here.
+        # Without this the registry is empty and every row reads
+        # "no provider selected or registered" (idempotent, cheap on rerun).
+        _ensure_web_plugins_loaded()
+    except Exception:
+        return rows
+
+    for capability, getter in (
+        ("web search", get_active_search_provider),
+        ("web extract", get_active_extract_provider),
+    ):
+        try:
+            provider = getter()
+        except Exception:
+            provider = None
+        if provider is None:
+            rows.append(
+                (
+                    "warn",
+                    capability,
+                    "(no provider selected or registered)",
+                )
+            )
+            continue
+        name = getattr(provider, "name", None) or type(provider).__name__
+        if _provider_is_ready(provider):
+            rows.append(("ok", capability, f"({name})"))
+        else:
+            rows.append(
+                (
+                    "warn",
+                    capability,
+                    f"({name} selected; provider not configured)",
+                )
+            )
+    return rows
 
 def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
     """Adjust runtime-gated tool availability for doctor diagnostics."""
@@ -404,6 +501,18 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
             "info",
             "FTS tables: " + (", ".join(present) if present else "none"),
             "",
+        ))
+
+    deferral = stats.get("fts_rebuild_deferral")
+    if isinstance(deferral, dict):
+        attempts = deferral.get("attempts")
+        pids = deferral.get("holder_pids") or []
+        lines.append((
+            "warn",
+            f"state.db FTS repair is blocked after {attempts or '?'} "
+            f"deferral(s) by PID(s) {pids or 'unknown'}",
+            "(stop the listed processes, then run 'hermes sessions "
+            "optimize-storage' with the gateway stopped)",
         ))
 
     # Advisory: oversized database. Suggest auto_prune, and — when the v23
@@ -524,6 +633,46 @@ def collect_deprecated_env_vars(env_map: dict | None) -> list[tuple[str, str]]:
     return findings
 
 
+def collect_relay_plugin_cutover_findings(
+    raw_config: dict | None,
+    env_map: dict | None,
+) -> list[tuple[str, str]]:
+    """Return actionable findings for the removed Hermes Relay plugin."""
+    from hermes_cli.relay_plugin_cutover import (
+        LEGACY_RELAY_EXPORT_ENV_VARS,
+        RELAY_PLUGINS_CONFIG_ENV,
+        configured_legacy_relay_env_vars,
+        legacy_relay_plugin_keys,
+    )
+
+    findings: list[tuple[str, str]] = []
+    if isinstance(raw_config, dict):
+        plugins = raw_config.get("plugins")
+        if isinstance(plugins, dict):
+            for key in legacy_relay_plugin_keys(plugins.get("enabled")):
+                findings.append(
+                    (
+                        f"plugins.enabled: {key}",
+                        f"remove it and configure {RELAY_PLUGINS_CONFIG_ENV}",
+                    )
+                )
+
+    effective_env = dict(env_map or {})
+    for name in (*LEGACY_RELAY_EXPORT_ENV_VARS, RELAY_PLUGINS_CONFIG_ENV):
+        if name not in effective_env and os.environ.get(name) is not None:
+            effective_env[name] = os.environ[name]
+    if not str(effective_env.get(RELAY_PLUGINS_CONFIG_ENV, "")).strip():
+        for name in configured_legacy_relay_env_vars(effective_env):
+            findings.append(
+                (
+                    name,
+                    f"move exporter settings to {RELAY_PLUGINS_CONFIG_ENV}; "
+                    "this variable is now ignored",
+                )
+            )
+    return findings
+
+
 def report_deprecated_config_and_env(
     raw_config: dict | None = None,
     env_map: dict | None = None,
@@ -534,18 +683,26 @@ def report_deprecated_config_and_env(
     (empty when nothing deprecated is present). Does not mutate config/env and
     does not append to the blocking ``issues`` list.
     """
-    findings = collect_deprecated_config_keys(raw_config)
-    findings.extend(collect_deprecated_env_vars(env_map))
+    deprecated = collect_deprecated_config_keys(raw_config)
+    deprecated.extend(collect_deprecated_env_vars(env_map))
+    relay_cutover = collect_relay_plugin_cutover_findings(raw_config, env_map)
+    findings = deprecated + relay_cutover
     if not findings:
         check_ok("No deprecated config keys or env vars")
         return findings
 
-    for legacy, replacement in findings:
+    for legacy, replacement in deprecated:
         check_warn(
             f"Deprecated: {legacy}",
             f"(use {replacement} instead)",
         )
         check_info(f"Replace {legacy} → {replacement} (warn-only; not auto-migrated here)")
+    for legacy, replacement in relay_cutover:
+        check_warn(
+            f"Breaking Relay migration: {legacy}",
+            f"({replacement})",
+        )
+        check_info(f"Migrate {legacy}: {replacement}")
     return findings
 
 
@@ -1138,6 +1295,7 @@ def run_doctor(args):
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()
     # Check ~/.hermes/.env (primary location for user config)
+    config_path = HERMES_HOME / 'config.yaml'
     env_path = HERMES_HOME / '.env'
     if env_path.exists():
         check_ok(f"{_DHH}/.env file exists")
@@ -1151,6 +1309,8 @@ def run_doctor(args):
             content = env_path.read_text(encoding="latin-1")
         if _has_provider_env_config(content):
             check_ok("API key or custom endpoint configured")
+        elif _configured_model_uses_keyless_local_endpoint(config_path):
+            check_info("No API key needed for configured local endpoint")
         else:
             check_warn(f"No API key found in {_DHH}/.env")
             issues.append("Run 'hermes setup' to configure API keys")
@@ -1179,7 +1339,6 @@ def run_doctor(args):
                 issues.append("Run 'hermes setup' to create .env")
     
     # Check ~/.hermes/config.yaml (primary) or project cli-config.yaml (fallback)
-    config_path = HERMES_HOME / 'config.yaml'
     if config_path.exists():
         check_ok(f"{_DHH}/config.yaml exists")
 
@@ -2138,6 +2297,34 @@ def run_doctor(args):
         else:
             check_info("Vercel persistence: ephemeral filesystem")
 
+    # Plugin-registered terminal backends (if one is the active backend)
+    if terminal_env not in {
+        "local", "docker", "singularity", "modal", "managed_modal",
+        "daytona", "vercel_sandbox", "ssh",
+    }:
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+            from agent.terminal_env_registry import get_provider
+
+            _provider = get_provider(terminal_env)
+        except Exception:
+            _provider = None
+        if _provider is None:
+            _fail_and_issue(
+                f"Unknown terminal backend '{terminal_env}'",
+                "(no built-in or plugin backend by that name)",
+                "Fix terminal.backend in config.yaml, or install/enable the plugin that provides it",
+                issues,
+            )
+        else:
+            for _ok, _label, _detail in _provider.doctor_checks():
+                if _ok:
+                    check_ok(_label, _detail)
+                else:
+                    _fail_and_issue(_label, _detail, _detail.strip("()"), issues)
+
     # Node.js + agent-browser (for browser automation tools)
     if _safe_which("node"):
         check_ok("Node.js")
@@ -2734,38 +2921,43 @@ def run_doctor(args):
     _probes.append(("AWS Bedrock", _probe_bedrock))
     _probes.append(("Azure Foundry (Entra ID)", _probe_azure_entra))
 
-    # Print a single status line so users see something happening, then
-    # fan out. ``\r`` clears it once the first real result line lands.
-    print(f"  {color(f'Running {len(_probes)} connectivity checks in parallel…', Colors.DIM)}",
-          end="", flush=True)
+    _offline = bool(getattr(args, "offline", False))
+    if _offline:
+        print(color("  Skipped provider connectivity probes (--offline).", Colors.DIM))
+        _results = []
+    else:
+        # Print a single status line so users see something happening, then
+        # fan out. ``\r`` clears it once the first real result line lands.
+        print(f"  {color(f'Running {len(_probes)} connectivity checks in parallel…', Colors.DIM)}",
+              end="", flush=True)
 
-    # Disable boto3's EC2 instance-metadata-service probe for the duration
-    # of the parallel block. boto's default credential chain tries
-    # 169.254.169.254 with a multi-second timeout when we're not on EC2,
-    # which dominated the section's wall time before this fix
-    # (~2s on a developer laptop, even with the rest parallelized).
-    # Set on the parent thread before submitting work so the env-var
-    # mutation never races with another worker. has_aws_credentials() in
-    # the bedrock probe already gates on real env-var creds, so IMDS is
-    # never the legitimate source for `hermes doctor`.
-    _imds_prev = os.environ.get("AWS_EC2_METADATA_DISABLED")
-    os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
-    try:
-        # 8 workers is plenty — each probe is a single HTTP call plus a TLS
-        # handshake. More than that wastes thread-startup cost and risks
-        # noisy output if anything ever printed from inside a worker.
-        with _futures.ThreadPoolExecutor(max_workers=8,
-                                         thread_name_prefix="doctor-probe") as _ex:
-            _futures_in_order = [_ex.submit(_fn) for _, _fn in _probes]
-            _results = [_f.result() for _f in _futures_in_order]
-    finally:
-        if _imds_prev is None:
-            os.environ.pop("AWS_EC2_METADATA_DISABLED", None)
-        else:
-            os.environ["AWS_EC2_METADATA_DISABLED"] = _imds_prev
+        # Disable boto3's EC2 instance-metadata-service probe for the duration
+        # of the parallel block. boto's default credential chain tries
+        # 169.254.169.254 with a multi-second timeout when we're not on EC2,
+        # which dominated the section's wall time before this fix
+        # (~2s on a developer laptop, even with the rest parallelized).
+        # Set on the parent thread before submitting work so the env-var
+        # mutation never races with another worker. has_aws_credentials() in
+        # the bedrock probe already gates on real env-var creds, so IMDS is
+        # never the legitimate source for `hermes doctor`.
+        _imds_prev = os.environ.get("AWS_EC2_METADATA_DISABLED")
+        os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+        try:
+            # 8 workers is plenty — each probe is a single HTTP call plus a TLS
+            # handshake. More than that wastes thread-startup cost and risks
+            # noisy output if anything ever printed from inside a worker.
+            with _futures.ThreadPoolExecutor(max_workers=8,
+                                             thread_name_prefix="doctor-probe") as _ex:
+                _futures_in_order = [_ex.submit(_fn) for _, _fn in _probes]
+                _results = [_f.result() for _f in _futures_in_order]
+        finally:
+            if _imds_prev is None:
+                os.environ.pop("AWS_EC2_METADATA_DISABLED", None)
+            else:
+                os.environ["AWS_EC2_METADATA_DISABLED"] = _imds_prev
 
-    # Clear the "Running …" line and print all results in submission order.
-    print("\r" + " " * 70 + "\r", end="")
+        # Clear the "Running …" line and print all results in submission order.
+        print("\r" + " " * 70 + "\r", end="")
     for _r in _results:
         for _glyph, _label, _detail in _r.lines:
             if _detail:
@@ -2786,11 +2978,26 @@ def run_doctor(args):
         
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
-        
+
+        # Web is split into search/extract readiness rows so an explicitly
+        # selected but unconfigured backend cannot look healthy (#78412).
+        web_rows = []
+        if "web" in available or any(item.get("name") == "web" for item in unavailable):
+            web_rows = _doctor_web_capability_rows()
+            if web_rows:
+                available = [tid for tid in available if tid != "web"]
+                unavailable = [item for item in unavailable if item.get("name") != "web"]
+
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
             check_ok(info.get("name", tid), _doctor_tool_availability_detail(tid))
-        
+
+        for status, label, detail in web_rows:
+            if status == "ok":
+                check_ok(label, detail)
+            else:
+                check_warn(label, detail)
+
         for item in unavailable:
             env_vars = item.get("missing_vars") or item.get("env_vars") or []
             if env_vars:
@@ -2803,7 +3010,8 @@ def run_doctor(args):
         # current CLI platform. Default-off or explicitly disabled toolsets may
         # still show warnings above, but should not pollute the final summary.
         api_disabled = _missing_api_key_toolsets_for_summary(unavailable)
-        if api_disabled:
+        web_not_ready = any(status != "ok" for status, _, _ in web_rows)
+        if api_disabled or web_not_ready:
             issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")
