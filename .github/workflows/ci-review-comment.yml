@@ -2,12 +2,10 @@ name: CI review comment
 
 # Live-updating PR review comment.
 #
-# The poller runs for up to 40 minutes.
-# This run lives in its own workflow.
-# A run stays in progress until its last job ends, and GitHub refuses
-# ``gh run rerun`` on a run that is in progress.
+# The poller runs only after CI completes and is bounded to 10 minutes.
+# This keeps the final PR comment without reserving a runner while CI runs.
 #
-# ``workflow_run`` starts this when CI starts. It always reads the workflow
+# ``workflow_run`` starts this when CI finishes. It always reads the workflow
 # and the scripts from the default branch, never from the PR head.
 # It makes a write token safe here.
 #
@@ -17,25 +15,21 @@ name: CI review comment
 on:
   workflow_run:
     workflows: [CI]
-    # ``in_progress``, not ``requested``: a first-time contributor's run
-    # sits in ``action_required`` until a maintainer approves it, and
-    # ``requested`` fires at creation — the poller would wait out its
-    # whole timeout on a run that never starts. ``in_progress`` fires
-    # when the run actually starts, and it also fires on re-runs, which
-    # ``requested`` does not.
-    types: [in_progress]
+    # A completed CI run has final job results, so the comment does not need
+    # to occupy a hosted runner for the lifetime of CI.
+    types: [completed]
 
 permissions:
   contents: read
   actions: read
   pull-requests: write
 
-# One poller per CI run. A new push starts a new CI run, and its poller
-# cancels the poller of the run that GitHub superseded. The group keys
-# on the head repository too: fork PRs often share a branch name
-# (``main``, ``patch-1``), and two PRs must not cancel each other.
+# One bounded poller per PR. ``workflow_run.head_branch`` resolves to the
+# default branch for these runs, so using it puts unrelated PRs in one
+# cancellation group. The PR number keeps cancellation scoped correctly;
+# non-PR runs get a unique group and are skipped by the job condition.
 concurrency:
-  group: ci-review-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  group: ci-review-comment-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
   cancel-in-progress: true
 
 jobs:
@@ -45,9 +39,11 @@ jobs:
     # ``pull_requests`` payload is empty for a fork run.
     if: >-
       github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.pull_requests[0].number != '' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - name: Checkout trusted default branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -76,5 +72,5 @@ jobs:
           COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
         run: |
           python3 -u scripts/ci/live_comment.py \
-            --interval 15 \
-            --timeout 3000
+            --interval 30 \
+            --timeout 600
