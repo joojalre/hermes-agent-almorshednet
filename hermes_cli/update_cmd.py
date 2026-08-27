@@ -7675,14 +7675,40 @@ def _cmd_update_impl(args, gateway_mode: bool):
         #                    branch (local patches on top of main) is updated
         #                    IN PLACE from origin/<target> — the checkout
         #                    never moves, local commits survive, the running
-        #                    code advances. --switch-branch overrides back to
-        #                    the switch path for one run.
+        #                    code advances. The same policy protects maintained
+        #                    commits directly on the target branch too.
+        #                    --switch-branch overrides back to the switch path
+        #                    for one run.
         #   anything else -> dirty / unverifiable / opted out: touch nothing,
         #                    warn loudly, mark the code update SKIPPED, and
         #                    stop before the post-update steps reinforce the
         #                    stale tree.
         parked_branch_switched = False
-        in_place_update = False
+        _in_place_configured = False
+        try:
+            from hermes_cli.config import load_config as _load_cfg
+
+            _upd_cfg = (_load_cfg() or {}).get("updates", {})
+            _in_place_configured = (
+                isinstance(_upd_cfg, dict)
+                and _upd_cfg.get("parked_branch_strategy", "switch")
+                == "update_in_place"
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not read updates.parked_branch_strategy: %s", exc
+            )
+
+        in_place_update = (
+            current_branch == branch
+            and _in_place_configured
+            and not switch_branch
+        )
+        if in_place_update:
+            print(
+                f"  ℹ On target branch '{current_branch}' — updating it in place from "
+                f"origin/{branch} (local commits preserved)."
+            )
         if current_branch != branch and current_branch != "HEAD":
             switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
                 git_cmd, _m().PROJECT_ROOT, current_branch, branch
@@ -7705,20 +7731,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
                 sys.exit(1)
             if switch_block_reason.startswith("unmerged:"):
-                _in_place_configured = False
-                try:
-                    from hermes_cli.config import load_config as _load_cfg
-
-                    _upd_cfg = (_load_cfg() or {}).get("updates", {})
-                    _in_place_configured = (
-                        isinstance(_upd_cfg, dict)
-                        and _upd_cfg.get("parked_branch_strategy", "switch")
-                        == "update_in_place"
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Could not read updates.parked_branch_strategy: %s", exc
-                    )
                 if _in_place_configured and not switch_branch:
                     # The merge source must exist upstream; --branch typos
                     # previously surfaced through the checkout failing, which
@@ -8074,11 +8086,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     ).stdout
                     or ""
                 ).strip()
-                if _cur_branch and _cur_branch != branch:
-                    print(
-                        f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
-                        f"merging origin/{branch} instead of resetting so local commits survive..."
-                    )
+                if _cur_branch and (_cur_branch != branch or in_place_update):
+                    if _cur_branch == branch:
+                        print(
+                            f"  ⚠ Branch '{_cur_branch}' has maintained local history — "
+                            f"merging origin/{branch} instead of resetting so local commits survive..."
+                        )
+                    else:
+                        print(
+                            f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
+                            f"merging origin/{branch} instead of resetting so local commits survive..."
+                        )
                     has_merge_base, merge_base_error = _ensure_in_place_merge_base(
                         git_cmd, _m().PROJECT_ROOT, branch
                     )
