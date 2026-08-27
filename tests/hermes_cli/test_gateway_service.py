@@ -920,8 +920,119 @@ class TestGatewaySystemServiceRouting:
         assert result is False
         assert replacement_observed == [True]
 
+    def test_launchd_restart_uses_sigusr1_and_exit_wait_budget(self, monkeypatch, capsys):
+        """launchd_restart must take the same graceful path as systemd_restart.
 
+        Regression: it previously sent a bare SIGTERM and waited
+        ``_get_restart_drain_timeout()`` (default 0), so the wait could never
+        succeed and every restart fell through to ``kickstart -k``. A bare
+        SIGTERM leaves ``restart_requested`` False, so the gateway exits 1
+        instead of 75 and announces itself as "shutting down" rather than
+        "restarting", dropping the resume_pending handoff.
+        """
+        calls = []
 
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 654)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "probe_gateway_loop_liveness",
+            lambda pid, **kw: gateway_cli.GATEWAY_LOOP_ALIVE,
+        )
+        # Wait budget covers after-turn deferral + drain + headroom (#77184);
+        # the raw drain timeout (0 by default) must not be used here.
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 0.0)
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False: calls.append(("sigterm", pid)),
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **k: calls.append(("kickstart", a[0])) or SimpleNamespace(
+                returncode=0, stdout="", stderr=""
+            ),
+        )
+        monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+        # KeepAlive revives the label on a fresh PID — replacement observed.
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_pid",
+            lambda label, old_pid, timeout=10.0, *, domain: calls.append(
+                ("observe", label, old_pid, domain)
+            )
+            or True,
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert ("graceful", 654, 27.0) in calls
+        # A bare SIGTERM would strand the gateway on the unplanned-shutdown path.
+        assert not any(call[0] == "sigterm" for call in calls)
+        # ``-k`` after a successful graceful exit would kill the replacement.
+        assert not any(call[0] == "kickstart" for call in calls)
+        # The success message must follow an observed replacement PID.
+        assert ("observe", "ai.hermes.gateway", 654, "gui/501") in calls
+        out = capsys.readouterr().out
+        assert "up to 27s" in out
+        assert "up to 0s" not in out
+
+    def test_launchd_restart_forces_kickstart_when_no_replacement_appears(
+        self, monkeypatch, capsys
+    ):
+        """A graceful exit with no KeepAlive revival must not report success.
+
+        Detached-fallback gateways (macOS 26 unsupported-domain marker) and
+        unloaded jobs also exit cleanly on SIGUSR1, but nobody revives them —
+        and ``_graceful_restart_via_sigusr1`` returns True for an already-gone
+        PID. Without replacement observation the CLI would print
+        \"✓ Service restart requested\" while the gateway stays down.
+        """
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 654)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "probe_gateway_loop_liveness",
+            lambda pid, **kw: gateway_cli.GATEWAY_LOOP_ALIVE,
+        )
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
+        monkeypatch.setattr(
+            gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_pid",
+            lambda label, old_pid, timeout=10.0, *, domain: False,
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **k: calls.append(("kickstart", a[0])) or SimpleNamespace(
+                returncode=0, stdout="", stderr=""
+            ),
+        )
+        monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+
+        gateway_cli.launchd_restart()
+
+        # No replacement observed → must escalate to kickstart -k.
+        assert any(call[0] == "kickstart" for call in calls)
+        out = capsys.readouterr().out
+        assert "did not revive" in out
+        assert "✓ Service restarted" in out
 
 
 
@@ -1490,7 +1601,6 @@ class TestProfileArg:
             "mybot",
             "gateway",
             "run",
-            "--replace",
             "--external-supervisor",
         ]
 
@@ -2147,6 +2257,44 @@ class TestServiceWorkingDirIsStable:
         assert m, "plist has no WorkingDirectory entry"
         assert Path(m.group(1)).resolve() == home.resolve()
         assert "/.worktrees/" not in m.group(1)
+
+
+class TestServiceTakeoverGovernance:
+    """Supervised service definitions must never arm ``--replace`` takeover.
+
+    Regression for #79048: two launchd-supervised profile gateways sharing
+    one platform token (e.g. the same Discord bot) entered an endless
+    mutual-eviction loop because the generated plist armed ``--replace`` on
+    every KeepAlive respawn: each revived process was authorized to terminate
+    the sibling holding the shared token, and launchd immediately revived the
+    victim. The systemd unit already runs ``gateway run`` without
+    ``--replace``; the launchd plist must match so a supervised restart can
+    never evict a legitimate cross-profile lock holder. Bounded replacement
+    stays the lifecycle commands' job (kickstart -k / drain / bootout).
+    """
+
+    def test_launchd_plist_does_not_arm_takeover(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        plist = gateway_cli.generate_launchd_plist()
+        # The whole bug class: no --replace anywhere in the supervised argv.
+        assert "--replace" not in plist
+        # It still runs the plain gateway command under KeepAlive.
+        assert "<string>gateway</string>" in plist
+        assert "<string>run</string>" in plist
+        assert "<key>KeepAlive</key>" in plist
+        assert "<true/>" in plist
+
+    def test_systemd_unit_does_not_arm_takeover(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+        unit = gateway_cli.generate_systemd_unit(system=False)
+        exec_starts = [l for l in unit.splitlines() if l.startswith("ExecStart=")]
+        assert exec_starts, "unit has no ExecStart line"
+        # The safe service posture the launchd plist now mirrors.
+        assert "--replace" not in exec_starts[0]
 
 
 class TestLaunchctlBootstrapEioRetry:
