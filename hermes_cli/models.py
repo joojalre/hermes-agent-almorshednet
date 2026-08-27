@@ -115,7 +115,6 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("moonshotai/kimi-k3",                     "recommended"),
     # MiniMax
     ("minimax/minimax-m3",                     ""),
-    ("minimax/minimax-m3:free",                "free"),
     # Z-AI
     ("z-ai/glm-5.3",                           ""),
     ("z-ai/glm-5.3-flash",                     ""),
@@ -135,6 +134,9 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # OpenRouter routers
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     # Free tier
+    ("thinkingmachines/inkling:free",          "free"),
+    ("thinkingmachines/inkling-small:free",    "free"),
+    ("minimax/minimax-m3:free",                "free"),
     ("openrouter/elephant-alpha",              "free"),
     ("z-ai/glm-5.2:free",                      "free"),
     ("poolside/laguna-s-2.1:free",             "free"),

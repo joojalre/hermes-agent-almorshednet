@@ -494,7 +494,7 @@ function groupActivityLabel(event) {
   const kind = event?.kind
   const base = GROUP_ACTIVITY_LABELS[kind] || kind || 'did something'
 
-  if (kind === 'cancelled' || kind === 'settled') {
+  if (kind === 'cancelled' || kind === 'settled' || kind === 'capped') {
     return base
   }
 
@@ -512,6 +512,7 @@ const GROUP_ACTIVITY_LABELS = {
   failed: 'hit an error',
   cancelled: 'turn interrupted by a newer message',
   settled: 'turn settled',
+  capped: 'turn stopped at the round/message cap',
   delivered: 'delivered a late reply',
   held: 'is held (stopped by you) — @mention it or say resume to release'
 }
@@ -525,6 +526,7 @@ const GROUP_ACTIVITY_GLYPHS = {
   failed: 'error',
   cancelled: 'close',
   settled: 'check-all',
+  capped: 'debug-step-over',
   delivered: 'mail-read',
   held: 'debug-pause'
 }
@@ -6698,7 +6700,10 @@ function knownGroups(metaByName) {
 // room messages that are NEW since it last saw the room.
 
 const GROUP_CHAT_MAX_ROUNDS = 3
+
+// #94478 review: continuation rounds are bounded independently of the message cap so a pathological mention chain can't consume the room's whole budget on handoffs.
 const GROUP_CHAT_MAX_MESSAGES = 10
+const GROUP_CHAT_MAX_CONTINUATIONS = 2
 const GROUP_CHAT_HISTORY_LIMIT = 24
 const GROUP_CHAT_MAX_MEMBERS = 6
 
@@ -7979,6 +7984,73 @@ function heldMemberWatermarkAdvance(seen, logLength) {
 
 // --- end member-hold helpers ---
 
+/** Members cited by @mention in a thread who have not posted any entry after
+ *  the citing one — the unresolved-handoff detector for #94478. A mention
+ *  inside a member reply is visible to the NEXT round's responder selection,
+ *  but the round loop exits first when nobody has new delta to read
+ *  (`spokeThisRound === 0`) or a cap lands, so the room settles while a
+ *  called bot never answers. Returns member keys still owed a turn. */
+function unaddressedGroupMentions(group, members, thread) {
+  const room = $groupChats.get()[group] || { log: [] }
+  const log = (room.log || []).filter(e => groupThreadOf(e) === thread)
+
+  // key → log INDEX of the entry that most recently cited this member.
+  // Entry ids are UUIDs (groupChatEntryId), NOT monotonic — index order is
+  // the only guaranteed ordering, and it is what "answered after the citing
+  // entry" actually means. (#94478 review)
+  const citedAt = new Map()
+
+  for (const entry of log) {
+    const parsed = parseGroupChatMentions(entry.text || '', members)
+
+    // A user send re-drives everyone anyway; only member-to-member handoffs
+    // can strand here.
+    if (entry.from.kind !== 'member') {
+      continue
+    }
+
+    for (const key of parsed.mentioned) {
+      const citingMemberKey = (() => {
+        const m = members.find(mm => mm.name === entry.from?.name)
+
+        return m ? groupMemberKey(m) : null
+      })()
+
+      // Never count a bot citing itself as a pending handoff.
+      if (citingMemberKey && citingMemberKey !== key) {
+        citedAt.set(key, log.indexOf(entry))
+      }
+    }
+  }
+
+  // A citation is answered when the cited member posts any entry after the
+  // citing one (its turn, whatever the content).
+  const lastPostAt = new Map()
+
+  for (const entry of log) {
+    if (entry.from.kind !== 'member') {
+      continue
+    }
+
+    const speakerKey = (() => {
+      const m = members.find(mm => mm.name === entry.from?.name)
+
+      return m ? groupMemberKey(m) : null
+    })()
+
+    if (speakerKey) {
+      lastPostAt.set(speakerKey, log.indexOf(entry))
+    }
+  }
+
+  return [...citedAt.keys()].filter(key => {
+    const citedIdx = citedAt.get(key)
+    const answeredIdx = lastPostAt.get(key)
+
+    return answeredIdx === undefined || answeredIdx <= citedIdx
+  })
+}
+
 /** Drive one bounded round-robin turn for ONE THREAD. Serial — one member at
  *  a time. A newer user send bumps the room epoch; this loop notices at the
  *  next member boundary, bails, and the newest send's own loop takes over.
@@ -7988,6 +8060,11 @@ async function runGroupChatRounds(group, members, thread) {
   const startEpoch = ($groupChats.get()[group] || {}).epoch || 0
   const isCurrent = () => (($groupChats.get()[group] || {}).epoch || 0) === startEpoch
   let posted = 0
+  let continuations = 0
+  // #94478: how this drive ended. 'settled' means quiet consensus (everyone
+  // passed with nothing pending); 'capped' means a round/message/continuation
+  // cap forced the exit — the activity feed must tell those apart.
+  let exitKind = 'settled'
 
   try {
     for (let round = 0; round < GROUP_CHAT_MAX_ROUNDS; round++) {
@@ -8025,6 +8102,8 @@ async function runGroupChatRounds(group, members, thread) {
         if (!isCurrent() || posted >= GROUP_CHAT_MAX_MESSAGES) {
           if (!isCurrent()) {
             recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
+          } else {
+            exitKind = 'capped' // message cap, not consensus (#94478)
           }
           return
         }
@@ -8166,12 +8245,135 @@ async function runGroupChatRounds(group, members, thread) {
       }
 
       if (spokeThisRound === 0) {
-        return // everyone passed — the conversation settled
+        // #94478: "everyone passed" is NOT the only way a round can go quiet —
+        // responders can be narrowed to members with no new delta while the
+        // thread's tail carries an @mention handoff that was never answered.
+        // Before settling, check for cited members still owed a turn and run
+        // one bounded continuation round for exactly those members. If none
+        // exist (or the continuation also goes quiet), the room genuinely
+        // settled.
+        const pendingKeys = unaddressedGroupMentions(group, members, thread)
+
+        // #94478 review: bound continuation rounds independently of the
+        // message cap so a pathological mention chain can't consume the
+        // room's entire budget on back-and-forth handoffs.
+        continuations += 1
+
+        if (pendingKeys.length && continuations <= GROUP_CHAT_MAX_CONTINUATIONS) {
+          const citedMembers = members.filter(member => pendingKeys.includes(groupMemberKey(member)))
+
+          if (citedMembers.length && posted < GROUP_CHAT_MAX_MESSAGES) {
+            const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
+            const continuationResponders = citedMembers.filter(
+              member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member))
+            )
+
+            for (const member of continuationResponders) {
+              if (!isCurrent() || posted >= GROUP_CHAT_MAX_MESSAGES || continuations > GROUP_CHAT_MAX_CONTINUATIONS) {
+                break
+              }
+
+              const room = $groupChats.get()[group] || { log: [], watermarks: {} }
+              const memberKey = groupMemberKey(member)
+              const markKey = `${thread}::${memberKey}`
+              const seen = room.watermarks[markKey] || 0
+              const delta = room.log.slice(seen).filter(e => groupThreadOf(e) === thread)
+
+              // A cited member always has delta here (the citing reply IS in
+              // its tail); skip defensively anyway so an empty prompt never
+              // fires.
+              if (!delta.length) {
+                continue
+              }
+
+              const heldEntry = (room.holds || {})[memberKey]
+
+              if (heldEntry) {
+                continue // holds still apply to continuation turns (#93129)
+              }
+
+              const prompt = buildGroupChatTurnPrompt({
+                groupName: group,
+                members,
+                viewer: member,
+                // The continuation prompt centers on what the member missed:
+                // everything since its watermark, which includes the reply
+                // that cites it.
+                deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
+              })
+
+              updateGroupChat(group, r => {
+                r.turn = member.name
+                return r
+              })
+
+              let continuationReply = null
+
+              try {
+                continuationReply = await runGroupChatMemberTurn(group, member, prompt, thread)
+
+                if (continuationReply !== null) {
+                  clearBotAttention(memberKey)
+                }
+              } catch (error) {
+                recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
+                noteBotAttention(memberKey, error?.message || error)
+                continuationReply = null
+              }
+
+              if (!isCurrent()) {
+                return
+              }
+
+              updateGroupChat(group, r => {
+                r.watermarks[markKey] = r.log.length
+                return r
+              })
+
+              if (continuationReply !== null && !isGroupPassText(continuationReply)) {
+                appendGroupChatEntry(
+                  group,
+                  { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
+                  continuationReply,
+                  thread
+                )
+                updateGroupChat(group, r => {
+                  r.watermarks[markKey] = r.log.length
+                  return r
+                })
+                posted += 1
+
+                // The continuation's own reply may cite someone else — fall
+                // through to the normal loop so the next round handles it via
+                // the same responder machinery. Reaching here means the loop
+                // continues rather than settling; the outer for-loop's next
+                // iteration re-evaluates everything.
+                spokeThisRound += 1
+              }
+            }
+          }
+        }
+
+        if (spokeThisRound === 0) {
+          // Genuinely nothing left to say — including after the continuation
+          // attempt above produced no spoken turns. Settle honestly, but if
+          // cited members are STILL owed a turn and only the continuation /
+          // message caps stopped us from driving them, this is a capped
+          // exit, not consensus. (#94478)
+          if (pendingKeys.length && (continuations > GROUP_CHAT_MAX_CONTINUATIONS || posted >= GROUP_CHAT_MAX_MESSAGES)) {
+            exitKind = 'capped'
+          }
+          return
+        }
       }
     }
+
+    // All GROUP_CHAT_MAX_ROUNDS rounds ran with someone still speaking —
+    // the round cap ended the drive, not consensus. (#94478)
+    exitKind = 'capped'
   } finally {
     if (isCurrent()) {
-      recordGroupActivity(group, { kind: 'settled', member: null, thread })
+      recordGroupActivity(group, { kind: exitKind, member: null, thread })
       updateGroupChat(group, r => {
         r.running = false
         r.turn = null
