@@ -689,13 +689,21 @@ def _real_profile_autoclose() -> bool:
     return False
 
 
-def _processes_holding_profile(src: str):
+_BROWSER_PROCESS_NAMES = {
+    "chrome": ("chrome", "chrome.exe", "google chrome"),
+    "chromium": ("chromium", "chromium.exe", "chromium-browser"),
+    "brave": ("brave", "brave.exe", "brave-browser"),
+    "edge": ("msedge", "msedge.exe", "microsoft-edge"),
+}
+
+
+def _processes_holding_profile(src: str, browser: str | None = None):
     """Yield (psutil.Process) instances holding the user-data-dir ``src`` open.
 
-    Identity discipline mirrors the daemon reaper: a process qualifies only when
-    it's a Chromium-family binary AND its command line references THIS
-    user-data-dir — so we never terminate an unrelated same-PID process. Any
-    ambiguity (unreadable cmdline) is skipped, fail-closed.
+    Identity discipline mirrors the daemon reaper: a process qualifies only
+    when it is the requested Chromium family and either references THIS
+    user-data-dir explicitly or uses that family's implicit default profile.
+    Any ambiguity (unknown family or unreadable cmdline) is skipped fail-closed.
     """
     try:
         import psutil
@@ -710,24 +718,46 @@ def _processes_holding_profile(src: str):
         try:
             name = (proc.info.get("name") or "").lower()
             cmd = proc.info.get("cmdline") or []
-            joined = " ".join(cmd)
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
+        if not cmd:
+            continue
+        argv0 = os.path.basename(cmd[0]).lower() if cmd else ""
         if not any(b in name for b in browser_bins):
             # Some platforms report a generic name; also accept when the binary
             # in argv[0] looks like a browser.
-            argv0 = (cmd[0].lower() if cmd else "")
             if not any(b in argv0 for b in browser_bins):
                 continue
-        # Binding: the exact user-data-dir must appear in the cmdline
-        # (--user-data-dir=<src>), normalized for case/separators.
-        if norm not in os.path.normcase(os.path.normpath(joined)) and \
-           f"--user-data-dir={src}".lower() not in joined.lower():
+
+        if browser:
+            expected_names = _BROWSER_PROCESS_NAMES.get(browser, ())
+            if not any(token in name or token in argv0 for token in expected_names):
+                continue
+
+        explicit_dirs: list[str] = []
+        for index, arg in enumerate(cmd):
+            lower = arg.lower()
+            if lower.startswith("--user-data-dir="):
+                explicit_dirs.append(arg.split("=", 1)[1].strip('"\''))
+            elif lower == "--user-data-dir" and index + 1 < len(cmd):
+                explicit_dirs.append(cmd[index + 1].strip('"\''))
+
+        if explicit_dirs:
+            if not any(
+                os.path.normcase(os.path.normpath(candidate)) == norm
+                for candidate in explicit_dirs
+            ):
+                continue
+        elif not browser:
+            # Without a known browser family, an implicit default-dir process
+            # cannot be bound safely to this profile.
             continue
         yield proc
 
 
-def close_browser_holding_profile(src: str, timeout: float = 15.0) -> tuple[bool, str]:
+def close_browser_holding_profile(
+    src: str, timeout: float = 15.0, *, browser: str | None = None
+) -> tuple[bool, str]:
     """Terminate the browser process tree holding ``src`` and wait for release.
 
     CONSENTED, DESTRUCTIVE. Only call after the user has agreed to close their
@@ -742,7 +772,7 @@ def close_browser_holding_profile(src: str, timeout: float = 15.0) -> tuple[bool
     except ImportError:
         return False, "psutil unavailable — cannot close the browser automatically."
 
-    procs = list(_processes_holding_profile(src))
+    procs = list(_processes_holding_profile(src, browser=browser))
     if not procs:
         # Nothing we can see holds it. Either already closed, or the holder is
         # a different user / unreadable — caller re-probes the lock.
@@ -844,7 +874,14 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     # Only a copy that previously COMPLETED counts as populated. A half-written
     # tree (no marker) is treated as absent and rebuilt — otherwise a torn first
     # copy poisons freshness forever and only ever gets auth overlays.
-    populated = os.path.isfile(marker)
+    marker_profile = None
+    if os.path.isfile(marker):
+        try:
+            with open(marker, encoding="utf-8") as fh:
+                marker_profile = fh.read().strip()
+        except OSError as e:
+            logger.debug("real-profile snapshot: could not read done marker: %s", e)
+    populated = marker_profile == source_profile
     try:
         os.makedirs(dst, exist_ok=True)
         # Secure the snapshot dir AND its browser-profile parent on EVERY
@@ -874,6 +911,10 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
             # _mirror_profile_auth below (sqlite online-backup).
             dst_default = os.path.join(dst, "Default")
             try:
+                try:
+                    os.unlink(marker)
+                except OSError:
+                    pass
                 shutil.rmtree(dst_default, ignore_errors=True)
                 shutil.copytree(
                     os.path.join(src, source_profile),
@@ -884,10 +925,11 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                     ignore_dangling_symlinks=True,
                 )
             except shutil.Error as multi:
-                # Per-file failures (browser mid-write) are non-fatal.
-                logger.info(
-                    "real-profile snapshot: %d file(s) skipped copying %s/%s",
-                    len(multi.args[0]) if multi.args else 0, src, source_profile,
+                failures = len(multi.args[0]) if multi.args else 0
+                return None, (
+                    f"real-profile snapshot is incomplete: {failures} file(s) "
+                    f"could not be copied from {src}/{source_profile}. Close "
+                    f"{browser} and retry."
                 )
 
         # Both paths: copy the active profile's auth DBs into Default,
@@ -921,19 +963,26 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     return dst, None
 
 
-def cleanup_real_profile_snapshots() -> None:
+def cleanup_real_profile_snapshots() -> str | None:
     """Delete the whole real-profile snapshot store (all copied credentials).
 
     Called when consent is OFF: the copied Cookies / Login Data must not
-    outlive the toggle. Best-effort and idempotent — missing dir is fine.
+    outlive the toggle. Returns an error string if verified removal fails.
     """
     root = str(get_hermes_home() / "browser-profile")
     try:
-        if os.path.isdir(root):
-            shutil.rmtree(root, ignore_errors=True)
+        if os.path.lexists(root):
+            if os.path.isdir(root) and not os.path.islink(root):
+                shutil.rmtree(root)
+            else:
+                os.unlink(root)
+            if os.path.lexists(root):
+                return f"real-profile snapshot cleanup did not remove {root}"
             logger.info("real-profile: removed snapshot store %s (consent off)", root)
     except OSError as e:
-        logger.debug("real-profile cleanup failed for %s: %s", root, e)
+        logger.warning("real-profile cleanup failed for %s: %s", root, e)
+        return f"could not remove real-profile snapshot store {root}: {e}"
+    return None
 
 
 def get_chrome_debug_candidates(system: str) -> list[str]:

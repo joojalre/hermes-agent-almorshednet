@@ -402,6 +402,26 @@ def get_read_block_error(path: str) -> Optional[str]:
             "can still bypass.)"
         )
 
+    # Profile mode keeps sibling homes at <root>/profiles/<name>. The active
+    # profile and root checks above do not cover a different sibling, so block
+    # that structural path without relying on directory enumeration.
+    try:
+        profiles_root = (_hermes_root_path() / "profiles").resolve()
+        profile_relative = resolved.relative_to(profiles_root)
+    except (OSError, ValueError):
+        profile_relative = None
+    if (
+        profile_relative is not None
+        and len(profile_relative.parts) >= 2
+        and profile_relative.parts[1].lower() == "browser-profile"
+    ):
+        return (
+            f"Access denied: {path} is inside a Hermes profile's real-profile "
+            "browser snapshot (copied cookies/logins) and cannot be read "
+            "directly. (Defense-in-depth — not a security boundary; the "
+            "terminal tool can still bypass.)"
+        )
+
     # Block common secret-bearing project-local .env files anywhere on disk.
     # The agent helping a user with their project rarely needs to read raw
     # .env contents — .env.example is the documented-shape substitute. The

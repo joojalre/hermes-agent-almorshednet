@@ -13319,7 +13319,7 @@ def main():
         if not src:
             print(f"✗ Could not resolve the {browser} profile directory.", file=sys.stderr)
             return 1
-        closed, msg = close_browser_holding_profile(src)
+        closed, msg = close_browser_holding_profile(src, browser=browser)
         if closed:
             print(f"✓ {msg}")
             return 0
