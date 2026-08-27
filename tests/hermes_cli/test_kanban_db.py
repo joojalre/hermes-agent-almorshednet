@@ -566,7 +566,12 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    listed_worktrees = {
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in listed.splitlines()
+        if line.startswith("worktree ")
+    }
+    assert target.resolve() in listed_worktrees
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -1007,6 +1012,39 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
     )
 
 
+def test_sqlite_connect_closes_tracked_conn_on_setup_failure(tmp_path, monkeypatch):
+    """A PRAGMA failure after connect must not abandon a tracked kanban fd."""
+    from hermes_cli import sqlite_safe_read
+
+    db_path = tmp_path / "kanban.db"
+    real_connect = sqlite3.connect
+    opened = []
+
+    class _BusyTimeoutFailure(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+            if str(sql).startswith("PRAGMA busy_timeout="):
+                raise sqlite3.OperationalError("simulated setup failure")
+            return super().execute(sql, *args, **kwargs)
+
+    def failing_connect(*args, **kwargs):
+        kwargs.pop("factory", None)
+        conn = real_connect(*args, factory=_BusyTimeoutFailure, **kwargs)
+        opened.append(conn)
+        return conn
+
+    key = sqlite_safe_read._key(db_path)
+    with sqlite_safe_read._live_lock:
+        before = sqlite_safe_read._live_connections.get(key, 0)
+    monkeypatch.setattr(kb.sqlite3, "connect", failing_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="simulated setup failure"):
+        kb._sqlite_connect(db_path)
+
+    with sqlite_safe_read._live_lock:
+        after = sqlite_safe_read._live_connections.get(key, 0)
+    assert after == before
+
+
 def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     """Regression test for issue #22459.
 
@@ -1156,6 +1194,7 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(kb, "_safe_which_no_cwd", lambda name: None)
     argv = kb._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 

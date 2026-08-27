@@ -35,8 +35,10 @@ function resolvePortAnnounceTimeoutMs(env = process.env) {
 }
 
 /**
- * Watch a child process's stdout for the `HERMES_(BACKEND|DASHBOARD)_READY
- * port=<N>` line that web_server.py prints after uvicorn binds its socket.
+ * Watch a child process's stdout and stderr for the
+ * `HERMES_(BACKEND|DASHBOARD)_READY port=<N>` line that web_server.py prints
+ * after uvicorn binds its socket. Some packaged Windows runtimes route the
+ * announcement through stderr even though the backend is healthy.
  *
  * Returns the parsed port. Rejects if:
  *   - the child exits before emitting the line
@@ -53,7 +55,6 @@ function resolvePortAnnounceTimeoutMs(env = process.env) {
  */
 function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(), describeOutputTail = () => '') {
   return new Promise((resolve, reject) => {
-    let buf = ''
     let done = false
 
     function cleanup() {
@@ -63,28 +64,36 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(),
 
       done = true
       clearTimeout(timer)
-      child.stdout.off('data', onData)
+      child.stdout.off('data', onStdoutData)
+      child.stderr?.off('data', onStderrData)
       child.off('exit', onExit)
       child.off('error', onError)
     }
 
-    function onData(chunk) {
-      buf += chunk.toString()
-      let nl
+    function makeDataHandler() {
+      let buf = ''
 
-      while ((nl = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, nl)
-        buf = buf.slice(nl + 1)
-        const m = line.match(_READY_RE)
+      return function onData(chunk) {
+        buf += chunk.toString()
+        let nl
 
-        if (m) {
-          cleanup()
-          resolve(parseInt(m[1], 10))
+        while ((nl = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, nl)
+          buf = buf.slice(nl + 1)
+          const m = line.match(_READY_RE)
 
-          return
+          if (m) {
+            cleanup()
+            resolve(parseInt(m[1], 10))
+
+            return
+          }
         }
       }
     }
+
+    const onStdoutData = makeDataHandler()
+    const onStderrData = makeDataHandler()
 
     function onExit(code, signal) {
       cleanup()
@@ -101,7 +110,8 @@ function waitForDashboardPort(child, timeoutMs = resolvePortAnnounceTimeoutMs(),
       reject(new Error(`Timed out waiting for Hermes backend port announcement (${timeoutMs}ms)`))
     }, timeoutMs)
 
-    child.stdout.on('data', onData)
+    child.stdout.on('data', onStdoutData)
+    child.stderr?.on('data', onStderrData)
     child.on('exit', onExit)
     child.on('error', onError)
   })
