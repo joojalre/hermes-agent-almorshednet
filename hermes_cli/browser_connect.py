@@ -216,7 +216,11 @@ def real_profile_data_dir(browser: str, system: str | None = None) -> str | None
         return None
     system = system or platform.system()
     mac_parts, win_parts, linux_name = _real_profile_relparts(browser)
-    home = os.path.expanduser("~")
+    if system == "Windows":
+        home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    else:
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        home = home.replace("\\", "/")
     if system == "Darwin":
         return posixpath.join(home, "Library", "Application Support", *mac_parts)
     if system == "Windows":

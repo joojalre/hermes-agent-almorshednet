@@ -145,6 +145,7 @@ class TestRealProfileCdpLaunch:
         self._reset()
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch.object(bt, "_agent_browser_get_cdp", return_value=None), \
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(None, "boom")):
             cdp, err = bt._real_profile_cdp()
         assert cdp is None
