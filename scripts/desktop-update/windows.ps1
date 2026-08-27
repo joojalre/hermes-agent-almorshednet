@@ -167,9 +167,11 @@ function Start-UiServer([string]$HtmlPath) {
 
         $rs = [runspacefactory]::CreateRunspace()
         $rs.Open()
+        $ready = [System.Threading.ManualResetEventSlim]::new($false)
         $rs.SessionStateProxy.SetVariable("Listener", $listener)
         $rs.SessionStateProxy.SetVariable("State", $script:UiState)
         $rs.SessionStateProxy.SetVariable("HtmlBytes", [System.IO.File]::ReadAllBytes($HtmlPath))
+        $rs.SessionStateProxy.SetVariable("Ready", $ready)
 
         $ps = [powershell]::Create()
         $ps.Runspace = $rs
@@ -181,6 +183,11 @@ function Start-UiServer([string]$HtmlPath) {
                 $Stream.Write($Body, 0, $Body.Length)
                 $Stream.Flush()
             }
+            # Signal only after this dedicated runspace is executing. Without
+            # the handshake the caller can publish the URL while BeginInvoke
+            # is still queued on a loaded Windows runner, leaving /progress
+            # connected but unanswered for several seconds.
+            $Ready.Set()
             while ($true) {
                 try { $client = $Listener.AcceptTcpClient() } catch { break }  # Stop() ends the loop
                 try {
@@ -212,9 +219,16 @@ function Start-UiServer([string]$HtmlPath) {
         })
         [void]$ps.BeginInvoke()
 
-        return @{ Listener = $listener; Runspace = $rs; PowerShell = $ps; Port = $port; BrowserProc = $null; Profile = $null }
+        if (-not $ready.Wait([TimeSpan]::FromSeconds(30))) {
+            throw "Timed out starting the desktop update progress server."
+        }
+
+        return @{ Listener = $listener; Runspace = $rs; PowerShell = $ps; Ready = $ready; Port = $port; BrowserProc = $null; Profile = $null }
     } catch {
         try { if ($listener) { $listener.Stop() } } catch {}
+        try { if ($ps) { $ps.Stop(); $ps.Dispose() } } catch {}
+        try { if ($rs) { $rs.Close(); $rs.Dispose() } } catch {}
+        try { if ($ready) { $ready.Dispose() } } catch {}
         return $null
     }
 }
@@ -224,6 +238,7 @@ function Stop-UiServer([switch]$LeaveWindow) {
     try { $script:UiServer.Listener.Stop() } catch {}
     try { $script:UiServer.PowerShell.Stop() } catch {}
     try { $script:UiServer.Runspace.Close() } catch {}
+    try { if ($script:UiServer.Ready) { $script:UiServer.Ready.Dispose() } } catch {}
     # On success the window closes itself out from under the user (the whole
     # point); on error we LEAVE it — the page holds the failure state and the
     # user closes it when they've read it.
