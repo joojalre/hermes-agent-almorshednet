@@ -77,7 +77,7 @@ jobs:
           if [ -z "$pr_number" ]; then
             pr_number=$(gh api \
               "repos/$REPO/commits/$HEAD_SHA/pulls" \
-              --jq '.[0].number // empty' 2>/dev/null || true)
+              --jq 'map(select(.state == "open")) | .[0].number // empty' 2>/dev/null || true)
           fi
           if [ -z "$pr_number" ]; then
             echo "No pull request is associated with $HEAD_SHA; nothing to rerun."
