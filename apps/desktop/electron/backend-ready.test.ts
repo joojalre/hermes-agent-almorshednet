@@ -108,6 +108,14 @@ test('resolves when the Windows runtime announces readiness on stderr', async ()
   assert.equal(await p, 43211)
 })
 
+test('parses a Windows stderr announcement split across chunks', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stderr.emit('data', 'HERMES_BACKEND_READY po')
+  child.stderr.emit('data', 'rt=43212\r\n')
+  assert.equal(await p, 43212)
+})
+
 test('parses the port even when the line arrives split across chunks', async () => {
   const child = makeFakeChild()
   const p = waitForDashboardPort(child, 1000)
