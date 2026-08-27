@@ -1197,6 +1197,12 @@ if ($SelfTestPipeDrain) {
     New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
     $hold = 60
     if ($env:HERMES_SELFTEST_HOLD_SECONDS) { $hold = [int]$env:HERMES_SELFTEST_HOLD_SECONDS }
+    # The production idle ceiling is intentionally long (10 minutes), while
+    # this fixture must outlive the watchdog to prove cancellation. Keep the
+    # self-test self-contained instead of relying on an undocumented caller
+    # environment override.
+    if ($hold -lt 3) { $hold = 3 }
+    $script:StepIdleTimeoutSeconds = [Math]::Min(5, $hold - 1)
     $floodKb = 8192
     if ($env:HERMES_SELFTEST_FLOOD_KB) { $floodKb = [int]$env:HERMES_SELFTEST_FLOOD_KB }
     # $PSHOME is this interpreter's own directory -- no hardcoded system path.
