@@ -702,6 +702,10 @@ _wal_fallback_warned_lock = threading.Lock()
 _wal_reset_bug_warned_paths: set[str] = set()
 _wal_reset_bug_warned_lock = threading.Lock()
 
+# Dedup ERROR for the "configured delete overridden by on-disk WAL" warning.
+_delete_overridden_warned_paths: set[str] = set()
+_delete_overridden_warned_lock = threading.Lock()
+
 def _set_last_init_error(msg: Optional[str]) -> None:
     """Record (or clear) the most recent state.db init failure.
 
@@ -1034,6 +1038,31 @@ def sqlite_source_id() -> str:
     return str(row[0])
 
 
+def _database_has_content(conn: sqlite3.Connection) -> bool:
+    """Return whether the database file already holds pages.
+
+    Used to tell an EXISTING database apart from a brand-new one before
+    rewriting its journal mode. ``PRAGMA page_count`` is a header read, so
+    this costs nothing and takes no lock.
+
+    Fail-quiet: any error, or a database we cannot measure, answers False.
+    The only caller uses this to decide whether to emit a warning, and a
+    warning that fires when the answer is unknown would fire on every fresh
+    database -- precisely the case where there is provably no operator choice
+    being overwritten.
+    """
+    try:
+        row = conn.execute("PRAGMA page_count").fetchone()
+    except sqlite3.Error:
+        return False
+    if not row or row[0] is None:
+        return False
+    try:
+        return int(row[0]) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def resolve_journal_mode() -> str:
     """Return the configured journal mode (``wal`` or ``delete``).
 
@@ -1145,6 +1174,10 @@ def apply_wal_with_fallback(
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
     current_mode = _on_disk_journal_mode(conn)
     if current_mode == "wal":
+        if configured == "delete":
+            # Never-live-downgrade keeps this WAL; tell the operator their
+            # configured delete did not apply (see _log_configured_delete_overridden_once).
+            _log_configured_delete_overridden_once(db_label)
         _apply_wal_size_limit(conn)
         _apply_macos_checkpoint_barrier(conn)
         _enforce_macos_synchronous_full(conn)
@@ -1173,6 +1206,21 @@ def apply_wal_with_fallback(
             )
         return actual
 
+    # Decide BEFORE the flip whether it would silently overwrite a mode
+    # somebody chose. Both inputs are only readable while the file is still
+    # in its original state: `current_mode` is the probe above, and
+    # page_count distinguishes an existing database from a fresh one.
+    #
+    # A 0-page database has no prior choice to overwrite, and every caller
+    # reaches this before creating any schema (SessionDB._connect_and_init
+    # applies WAL, then _init_schema), so brand-new databases land here empty
+    # and stay quiet.
+    _upgrading_existing_db = (
+        current_mode is not None
+        and current_mode != "wal"
+        and _database_has_content(conn)
+    )
+
     try:
         # ``PRAGMA journal_mode=WAL`` is a query-that-sets: it RETURNS the
         # resulting journal mode. Network filesystems that refuse WAL by
@@ -1186,6 +1234,8 @@ def apply_wal_with_fallback(
         row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
         mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
         if mode == "wal":
+            if _upgrading_existing_db:
+                _log_journal_mode_upgrade_once(db_label, current_mode)
             _apply_wal_size_limit(conn)
             _apply_macos_checkpoint_barrier(conn)
             _enforce_macos_synchronous_full(conn)
@@ -1235,6 +1285,11 @@ def apply_wal_with_fallback(
                     else ""
                 )
                 if mode == "wal":
+                    # Same flip, later door: a transient EIO cleared and the
+                    # switch went through. The header rewrite is identical, so
+                    # the signal must be too.
+                    if _upgrading_existing_db:
+                        _log_journal_mode_upgrade_once(db_label, current_mode)
                     _apply_wal_size_limit(conn)
                     _apply_macos_checkpoint_barrier(conn)
                     _enforce_macos_synchronous_full(conn)
@@ -1312,9 +1367,15 @@ def _apply_delete_for_wal_reset_bug(
     current = _on_disk_journal_mode(conn)
 
     if current == "wal":
-        # Do not TRUNCATE / journal_mode=DELETE while other processes may
-        # still hold this WAL DB open — same safety rule as the NFS path.
         _log_wal_reset_bug_once(db_label, kept_wal=True)
+        if require_delete:
+            # The vulnerability warning above suggests upgrading SQLite, which
+            # does not help on a WAL-incompatible filesystem; surface that the
+            # configured delete is not in effect (see _log_configured_delete_overridden_once).
+            # Emitted last so the actionable message is the final one in the log.
+            _log_configured_delete_overridden_once(db_label)
+        # Do not TRUNCATE / journal_mode=DELETE while other processes may
+        # still hold this WAL DB open; same safety rule as the NFS path.
         _apply_wal_size_limit(conn)
         _apply_macos_checkpoint_barrier(conn)
         _enforce_macos_synchronous_full(conn)
@@ -1386,6 +1447,12 @@ def _wal_reset_repair_hint() -> str:
     )
 
 
+# Dedup state for _log_journal_mode_upgrade_once, mirroring the
+# _wal_fallback_warned_* pair below it.
+_journal_upgrade_warned_paths: set = set()
+_journal_upgrade_warned_lock = threading.Lock()
+
+
 def _log_wal_reset_bug_once(
     db_label: str,
     *,
@@ -1428,6 +1495,47 @@ def _log_wal_reset_bug_once(
     )
 
 
+def _log_journal_mode_upgrade_once(db_label: str, previous_mode: str) -> None:
+    """Log a single WARNING per (process, db_label) about a non-WAL -> WAL flip.
+
+    ``PRAGMA journal_mode`` is a property of the FILE, not of the connection:
+    switching an existing database to WAL rewrites its header and outlives the
+    process that did it. Operators do set it directly on the file -- that was
+    the documented mitigation for the SQLite 3.50.4 WAL-reset bug -- and
+    nothing here told them the next open would silently put it back.
+
+    WARNING, not ERROR, and deliberately so. The reverse move is logged at
+    ERROR by ``_log_wal_fallback_once`` because dropping to DELETE is a real
+    loss of concurrency; this direction is normally the desirable one (see
+    ``hermes_cli/managed_uv._default_live_venv``, which treats a database
+    stuck on DELETE as a bug worth repairing on update). The problem is not
+    the change, it is that the change was invisible: an operator who chose
+    DELETE deliberately had no way to learn their choice had been overwritten,
+    or which lever makes it stick. So this says what happened and names the
+    durable setting, without claiming a degradation that is not there.
+
+    Deduped per process per ``db_label`` like its siblings: kanban opens a
+    fresh connection per operation, so an undeduped line here would be a log
+    flood rather than a signal.
+    """
+    with _journal_upgrade_warned_lock:
+        if db_label in _journal_upgrade_warned_paths:
+            return
+        _journal_upgrade_warned_paths.add(db_label)
+    logger.warning(
+        "%s: on-disk journal_mode was %s and has been switched to WAL. This "
+        "rewrites the database header and persists after this process exits. "
+        "If %s was a deliberate choice (for example the mitigation for the "
+        "SQLite WAL-reset bug, or a WAL-unsafe filesystem), setting it with "
+        "PRAGMA on the file will not survive -- every open re-applies the "
+        "configured mode. Set `database.journal_mode: delete` in config.yaml "
+        "to make it stick. This message fires once per process per database.",
+        db_label,
+        previous_mode,
+        previous_mode,
+    )
+
+
 def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
     """Log a single ERROR per (process, db_label) about WAL fallback.
 
@@ -1454,9 +1562,125 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
     )
 
 
+def _log_configured_delete_overridden_once(db_label: str) -> None:
+    """Log a single ERROR per (process, db_label) when the operator configured
+    ``journal_mode=delete`` but the on-disk DB is already WAL, so the configured
+    mode is not in effect.
+
+    Counterpart to :func:`_log_wal_fallback_once` for the opposite direction:
+    there WAL was refused by the filesystem and we silently fell back to DELETE;
+    here the operator asked for DELETE but an inherited on-disk WAL header means
+    we keep WAL (the never-live-downgrade rule prevents a live downgrade, which
+    causes mixed-mode corruption). The signal matters because otherwise the
+    operator has no indication that ``database.journal_mode: delete`` had no
+    effect and the DB still requires a one-time offline ``PRAGMA
+    journal_mode=DELETE`` (with no open connections) to apply.
+
+    Fires once per process per database.
+    """
+    with _delete_overridden_warned_lock:
+        if db_label in _delete_overridden_warned_paths:
+            return
+        _delete_overridden_warned_paths.add(db_label)
+    logger.error(
+        "%s: database.journal_mode=delete is configured but the on-disk "
+        "database is already WAL; keeping WAL (a live downgrade under open "
+        "connections can corrupt the DB). To apply journal_mode=DELETE, stop "
+        "all connections to this DB and run a one-time offline "
+        "'PRAGMA journal_mode=DELETE' on the file. This message fires once "
+        "per process per database.",
+        db_label,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Config-driven database pragmas
 # ---------------------------------------------------------------------------
+# PRAGMA synchronous accepts either an integer or a symbolic name, and operators
+# write the names. Mapped here rather than passed through so a typo becomes a
+# warning instead of a silently different durability level.
+_SYNCHRONOUS_LEVELS: Dict[str, int] = {
+    "OFF": 0,
+    "NORMAL": 1,
+    "FULL": 2,
+    "EXTRA": 3,
+}
+_SYNCHRONOUS_NAMES: Dict[int, str] = {v: k for k, v in _SYNCHRONOUS_LEVELS.items()}
+_SYNCHRONOUS_FULL = 2
+
+
+def resolve_synchronous_level(raw_value: Any) -> Optional[int]:
+    """Map a configured ``database.synchronous`` value to its PRAGMA integer.
+
+    Accepts the symbolic names SQLite documents (``OFF``/``NORMAL``/``FULL``/
+    ``EXTRA``, any case) and the equivalent integers ``0``-``3``. Returns None
+    for anything else so the caller can warn and leave the level untouched —
+    guessing at a malformed durability setting is worse than ignoring it.
+    """
+    if isinstance(raw_value, bool):
+        # bool is an int subclass, and YAML turns a bare `on`/`off` into one.
+        # "off" as a durability level is a real choice; True is meaningless.
+        return 0 if raw_value is False else None
+    if isinstance(raw_value, int):
+        return raw_value if raw_value in _SYNCHRONOUS_NAMES else None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if upper in _SYNCHRONOUS_LEVELS:
+        return _SYNCHRONOUS_LEVELS[upper]
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        return None
+    return value if value in _SYNCHRONOUS_NAMES else None
+
+
+def _apply_synchronous_pragma(
+    conn: sqlite3.Connection,
+    raw_value: Any,
+    *,
+    db_label: str,
+) -> None:
+    """Set ``PRAGMA synchronous`` from config, never below FULL on macOS.
+
+    Split out of the integer loop in :func:`apply_database_pragmas` because
+    this PRAGMA is not interchangeable with the sizing ones around it. Those
+    trade memory or disk for speed; this one decides whether a commit is on
+    the platter, so an unrecognised value must not fall through to "SQLite
+    default" the way a bad ``cache_size`` harmlessly can.
+
+    The Darwin floor exists because :func:`_enforce_macos_synchronous_full`
+    runs during ``apply_wal_with_fallback()`` and this function runs after it,
+    so a configured ``NORMAL`` would otherwise silently undo the macOS btree
+    protection that fix put there deliberately. Raising the level on macOS is
+    allowed; lowering it is refused out loud.
+    """
+    level = resolve_synchronous_level(raw_value)
+    if level is None:
+        logger.warning(
+            "%s: ignoring unrecognized database.synchronous=%r "
+            "(expected OFF, NORMAL, FULL, EXTRA, or 0-3)",
+            db_label,
+            raw_value,
+        )
+        return
+    if sys.platform == "darwin" and level < _SYNCHRONOUS_FULL:
+        logger.warning(
+            "%s: refusing database.synchronous=%s on macOS; keeping FULL. "
+            "Darwin's fsync() does not guarantee write ordering, so a lower "
+            "level readmits the half-written btree pages FULL exists to "
+            "prevent.",
+            db_label,
+            _SYNCHRONOUS_NAMES[level],
+        )
+        return
+    try:
+        conn.execute(f"PRAGMA synchronous={level}")
+    except sqlite3.OperationalError:
+        pass
+
+
 def apply_database_pragmas(
     conn: sqlite3.Connection,
     *,
@@ -1479,6 +1703,11 @@ def apply_database_pragmas(
     * ``temp_store`` — 0=DEFAULT(file), 1=FILE, 2=MEMORY, 3=ALWAYS
     * ``wal_autocheckpoint`` — WAL auto-checkpoint threshold in pages
     * ``journal_size_limit`` — max journal/WAL size in bytes
+    * ``synchronous`` — durability level: ``OFF``/``NORMAL``/``FULL``/``EXTRA``
+      or ``0``-``3``. Unset leaves SQLite's own default, which is a
+      *compile-time* constant (``SQLITE_DEFAULT_WAL_SYNCHRONOUS``) and so
+      differs between the bundled, distro and Homebrew builds an operator
+      might be running. Setting it explicitly is the only way to know.
 
     Best-effort: config load or pragma failures are ignored so DB init
     never breaks on a malformed ``database:`` section.
@@ -1517,6 +1746,14 @@ def apply_database_pragmas(
             conn.execute(f"PRAGMA {pragma_name}={value}")
         except sqlite3.OperationalError:
             pass
+
+    # Last, so it wins over nothing and loses to nothing: the sizing pragmas
+    # above cannot change durability, and the macOS enforcement ran earlier
+    # during WAL activation (see _apply_synchronous_pragma for why that
+    # ordering needs an explicit floor rather than an explicit override).
+    raw_synchronous = cfg_get(cfg, "database", "synchronous", default=None)
+    if raw_synchronous is not None:
+        _apply_synchronous_pragma(conn, raw_synchronous, db_label=db_label)
 
 
 # ---------------------------------------------------------------------------
