@@ -912,6 +912,7 @@ DANGEROUS_PATTERNS = [
         "close browser process tree (unsaved tabs may be lost)",
     ),
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
+    (r'\brm\s+(-[^\s]*\s+)*[a-z]:[\\/]', "delete in Windows absolute path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
     # GNU rm permutes options, so a recursive flag group may legally FOLLOW
@@ -2453,25 +2454,46 @@ def _command_detection_variants(command: str):
         yield variant
 
 
-def _is_verification_artifact_cleanup(command: str) -> bool:
-    """Return whether *command* only removes one Hermes ad-hoc temp script."""
+def _verification_artifact_cleanup_operand(command: str) -> Optional[str]:
+    """Return the sole Hermes temp artifact operand, when shaped correctly."""
     try:
-        argv = shlex.split(command, posix=True)
+        argv = shlex.split(command, posix=os.name != "nt")
     except ValueError:
-        return False
+        return None
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
-        return False
+        return None
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
-    basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    if len(operand) >= 2 and operand[0] == operand[-1] and operand[0] in {'"', "'"}:
+        operand = operand[1:-1]
+    basename = os.path.basename(os.path.normpath(operand))
+    if re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is None:
+        return None
+    return operand
+
+
+def _is_verification_artifact_cleanup(command: str) -> bool:
+    """Return whether *command* only removes one Hermes ad-hoc temp script."""
+    operand = _verification_artifact_cleanup_operand(command)
+    if operand is None:
+        return False
+    if any(part in {".", ".."} for part in re.split(r"[\\/]", operand)):
         return False
 
-    target = os.path.realpath(operand)
-    if os.path.dirname(target) != temp_dir:
+    temp_dir = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
+    operand_path = os.path.normcase(os.path.abspath(operand))
+    basename = os.path.basename(operand_path)
+    expected = os.path.normcase(os.path.join(temp_dir, basename))
+
+    # Compare normalized native paths so POSIX-style paths used by shell
+    # commands are handled correctly on Windows. Keep the lexical-path check
+    # separate from realpath: a symlinked temp alias must not inherit the
+    # cleanup exemption of its canonical target.
+    if operand_path != expected:
         return False
-    return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
+    if os.path.normcase(os.path.realpath(operand_path)) != expected:
+        return False
+    return True
 
 
 _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION = (
@@ -2516,6 +2538,9 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    if _verification_artifact_cleanup_operand(command) is not None:
+        description = "delete Hermes verification artifact outside canonical temp"
+        return (True, description, description)
 
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
