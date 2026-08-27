@@ -478,6 +478,7 @@ def bounded_probe_run(
     *,
     timeout: float,
     errors: str = "replace",
+    cwd: str | os.PathLike[str] | None = None,
 ) -> "subprocess.CompletedProcess[str] | None":
     """Deadlock-safe ``subprocess.run(argv, capture_output=True, timeout=...)``
     for fail-open probe call sites. Returns a ``CompletedProcess`` when the
@@ -515,6 +516,7 @@ def bounded_probe_run(
             text=True,
             encoding="utf-8",
             errors=errors,
+            cwd=cwd,
             **_popen_kwargs,
         )
     except Exception:

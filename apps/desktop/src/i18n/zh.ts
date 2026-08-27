@@ -1085,6 +1085,10 @@ export const zh: Translations = {
       plainTextStoredTitle: 'Token 以明文存储',
       plainTextStoredDesc:
         '安全存储不可用，因此已保存的 token 以未加密方式存储在此设备上应用的连接设置文件中。请安装或启用 GNOME Keyring 或 KWallet 以对其加密。',
+      keychainEncryptionTitle: '使用系统钥匙串加密已保存的机密',
+      keychainEncryptionDesc:
+        '默认关闭。开启后，网关 token 和登录凭据将使用系统钥匙串（Keychain Access、GNOME Keyring 或 Windows DPAPI）加密——系统可能会请求授权或密码。关闭时，它们以仅当前用户可读的普通文件形式存储。',
+      keychainEncryptionFailed: '无法更改机密加密设置',
       testRemote: '测试远程',
       saveForRestart: '保存到下次重启',
       saveAndReconnect: '保存并重连',
@@ -2006,6 +2010,14 @@ export const zh: Translations = {
     switchConnectionFailed: name => `无法连接到 ${name}`,
     manageProfiles: '管理配置档案…',
     connectGateway: '管理网关…',
+    fleet: {
+      allOnGateway: '此网关上的全部配置档案',
+      gateway: gateway => `${gateway} 上的配置档案`,
+      gatewayUnreachable: gateway => `${gateway} · 无法连接`,
+      onGateway: (name, gateway) => `${name} · ${gateway}`,
+      switchTo: (name, gateway) => `切换到 ${gateway} 上的 ${name}`,
+      deleteOn: gateway => `（位于 ${gateway}）`
+    },
     remoteOverride: {
       menuItem: '连接到远程主机…',
       badge: (host: string) => `运行于 ${host}`,
@@ -2114,7 +2126,11 @@ export const zh: Translations = {
       message: count => `在您检查模型设置之前，${count} 个定时任务将被跳过。`,
       detailMore: (names, remaining) => `${names}，以及另外 ${remaining} 个`,
       review: '检查定时任务',
-      saveFailed: 'Hermes 未保存该模型更改。'
+      saveFailed: 'Hermes 未保存该模型更改。',
+      confirmTitle: '模型选择警告',
+      confirmDetail: '仅在你接受此权衡时确认。',
+      confirmAction: '确认',
+      declined: '已取消模型更改 — 你拒绝了数据训练层级警告。'
     },
     search: '搜索定时任务…',
     loading: '正在加载定时任务…',
@@ -3130,6 +3146,9 @@ export const zh: Translations = {
     hide: '隐藏',
     openPreview: '打开预览',
     openInBrowser: '在浏览器中打开',
+    openInExternal: '在外部打开',
+    popIn: '弹回',
+    popOut: '弹出',
     linkHint: '⌘/Ctrl+点击在预览面板打开',
     sourceLineTitle: '点击选择 · shift 点击扩展 · 拖到输入框',
     source: '源码',
@@ -3533,6 +3552,7 @@ export const zh: Translations = {
     cwdStagedTitle: '工作目录已暂存',
     cwdStagedMessage: '重启桌面后端后，工作目录更改才会应用到当前活跃会话。',
     modelSwitchFailed: '模型切换失败',
+    hydrationSyncing: (profile: string) => `正在同步 ${profile}\u2026`,
     sessionExported: '会话已导出',
     sessionExportFailed: '无法导出会话',
     imageSaved: '图片已保存',

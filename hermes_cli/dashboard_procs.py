@@ -91,23 +91,26 @@ def _scan_dashboard_processes(
                 timeout=10,
                 errors="ignore",
             )
-            if result is None or result.returncode != 0 or result.stdout is None:
-                return []
-            current_cmd = ""
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-                if line.startswith("CommandLine="):
-                    current_cmd = line[len("CommandLine=") :]
-                elif line.startswith("ProcessId="):
-                    pid_str = line[len("ProcessId=") :]
-                    if (
-                        any(p in current_cmd for p in patterns)
-                        and int(pid_str) != self_pid
-                    ):
-                        try:
-                            dashboard_processes.append((int(pid_str), current_cmd))
-                        except ValueError:
-                            pass
+            if (
+                result is not None
+                and result.returncode == 0
+                and result.stdout is not None
+            ):
+                current_cmd = ""
+                for line in result.stdout.split("\n"):
+                    line = line.strip()
+                    if line.startswith("CommandLine="):
+                        current_cmd = line[len("CommandLine=") :]
+                    elif line.startswith("ProcessId="):
+                        pid_str = line[len("ProcessId=") :]
+                        if (
+                            any(p in current_cmd for p in patterns)
+                            and int(pid_str) != self_pid
+                        ):
+                            try:
+                                dashboard_processes.append((int(pid_str), current_cmd))
+                            except ValueError:
+                                pass
         else:
             # Linux / macOS: scan the process table via ps and match against
             # the same explicit patterns list used on Windows.  Using ps
@@ -118,7 +121,9 @@ def _scan_dashboard_processes(
             result = subprocess.run(
                 ["ps", "-A", "-o", "pid=,command="],
                 capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
+                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             if result.returncode == 0:
@@ -143,6 +148,31 @@ def _scan_dashboard_processes(
         dashboard_processes = [
             proc for proc in dashboard_processes if proc[0] not in exclude_pids
         ]
+
+    # Spawn-ledger augmentation (#63206/#81564): the substring patterns above
+    # miss profiled launches — `hermes --profile p serve --host <ip>` contains
+    # neither "hermes serve" nor "hermes_cli.main serve". Every serve/
+    # dashboard registers itself in the machine spawn ledger at startup with
+    # live-verified (pid, create_time), so ledger rows are positive identity,
+    # not argv guessing. Add any live ledger serve/dashboard the scan missed;
+    # prefer the ledger's recorded argv (full launch args) over the scan's
+    # truncated view.
+    try:
+        from hermes_cli.process_identity import ledger_entries
+
+        seen = {pid for pid, _ in dashboard_processes}
+        for entry in ledger_entries():
+            if entry.get("purpose") not in ("serve", "dashboard"):
+                continue
+            pid = entry.get("pid")
+            if not isinstance(pid, int) or pid == self_pid or pid in seen:
+                continue
+            if exclude_pids and pid in exclude_pids:
+                continue
+            dashboard_processes.append((pid, str(entry.get("argv") or "")))
+    except Exception:
+        pass  # ledger unavailable → scan-only behavior, exactly as before
+
     return dashboard_processes
 
 
@@ -211,9 +241,7 @@ def _normalize_dashboard_cmdline(argv: list[str]) -> tuple[str, ...]:
     return tuple(prefix + list(argv[idx:]))
 
 
-def _profile_key_for_respawn(
-    argv: list[str], hermes_home: str | None = None
-) -> str:
+def _profile_key_for_respawn(argv: list[str], hermes_home: str | None = None) -> str:
     """Stable owner key: ``HERMES_HOME`` when known, else ``--profile`` / ``-p``.
 
     ``HERMES_HOME`` ending in ``profiles/<name>`` is normalized to
@@ -249,27 +277,60 @@ def _profile_key_for_respawn(
     return "profile:default"
 
 
+def _normalized_home_for_compare(home: str) -> str:
+    """Resolve *home* for install-identity comparison (#94030).
+
+    Same normalization ``_profile_key_for_respawn`` applies to ``home:``
+    keys, so symlinked / differently-spelled roots compare equal.
+    """
+    try:
+        return os.path.normcase(str(Path(home).resolve()))
+    except (OSError, RuntimeError, ValueError):
+        return os.path.normcase(home)
+
+
 def _filter_dashboard_respawn_candidates(
     candidates: list[tuple[int, list[str], str | None]],
+    *,
+    own_home: str | None = None,
 ) -> list[list[str]]:
     """Select which killed manual backends to respawn after ``hermes update``.
 
-    Each candidate is ``(pid, argv, hermes_home)``.
+    Each candidate is ``(pid, argv, hermes_home)``.  *own_home* is the
+    updating install's home; it defaults to this process's
+    ``get_hermes_home()`` and exists as a parameter so tests can pin it.
 
-    Rules (#78821):
+    Rules (#78821, #94030):
     1. Never resurrect Desktop ephemeral ``serve|dashboard --port 0``
        backends — Desktop (``HERMES_DESKTOP_CHILD_PID``) owns their
        lifecycle.  These are also the PPID-1 orphans that previously
        multiplied across updates because ``--port 0`` always binds a
        fresh free port.
-    2. Dedupe by normalized cmdline (identical argv → one respawn).
-    3. Cap at most one managed backend per profile / ``HERMES_HOME``.
+    2. Never replay a backend from a **foreign** ``HERMES_HOME``.  The
+       respawn below is argv-only (no ``env=`` replay), so a foreign
+       backend would come back running on the *updating* install's home
+       and steal the foreign install's fixed port, leaving its own
+       supervisor (launchd/systemd/...) to crash-loop on ``EADDRINUSE``
+       (#94030).  A foreign install's backend is owned by that install's
+       supervisor/user.  An unreadable home (``None``) stays eligible —
+       keep the pre-#94030 behaviour when we cannot tell.
+    3. Dedupe by normalized cmdline (identical argv → one respawn).
+    4. Cap at most one managed backend per profile / ``HERMES_HOME``.
 
     Intentionally does **not** blanket-skip every PPID-1 process: a prior
     ``hermes update`` respawn detaches with ``start_new_session=True``, so
     fixed-port manual backends are reparented to init and must still be
     eligible for the next update's #40449 restart.
     """
+    if own_home is None:
+        try:
+            from hermes_constants import get_hermes_home
+
+            own_home = str(get_hermes_home())
+        except Exception:
+            own_home = ""
+    own_key = _normalized_home_for_compare(own_home) if own_home else ""
+
     selected: list[list[str]] = []
     seen_cmdlines: set[tuple[str, ...]] = set()
     seen_profiles: set[str] = set()
@@ -278,6 +339,8 @@ def _filter_dashboard_respawn_candidates(
         if not argv:
             continue
         if _is_ephemeral_port_zero_backend(argv):
+            continue
+        if own_key and hermes_home and _normalized_home_for_compare(hermes_home) != own_key:
             continue
         norm = _normalize_dashboard_cmdline(argv)
         if norm in seen_cmdlines:
@@ -335,24 +398,28 @@ def _kill_stale_dashboard_processes(
     # When the Hermes Desktop Electron app spawns this dashboard as a
     # backend child, it sets HERMES_DESKTOP_CHILD_PID so that the update
     # path can skip killing the desktop-managed process.  (#37532)
-    exclude: set[int] | None = None
+    exclude: set[int] = set()
     raw_pid = os.environ.get("HERMES_DESKTOP_CHILD_PID")
     if raw_pid:
         # The desktop may manage several backends (one per active profile) and
         # passes them comma-separated; a lone int still parses for back-compat.
-        parsed: set[int] = set()
         for part in raw_pid.split(","):
             part = part.strip()
             if not part:
                 continue
             try:
-                parsed.add(int(part))
+                exclude.add(int(part))
             except (ValueError, TypeError):
                 pass
-        if parsed:
-            exclude = parsed
 
-    pids = _m()._find_stale_dashboard_pids(exclude_pids=exclude)
+    if restart_managed:
+        # An SSH-owned backend belongs to an attached Desktop client even when
+        # the updater runs from an unrelated remote shell with no Desktop child
+        # PID. Honor the same validated ownership records as the orphan reaper;
+        # killing one permanently strands that client's fixed SSH port-forward.
+        exclude |= _lock_owned_serve_pids()
+
+    pids = _m()._find_stale_dashboard_pids(exclude_pids=exclude or None)
     if not pids:
         return {"matched": [], "killed": [], "failed": []}
 
@@ -405,7 +472,9 @@ def _kill_stale_dashboard_processes(
                 result = subprocess.run(
                     ["taskkill", "/PID", str(pid), "/F"],
                     capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
                 )
                 if result.returncode == 0:
@@ -440,6 +509,7 @@ def _kill_stale_dashboard_processes(
             # On Windows, os.kill(pid, 0) is NOT a no-op. Route through
             # the cross-platform existence check.
             from gateway.status import _pid_exists
+
             for pid in pending:
                 if _pid_exists(pid):
                     still_pending.append(pid)
@@ -485,12 +555,13 @@ def _kill_stale_dashboard_processes(
                 if _m()._try_restart_systemd_service(svc_name, pid_cgroup.get(pid)):
                     restarted_services.append(svc_name)
                 else:
-                    failed_restarts.append((svc_name, "systemctl restart returned non-zero"))
+                    failed_restarts.append((
+                        svc_name,
+                        "systemctl restart returned non-zero",
+                    ))
                     unrecovered.append(pid)
             elif pid in pid_cmdline:
-                respawn_candidates.append(
-                    (pid, pid_cmdline[pid], pid_home.get(pid))
-                )
+                respawn_candidates.append((pid, pid_cmdline[pid], pid_home.get(pid)))
             else:
                 unrecovered.append(pid)
 
@@ -503,7 +574,9 @@ def _kill_stale_dashboard_processes(
         if respawn_cmds:
             failed_cmds = _m()._respawn_dashboard_processes(respawn_cmds)
             if failed_cmds:
-                unrecovered.extend(p for p in killed if pid_cmdline.get(p) in failed_cmds)
+                unrecovered.extend(
+                    p for p in killed if pid_cmdline.get(p) in failed_cmds
+                )
 
         if failed_restarts or unrecovered:
             print("  Restart anything not auto-restarted when you're ready:")
@@ -519,6 +592,7 @@ def _kill_stale_dashboard_processes(
         "failed": list(failed),
         "unrecovered": list(unrecovered),
     }
+
 
 def _detect_concurrent_hermes_instances(
     scripts_dir: Path, *, exclude_pid: int | None = None
@@ -796,8 +870,8 @@ def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     """
     import json
 
-    root = base_dir if base_dir is not None else (
-        _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
+    root = (
+        base_dir if base_dir is not None else (_hermes_home_dir() / _REMOTE_LOCK_SUBDIR)
     )
     owned: set[int] = set()
     if not root.is_dir():
@@ -1018,4 +1092,3 @@ def _reap_orphaned_desktop_local_serves(
             pass
 
     return {"matched": matched, "killed": killed, "failed": failed}
-

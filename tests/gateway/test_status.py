@@ -377,7 +377,7 @@ class TestGetProcessStartTime:
     def test_live_process_is_stable_int(self):
         import subprocess
         import time
-        p = subprocess.Popen(["sleep", "20"])
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
         try:
             a = status._get_process_start_time(p.pid)
             time.sleep(0.2)
@@ -1038,6 +1038,7 @@ class TestReadProcessCmdlinePsFallback:
 
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
+        monkeypatch.setattr(status, "_IS_WINDOWS", False)
         monkeypatch.setattr(
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),
@@ -1387,3 +1388,52 @@ class TestResolveGatewayLiveness:
         # profile's live gateway from being reported as this profile's.
         assert seen["expected_home"] == profile_dir
 
+
+def test_strict_gateway_identity_returns_none_for_confirmed_absence(tmp_path):
+    assert status.get_running_pid_identity_strict(tmp_path / "gateway.pid") is None
+
+
+def test_strict_gateway_identity_raises_when_metadata_stat_is_denied(
+    tmp_path, monkeypatch
+):
+    pid_path = tmp_path / "gateway.pid"
+    original_stat = Path.stat
+
+    def denied_stat(self, *args, **kwargs):
+        if self == pid_path:
+            raise PermissionError("denied")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied_stat)
+
+    with pytest.raises(RuntimeError, match="not inspectable"):
+        status.get_running_pid_identity_strict(pid_path)
+
+
+def test_strict_gateway_identity_raises_on_malformed_active_metadata(
+    tmp_path, monkeypatch
+):
+    pid_path = tmp_path / "gateway.pid"
+    lock_path = tmp_path / "gateway.lock"
+    pid_path.write_text("bad", encoding="utf-8")
+    lock_path.write_text("bad", encoding="utf-8")
+    monkeypatch.setattr(status, "_get_gateway_lock_path", lambda _path=None: lock_path)
+    monkeypatch.setattr(status, "_is_gateway_runtime_lock_active_strict", lambda _path=None: True)
+
+    with pytest.raises(RuntimeError, match="malformed"):
+        status.get_running_pid_identity_strict(pid_path)
+
+
+def test_strict_gateway_identity_rejects_reused_pid(tmp_path, monkeypatch):
+    pid_path = tmp_path / "gateway.pid"
+    lock_path = tmp_path / "gateway.lock"
+    record = {"pid": 123, "start_time": 10.0, "kind": "hermes-gateway"}
+    pid_path.write_text(json.dumps(record), encoding="utf-8")
+    lock_path.write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(status, "_get_gateway_lock_path", lambda _path=None: lock_path)
+    monkeypatch.setattr(status, "_is_gateway_runtime_lock_active_strict", lambda _path=None: True)
+    monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 20.0)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        status.get_running_pid_identity_strict(pid_path)

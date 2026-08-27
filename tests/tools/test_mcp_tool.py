@@ -1290,14 +1290,17 @@ class TestBuildSafeEnv:
         with patch.dict("os.environ", fake_env, clear=True):
             result = _build_safe_env(None)
 
-        assert result["ProgramFiles"] == r"C:\Program Files"
-        assert result["ProgramData"] == r"C:\ProgramData"
-        assert result["ProgramW6432"] == r"C:\Program Files"
-        assert result["LOCALAPPDATA"].endswith("Local")
-        assert result["APPDATA"].endswith("Roaming")
-        assert result["USERPROFILE"] == r"C:\Users\alice"
-        assert "GITHUB_TOKEN" not in result
-        assert "OPENAI_API_KEY" not in result
+        # Windows normalizes os.environ keys to uppercase.  Compare through a
+        # normalized view so this assertion exercises the allowlist itself.
+        normalized = {key.upper(): value for key, value in result.items()}
+        assert normalized["PROGRAMFILES"] == r"C:\Program Files"
+        assert normalized["PROGRAMDATA"] == r"C:\ProgramData"
+        assert normalized["PROGRAMW6432"] == r"C:\Program Files"
+        assert normalized["LOCALAPPDATA"].endswith("Local")
+        assert normalized["APPDATA"].endswith("Roaming")
+        assert normalized["USERPROFILE"] == r"C:\Users\alice"
+        assert "GITHUB_TOKEN" not in normalized
+        assert "OPENAI_API_KEY" not in normalized
 
 
 # ---------------------------------------------------------------------------
@@ -1421,6 +1424,79 @@ class TestReconnection:
 
         asyncio.run(_test())
 
+    def test_reconnect_failures_after_initial_success_use_reconnect_budget(self):
+        """A server that already registered tools must not be re-classified
+        as "never connected" just because a later reconnect attempt fails
+        while ``_ready`` is momentarily clear (#94654).
+
+        ``_MAX_INITIAL_CONNECT_RETRIES`` is 3 and ``_MAX_RECONNECT_RETRIES``
+        is 5. Four consecutive post-success reconnect failures exceed the
+        (buggy) initial-connect ladder but not the reconnect budget, so this
+        distinguishes the two code paths.
+        """
+        from tools.mcp_tool import MCPServerTask
+
+        run_count = 0
+        target_server = None
+
+        async def patched_run_stdio(self_srv, config):
+            nonlocal run_count, target_server
+            run_count += 1
+            if target_server is not self_srv:
+                return None
+            if run_count == 1:
+                # Initial connection succeeds and registers tools. Setting
+                # ``_ever_connected`` mirrors what the real ``_run_stdio``
+                # does right after a successful ``_discover_tools()`` call.
+                self_srv.session = MagicMock()
+                self_srv._tools = []
+                self_srv._ready.set()
+                # Guarded set: MCPServerTask uses __slots__, so on pre-fix
+                # code (no ``_ever_connected`` slot) a bare assignment raises
+                # AttributeError *inside this mock* while ``_ready`` is still
+                # set — which detours run() into the reconnect ladder and lets
+                # the test pass vacuously on the buggy code. The guard keeps
+                # the regression test biting: pre-fix the flag simply doesn't
+                # exist and the misclassification fires.
+                try:
+                    self_srv._ever_connected = True
+                except AttributeError:
+                    pass
+                return "reconnect"
+            if run_count <= 5:
+                # Four consecutive failures on later reconnect attempts --
+                # a flapping transport, not a server that never connected.
+                raise ConnectionError("reconnect attempt failed")
+            self_srv._shutdown_event.set()
+            await self_srv._shutdown_event.wait()
+
+        async def patched_wait_parked(self_srv, timeout=None):
+            # If the code under test parks early, unblock immediately
+            # instead of waiting out the real park interval.
+            self_srv._shutdown_event.set()
+            return "shutdown"
+
+        async def _test():
+            nonlocal target_server
+            server = MCPServerTask("test_srv")
+            target_server = server
+
+            with patch.object(MCPServerTask, "_run_stdio", patched_run_stdio), \
+                 patch.object(
+                     MCPServerTask, "_wait_for_reconnect_or_shutdown",
+                     patched_wait_parked,
+                 ), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                await server.run({"command": "test"})
+
+            assert server._was_parked is False, (
+                "server parked after only 4 reconnect failures following a "
+                "successful initial connection -- it was misclassified as "
+                "never having connected and re-entered the initial-connect "
+                "ladder instead of the (larger) reconnect budget"
+            )
+
+        asyncio.run(_test())
 
     def test_preflight_probe_runs_on_initial_http_connect(self):
         """The content-type preflight probe fires on the first HTTP connect."""

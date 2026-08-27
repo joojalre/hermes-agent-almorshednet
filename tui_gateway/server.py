@@ -384,6 +384,16 @@ _current_runtime_session_record: contextvars.ContextVar[dict | None] = (
     contextvars.ContextVar("hermes_gateway_runtime_session_record", default=None)
 )
 
+# JSON-RPC method being dispatched on this thread/task. Purely diagnostic: the
+# 4001 "session not found" warning below is the only signal a stale-runtime
+# retry loop leaves behind, and without the method name it cannot say WHICH
+# client poll is looping (a 5s `process.list` poll produced 18,614 rejections
+# against one id before the caller could be identified). Never used for
+# authorization — the method string is client-supplied.
+_current_rpc_method: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "hermes_gateway_rpc_method", default=""
+)
+
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
 # of corrupting the JSON protocol.
@@ -2444,7 +2454,11 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    return fn(rid, params)
+    token = _current_rpc_method.set(method)
+    try:
+        return fn(rid, params)
+    finally:
+        _current_rpc_method.reset(token)
 
 
 def _current_session_steer_authority(
@@ -2894,8 +2908,9 @@ def _sess_nowait(params, rid):
     # report is diagnosable as "request arrived and was rejected" instead of
     # "request never arrived" (see #90428).
     logger.warning(
-        "session-scoped RPC rejected: session_id=%r not in memory "
+        "session-scoped RPC rejected: method=%s session_id=%r not in memory "
         "(detached/reaped runtime; client should resume the stored session), rid=%r",
+        _current_rpc_method.get() or "?",
         sid,
         rid,
     )
@@ -4926,6 +4941,16 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     home_token = (
         set_hermes_home_override(profile_home) if profile_home else None
     )
+    # Bind the session context too. This function runs on the RPC dispatcher
+    # thread (model.switch, config.set model). On that thread the _SESSION_CWD
+    # contextvar is not set, so resolve_agent_cwd() falls back to the process
+    # TERMINAL_CWD, which the desktop pins to the home directory. The rebuilt
+    # prompt then records the wrong working directory and persists it. Later
+    # turns restore the stored bytes without change, because the turn
+    # prologue rebuilds only when _cached_system_prompt is None.
+    session_tokens = _set_session_context(
+        session_key, cwd=_session_cwd(session)
+    )
     try:
         prompt = agent._build_system_prompt(None)
         agent._cached_system_prompt = prompt
@@ -4937,6 +4962,7 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
             exc_info=True,
         )
     finally:
+        _clear_session_context(session_tokens)
         if home_token is not None:
             reset_hermes_home_override(home_token)
 
@@ -5627,6 +5653,9 @@ def _apply_model_switch(
             confirm_msg = warning.message
             if result.warning_message:
                 confirm_msg = f"{confirm_msg}\n\n{result.warning_message}"
+            # Same contract as the deferred branch below: confirm_message is
+            # canonical, warning is the pre-confirm-era alias. Identical by
+            # design, not by accident.
             return {
                 "value": result.new_model,
                 "warning": confirm_msg,
@@ -5806,6 +5835,32 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
             sid,
             {"message": f"Could not switch to configured model {model}: {e}"},
         )
+
+
+def _pending_switch_selection_warning(model: str, provider: str) -> str | None:
+    """Selection-guard message for a model queued mid-turn, or ``None``.
+
+    Runs BEFORE the pick is stashed, while the client still has a live response
+    it can turn into a confirm prompt. Only pre-resolution inputs exist here --
+    the model id the user picked and any explicit ``--provider`` -- which is
+    exactly what the data-policy guard keys on. Guards that can only decide
+    once base_url / api_key / model_info have settled still get their chance in
+    ``_apply_model_switch``; the cost guard returns ``None`` when pricing is
+    unknown, so an early call can only under-fire, never over-fire.
+
+    A misbehaving guard must never break the pick, so exceptions are swallowed
+    and treated as "no warning" -- the apply-time check remains the backstop.
+    """
+    if not model:
+        return None
+    try:
+        from hermes_cli.model_selection_guards import combined_selection_warning
+
+        warning = combined_selection_warning(model, provider=provider or None)
+    except Exception:
+        return None
+
+    return warning.message if warning is not None else None
 
 
 def _apply_pending_model_switch(sid: str, session: dict) -> None:
@@ -12678,19 +12733,57 @@ def _(rid, params: dict) -> dict:
                         pending_model = parsed.model_input
                     except Exception:
                         pending_model = str(value)
+                    pending_provider = (
+                        getattr(parsed, "explicit_provider", "") or ""
+                    ).strip()
+                    confirmed = bool(params.get("confirm_expensive_model", False))
+                    # Run the selection guards HERE, not only at apply time.
+                    # This branch used to answer confirm_required=False without
+                    # consulting them, so a client that implements the confirm
+                    # round-trip was told no consent was needed. It stashed the
+                    # pick, and _apply_pending_model_switch -- which calls the
+                    # guards with the stashed (unconfirmed) flag -- dropped the
+                    # switch at the next turn start. The model reverted with no
+                    # confirm ever offered, because the one moment a round-trip
+                    # was possible had already passed.
+                    if not confirmed:
+                        pending_warning = _pending_switch_selection_warning(
+                            pending_model, pending_provider
+                        )
+                        if pending_warning is not None:
+                            # Nothing is stashed: an unconfirmed guarded pick
+                            # leaves the session exactly as it was, and the
+                            # client re-sends with confirm_expensive_model to
+                            # queue it for real.
+                            return _ok(
+                                rid,
+                                {
+                                    "key": key,
+                                    "value": pending_model,
+                                    # `confirm_message` is the field to read.
+                                    # `warning` carries the same text only so
+                                    # clients written before the confirm
+                                    # round-trip existed still show something;
+                                    # `_apply_pending_model_switch` already
+                                    # prefers confirm_message and falls back to
+                                    # warning. Keep them identical or drop
+                                    # `warning` -- do not let them diverge.
+                                    "warning": pending_warning,
+                                    "confirm_required": True,
+                                    "confirm_message": pending_warning,
+                                    "scope": "session",
+                                    "deferred": False,
+                                },
+                            )
                     session["pending_model_switch"] = {
                         "raw": value,
-                        "confirm_expensive_model": bool(
-                            params.get("confirm_expensive_model", False)
-                        ),
+                        "confirm_expensive_model": confirmed,
                         # The resolved model/provider the next turn will run on.
                         # _session_info reports these while the switch is pending
                         # so the end-of-turn settle keeps showing the user's pick
                         # instead of blipping back to the still-live old model.
                         "display_model": pending_model,
-                        "display_provider": (
-                            getattr(parsed, "explicit_provider", "") or ""
-                        ).strip(),
+                        "display_provider": pending_provider,
                     }
                     return _ok(
                         rid,

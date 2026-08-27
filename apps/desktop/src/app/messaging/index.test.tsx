@@ -76,16 +76,12 @@ afterEach(() => {
 
 async function renderMessaging() {
   const { MessagingView } = await import('./index')
-  let result: ReturnType<typeof render>
-  await act(async () => {
-    result = render(
-      <MemoryRouter>
-        <MessagingView />
-      </MemoryRouter>
-    )
-  })
 
-  return result!
+  return render(
+    <MemoryRouter>
+      <MessagingView />
+    </MemoryRouter>
+  )
 }
 
 describe('MessagingView profile scope', () => {
@@ -167,8 +163,9 @@ describe('MessagingView pairing', () => {
 
     await renderMessaging()
 
+    const approve = await screen.findByRole('button', { name: 'Approve' })
     await act(async () => {
-      fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+      fireEvent.click(approve)
     })
 
     expect(await screen.findByRole('button', { name: 'Approve' })).toBeTruthy()

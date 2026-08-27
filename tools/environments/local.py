@@ -22,6 +22,45 @@ _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
 
+# The selected shell is cached so path translation stays consistent for the
+# whole environment.  In particular, WSL bash uses /mnt/<drive>, while Git
+# Bash uses /<drive>.
+_resolved_bash_path: str | None = None
+
+
+def _is_wsl_bash_path(path: str | None) -> bool:
+    """Return whether *path* is the Windows WSL launcher."""
+    if not _IS_WINDOWS or not path:
+        return False
+    system_root = (
+        os.environ.get("WINDIR")
+        or os.environ.get("SystemRoot")
+        or r"C:\Windows"
+    )
+    normalized = ntpath.normcase(ntpath.normpath(path))
+    candidates = {
+        ntpath.normcase(ntpath.normpath(
+            ntpath.join(system_root, "System32", "bash.exe")
+        )),
+        ntpath.normcase(ntpath.normpath(
+            ntpath.join(system_root, "Sysnative", "bash.exe")
+        )),
+    }
+    return normalized in candidates
+
+
+def _uses_wsl_bash() -> bool:
+    """Return whether the resolved local shell needs WSL path spelling."""
+    global _resolved_bash_path
+    if not _IS_WINDOWS:
+        return False
+    if _resolved_bash_path is None:
+        try:
+            _resolved_bash_path = _find_bash()
+        except (OSError, RuntimeError):
+            return False
+    return _is_wsl_bash_path(_resolved_bash_path)
+
 
 def _msys_to_windows_path(cwd: str) -> str:
     """Translate a Git Bash / MSYS-style POSIX path (``/c/Users/x``) to the
@@ -92,8 +131,10 @@ def _resolve_local_initial_cwd(cwd: str) -> str:
 
 
 def _windows_to_msys_path(cwd: str) -> str:
-    """Translate a native Windows path (``C:\\Users\\x``) to Git Bash /
-    MSYS form (``/c/Users/x``) so ``builtin cd`` resolves it reliably.
+    """Translate a native Windows path to the selected bash's POSIX form.
+
+    Git Bash uses ``/c/Users/x`` and WSL bash uses ``/mnt/c/Users/x`` so
+    ``builtin cd`` resolves the same host directory in either backend.
 
     No-ops on non-Windows hosts or for paths that aren't drive-qualified
     native Windows paths. Returns the input unchanged when no translation
@@ -106,21 +147,23 @@ def _windows_to_msys_path(cwd: str) -> str:
         return cwd
     drive = m.group(1).lower()
     tail = (m.group(2) or "").replace('\\', '/').lstrip('/')
-    return f"/{drive}/{tail}" if tail else f"/{drive}/"
+    root = "/mnt" if _uses_wsl_bash() else ""
+    return f"{root}/{drive}/{tail}" if tail else f"{root}/{drive}/"
 
 
 def _bash_safe_path(path: str) -> str:
-    """Return *path* in a form safe to embed in a Git Bash script.
+    """Return *path* in a form safe to embed in a bash script.
 
-    Native ``C:\\Users\\x`` / ``C:/Users/x`` → ``/c/Users/x`` via
+    Native ``C:\\Users\\x`` / ``C:/Users/x`` is converted to the selected
+    bash spelling via
     :func:`_windows_to_msys_path`. Mixed MSYS leftovers
     (``/c/Users\\Alexander\\Documents``) get backslashes normalized so
     bash does not eat ``\\U`` and trip the ``Directory \\drivers\\etc``
     failure class. No-op off Windows and for empty input.
 
     ``get_temp_dir`` already emits forward-slash ``C:/...`` forms for
-    Python compatibility; those still need the ``/c/...`` rewrite —
-    MSYS argument conversion treats ``C:/...`` as a Windows path and
+    Python compatibility; those still need the POSIX rewrite —
+    argument conversion treats ``C:/...`` as a Windows path and
     can corrupt the login-shell ``drivers\\etc`` lookup.
     """
     if not _IS_WINDOWS or not path:
@@ -767,6 +810,7 @@ def build_subprocess_env(
 
 def _find_bash() -> str:
     """Find bash for command execution."""
+    global _resolved_bash_path
     if not _IS_WINDOWS:
         return (
             shutil.which("bash")
@@ -828,6 +872,13 @@ def _find_bash() -> str:
                     custom,
                     candidate,
                 )
+            _resolved_bash_path = candidate
+            if _is_wsl_bash_path(candidate):
+                logger.warning(
+                    "Git Bash child-process probe failed; using WSL bash at %s "
+                    "with /mnt path mapping",
+                    candidate,
+                )
             return candidate
 
     if candidates:
@@ -844,6 +895,7 @@ def _find_bash() -> str:
         # Last resort for failures unrelated to the known MSYS/ASLR class:
         # return the first path so the caller still sees the real bash error
         # instead of the less useful "not found" message.
+        _resolved_bash_path = candidates[0]
         return candidates[0]
 
     raise RuntimeError(
@@ -954,11 +1006,15 @@ def _bash_starts(bash: str) -> bool:
         return cached
 
     try:
+        # The Windows WSL launcher has a cold-start cost that is materially
+        # higher than Git Bash on some installations.  Keep the normal probe
+        # bounded while allowing the known local fallback to initialize.
+        probe_timeout = 30 if _is_wsl_bash_path(bash) else 15
         result = subprocess.run(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
-            timeout=15,
+            timeout=probe_timeout,
             creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
         )
         ok = result.returncode == 0
@@ -1745,6 +1801,10 @@ class LocalEnvironment(BaseEnvironment):
     """
 
     _profile_scoped_passthrough = True
+
+    # Commands run on the Hermes host itself — controller-side platform
+    # behavior (macOS TCC pruning, etc.) legitimately applies here.
+    is_local = True
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
