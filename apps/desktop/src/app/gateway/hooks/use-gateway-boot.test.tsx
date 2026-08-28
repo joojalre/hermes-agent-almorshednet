@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopConnectionsRegistry } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { BACKEND_BOOT_WAIT_TIMEOUT_MS, BACKEND_SWITCH_WAIT_TIMEOUT_MS } from '@/lib/with-timeout'
 import { $desktopBoot } from '@/store/boot'
 import {
   $connectionsRegistry,
@@ -1205,12 +1206,12 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($connection.get()).toBeNull()
   })
 
-  it('a getConnection() that hangs on INITIAL boot rejects on its own after the reconnect-attempt timeout, not only when main eventually gives up (#93454)', async () => {
+  it('a getConnection() that hangs on INITIAL boot rejects on its own after the primary cold-boot timeout, not only when main eventually gives up (#93454)', async () => {
     // boot()'s getConnection() had no bound of its own — only main's own
     // eventual timeout (e.g. waitForHermes, ~45s) ever settled it. A wedge
     // that main never resolves (not even a rejection) must not hang
     // "Starting Hermes…" forever; the renderer needs to own its own bound
-    // here too, same as attemptReconnect() and softSwitch().
+    // here too, while still allowing the full primary cold-boot window.
     const desktop = fakeDesktop()
     desktop.getConnection = vi.fn(() => new Promise(() => undefined))
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
@@ -1220,11 +1221,11 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($desktopBoot.get().error).toBeNull()
 
-    // Advance past the shared backend-boot budget (45s) — the
+    // Advance past the primary cold-boot budget — the
     // stalled await must reject on its own so boot()'s catch runs instead of
     // waiting indefinitely on main.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(45_000)
+      await vi.advanceTimersByTimeAsync(BACKEND_BOOT_WAIT_TIMEOUT_MS)
     })
 
     expect($desktopBoot.get().error).toBeTruthy()
@@ -1258,11 +1259,11 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewaySwitching.get()).toBe(true)
 
-    // Advance past the shared backend-boot budget (45s) — the
+    // Advance past the connection-switch budget (45s) — the
     // stalled await must reject so the `finally` clears $gatewaySwitching
     // instead of latching the switch UI frozen forever.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(45_000)
+      await vi.advanceTimersByTimeAsync(BACKEND_SWITCH_WAIT_TIMEOUT_MS)
     })
 
     expect($gatewaySwitching.get()).toBe(false)

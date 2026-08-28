@@ -32,10 +32,9 @@ const LAST_PROFILE_STORAGE_KEY = 'hermes.desktop.lastProfileByConnection'
 const SWITCH_DIAL_TIMEOUT_MS = 20_000
 const SWITCH_COMMIT_TIMEOUT_MS = 20_000
 const SWITCH_REMEMBER_TIMEOUT_MS = 5_000
-// Matches the primary spawn budget: a healthy cold boot publishes well within
-// this; anything longer means the primary is not coming and the registry
-// restore should stop waiting for it. Shared constant so the boot-class
-// budgets can't drift apart (see with-timeout.ts).
+// Matches the primary cold-boot budget so registry restore cannot race the
+// backend descriptor while the main process is still completing a slow first
+// launch (see with-timeout.ts).
 const BOOT_DESCRIPTOR_WAIT_TIMEOUT_MS = BACKEND_BOOT_WAIT_TIMEOUT_MS
 
 export { $connectionsRegistry } from '@/store/connection-registry-state'

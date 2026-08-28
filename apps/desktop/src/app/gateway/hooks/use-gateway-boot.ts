@@ -8,7 +8,12 @@ import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import { decideLivenessForceClose, LIVENESS_REPROBE_DELAY_MS } from '@/lib/gateway-liveness-policy'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
-import { BACKEND_BOOT_WAIT_TIMEOUT_MS, RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import {
+  BACKEND_BOOT_WAIT_TIMEOUT_MS,
+  BACKEND_SWITCH_WAIT_TIMEOUT_MS,
+  RECONNECT_ATTEMPT_TIMEOUT_MS,
+  withTimeout
+} from '@/lib/with-timeout'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -601,12 +606,12 @@ export function useGatewayBoot({
         // on its pinned profile's backend across a soft switch.
         // Bounded for the same reason as attemptReconnect() (#93454): a wedged
         // main-process round-trip must not latch $gatewaySwitching stuck —
-        // the `finally` below only runs once this promise settles. Uses the
-        // shared backend-boot budget rather than the reconnect budget because
-        // ensureBackend may cold-spawn a pooled helper backend here.
+        // the `finally` below only runs once this promise settles. A pooled
+        // helper has its own bounded switch budget; the primary cold-boot
+        // budget would make a source change wait several minutes.
         const conn = await withTimeout(
           desktop.getConnection(windowProfileOverride() ?? undefined),
-          BACKEND_BOOT_WAIT_TIMEOUT_MS,
+          BACKEND_SWITCH_WAIT_TIMEOUT_MS,
           'Timed out reconnecting to Hermes backend'
         )
 
@@ -974,8 +979,8 @@ export function useGatewayBoot({
         // Everything else keeps dialing the primary.
         // Bounded like the reconnect path (#93454): a wedged main-process
         // round-trip must not hang "Starting Hermes…" forever. Initial boot
-        // rides out a full backend cold spawn, so it gets the shared 45s
-        // backend-boot budget, not the 20s reconnect budget.
+        // rides out a full backend cold spawn, so it gets the dedicated
+        // primary cold-boot budget, not the shorter reconnect/switch budgets.
         const conn = await withTimeout(
           desktop.getConnection(windowProfileOverride() ?? undefined),
           BACKEND_BOOT_WAIT_TIMEOUT_MS,
