@@ -7237,6 +7237,72 @@ def _rebuild_desktop_after_update(
     return True
 
 
+def _ensure_in_place_merge_base(git_cmd, repo_root, branch: str) -> tuple[bool, str]:
+    """Make an in-place custom-branch merge safe to attempt.
+
+    A shallow checkout can contain both ``HEAD`` and ``origin/<branch>`` but
+    still lack the ancestor Git needs to merge them. Fetch the missing history
+    before mutating the checkout, and distinguish that condition from a real
+    merge failure so the desktop updater does not report every failure as a
+    conflict.
+    """
+    target_ref = f"origin/{branch}"
+
+    def has_merge_base() -> bool:
+        result = subprocess.run(
+            git_cmd + ["merge-base", "HEAD", target_ref],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return result.returncode == 0
+
+    if has_merge_base():
+        return True, ""
+
+    shallow_result = subprocess.run(
+        git_cmd + ["rev-parse", "--is-shallow-repository"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    is_shallow = (
+        shallow_result.returncode == 0
+        and shallow_result.stdout.strip().lower() == "true"
+    )
+    if not is_shallow:
+        return False, f"No common Git ancestor exists between HEAD and {target_ref}."
+
+    print(f"  ℹ Completing shallow Git history before merging {target_ref}...")
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch", "--unshallow", "origin", branch],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if fetch_result.returncode != 0:
+        detail = (
+            (fetch_result.stderr or fetch_result.stdout or "")
+            .strip()
+            .splitlines()
+        )
+        suffix = f" Git: {detail[-1]}" if detail else ""
+        return False, f"Could not complete shallow Git history before merging.{suffix}"
+
+    if has_merge_base():
+        return True, ""
+    return False, (
+        f"No common Git ancestor exists between HEAD and {target_ref} "
+        "after completing history."
+    )
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -7700,7 +7766,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
         #                    stop before the post-update steps reinforce the
         #                    stale tree.
         parked_branch_switched = False
-        in_place_update = False
+        _in_place_configured = False
+        try:
+            from hermes_cli.config import load_config as _load_cfg
+
+            _upd_cfg = (_load_cfg() or {}).get("updates", {})
+            _in_place_configured = (
+                isinstance(_upd_cfg, dict)
+                and _upd_cfg.get("parked_branch_strategy", "switch")
+                == "update_in_place"
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not read updates.parked_branch_strategy: %s", exc
+            )
+
+        in_place_update = (
+            current_branch == branch
+            and _in_place_configured
+            and not switch_branch
+        )
+        if in_place_update:
+            print(
+                f"  ℹ On target branch '{current_branch}' — updating it in place from "
+                f"origin/{branch} (local commits preserved)."
+            )
         if current_branch != branch and current_branch != "HEAD":
             switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
                 git_cmd, _m().PROJECT_ROOT, current_branch, branch
@@ -8105,11 +8195,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     ).stdout
                     or ""
                 ).strip()
-                if _cur_branch and _cur_branch != branch:
-                    print(
-                        f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
-                        f"merging origin/{branch} instead of resetting so local commits survive..."
+                if _cur_branch and (_cur_branch != branch or in_place_update):
+                    if _cur_branch == branch:
+                        print(
+                            f"  ⚠ Branch '{_cur_branch}' has maintained local history — "
+                            f"merging origin/{branch} instead of resetting so local commits survive..."
+                        )
+                    else:
+                        print(
+                            f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
+                            f"merging origin/{branch} instead of resetting so local commits survive..."
+                        )
+                    has_merge_base, merge_base_error = _ensure_in_place_merge_base(
+                        git_cmd, _m().PROJECT_ROOT, branch
                     )
+                    if not has_merge_base:
+                        print(f"✗ {merge_base_error}")
+                        print(
+                            "  Update stopped before changing the checkout. "
+                            "Local work is untouched."
+                        )
+                        sys.exit(1)
                     # Best-effort safety tag; recovery anchor if anything goes wrong.
                     subprocess.run(
                         git_cmd
@@ -8131,10 +8237,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             capture_output=True,
                             check=False,
                         )
-                        print(
-                            "✗ Merge conflict between local commits and upstream — "
-                            "update stopped, nothing was changed."
+                        detail = (
+                            (merge_result.stderr or merge_result.stdout or "")
+                            .strip()
+                            .splitlines()
                         )
+                        print(
+                            "✗ Could not merge local commits with upstream — "
+                            "update stopped."
+                        )
+                        if detail:
+                            print(f"  Git: {detail[-1]}")
                         print(
                             f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
                             f"git merge origin/{branch}"

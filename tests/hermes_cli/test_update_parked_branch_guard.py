@@ -611,3 +611,58 @@ def test_update_on_main_fast_path_unchanged(repo_pair, monkeypatch, capsys):
     head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
     remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
     assert head == remote
+
+
+def test_ensure_in_place_merge_base_deepens_shallow_clone(tmp_path):
+    """A shallow branch with a disconnected remote tip is deepened safely."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.email", "test@example.com")
+    _git(origin, "config", "user.name", "Test")
+    (origin / "a.txt").write_text("base\n")
+    _git(origin, "add", "a.txt")
+    _git(origin, "commit", "-qm", "base")
+    _git(origin, "branch", "legacy")
+    (origin / "a.txt").write_text("main\n")
+    _git(origin, "commit", "-aqm", "main advance")
+
+    clone = tmp_path / "clone"
+    _git(
+        tmp_path,
+        "clone",
+        "-q",
+        "--depth=1",
+        "--branch",
+        "legacy",
+        origin.as_uri(),
+        str(clone),
+    )
+    _git(clone, "config", "user.email", "test@example.com")
+    _git(clone, "config", "user.name", "Test")
+    _git(
+        clone,
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*",
+    )
+    _git(clone, "fetch", "-q", "--depth=1", "origin", "main")
+
+    assert (
+        _git(clone, "rev-parse", "--is-shallow-repository").stdout.strip()
+        == "true"
+    )
+    assert (
+        _git(clone, "merge-base", "HEAD", "origin/main", check=False).returncode
+        != 0
+    )
+
+    ready, detail = update_cmd._ensure_in_place_merge_base(GIT, clone, "main")
+
+    assert ready is True
+    assert detail == ""
+    assert (
+        _git(clone, "rev-parse", "--is-shallow-repository").stdout.strip()
+        == "false"
+    )
+    assert _git(clone, "merge-base", "HEAD", "origin/main").returncode == 0
