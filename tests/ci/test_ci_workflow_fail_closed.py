@@ -25,6 +25,18 @@ def test_detect_timeout_has_checkout_headroom():
     assert timeout_minutes >= 5
 
 
+def test_fork_python_suite_uses_six_balanced_slices():
+    """Fork runners must split the full suite finely enough to avoid long tail jobs."""
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (_REPO / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    slice_expression = workflow["jobs"]["test"]["strategy"]["matrix"]["slice"]
+
+    assert all(f'"{index}/6"' in slice_expression for index in range(1, 7))
+    assert '"1/1"' in slice_expression
+
+
 def test_required_gate_rejects_cancelled_detect_job(tmp_path):
     """A cancelled classifier must block the required gate, not skip every lane green."""
     steps = _ci_workflow()["jobs"]["all-checks-pass"]["steps"]
