@@ -38,6 +38,9 @@ jobs:
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
+    # Fork PRs with deep merged history can spend over a minute in checkout
+    # before classification starts. Keep this bounded without cancelling a
+    # healthy run before the first project step.
     timeout-minutes: 5
     outputs:
       python: ${{ steps.classify.outputs.python }}

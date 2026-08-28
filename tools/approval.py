@@ -907,7 +907,12 @@ def _sudo_stdin_block_result(description: str) -> dict:
 # =========================================================================
 
 DANGEROUS_PATTERNS = [
+    (
+        r'\bhermes(?:\.exe)?\s+browser\s+close-profile\b',
+        "close browser process tree (unsaved tabs may be lost)",
+    ),
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
+    (r'\brm\s+(-[^\s]*\s+)*[a-z]:[\\/]', "delete in Windows absolute path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
     # GNU rm permutes options, so a recursive flag group may legally FOLLOW
@@ -2449,25 +2454,46 @@ def _command_detection_variants(command: str):
         yield variant
 
 
-def _is_verification_artifact_cleanup(command: str) -> bool:
-    """Return whether *command* only removes one Hermes ad-hoc temp script."""
+def _verification_artifact_cleanup_operand(command: str) -> Optional[str]:
+    """Return the sole Hermes temp artifact operand, when shaped correctly."""
     try:
-        argv = shlex.split(command, posix=True)
+        argv = shlex.split(command, posix=os.name != "nt")
     except ValueError:
-        return False
+        return None
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
-        return False
+        return None
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
-    basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    if len(operand) >= 2 and operand[0] == operand[-1] and operand[0] in {'"', "'"}:
+        operand = operand[1:-1]
+    basename = os.path.basename(os.path.normpath(operand))
+    if re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is None:
+        return None
+    return operand
+
+
+def _is_verification_artifact_cleanup(command: str) -> bool:
+    """Return whether *command* only removes one Hermes ad-hoc temp script."""
+    operand = _verification_artifact_cleanup_operand(command)
+    if operand is None:
+        return False
+    if any(part in {".", ".."} for part in re.split(r"[\\/]", operand)):
         return False
 
-    target = os.path.realpath(operand)
-    if os.path.dirname(target) != temp_dir:
+    temp_dir = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
+    operand_path = os.path.normcase(os.path.abspath(operand))
+    basename = os.path.basename(operand_path)
+    expected = os.path.normcase(os.path.join(temp_dir, basename))
+
+    # Compare normalized native paths so POSIX-style paths used by shell
+    # commands are handled correctly on Windows. Keep the lexical-path check
+    # separate from realpath: a symlinked temp alias must not inherit the
+    # cleanup exemption of its canonical target.
+    if operand_path != expected:
         return False
-    return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
+    if os.path.normcase(os.path.realpath(operand_path)) != expected:
+        return False
+    return True
 
 
 _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION = (
@@ -2512,6 +2538,9 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    if _verification_artifact_cleanup_operand(command) is not None:
+        description = "delete Hermes verification artifact outside canonical temp"
+        return (True, description, description)
 
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
@@ -2588,6 +2617,11 @@ def human_wait_ceiling() -> float:
     authorization gate's serialization-lock acquire, so the two bounds cannot
     drift. Never call while holding ``_human_wait_lock`` — it reads the
     config cache.
+
+    Platform safety: ``_get_approval_timeout`` caps at
+    ``agent.deadline.MAX_SAFE_TIMEOUT_S``, so this value is always safe to
+    hand to ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)``
+    (#83220 macOS time_t overflow).
     """
     return float(_get_approval_timeout()) + HUMAN_WAIT_MARGIN_S
 
@@ -3430,11 +3464,37 @@ def _get_approval_timeout() -> int:
     approvals arrive as push notifications the user may not see for a couple
     of minutes; 60s proved too tight in practice (Telegram taps landed after
     the wait had already failed closed).
+
+    Clamped to ``agent.deadline.MAX_SAFE_TIMEOUT_S`` (1 year — semantically
+    unbounded): a very large configured value overflows ``time_t`` inside
+    ``Thread.join(timeout=...)`` / ``Lock.acquire(timeout=...)`` on macOS,
+    and before this clamp a single oversized ``approvals.timeout`` crashed
+    every parallel tool batch with OverflowError (#83220). Clamping at the
+    single config-read site keeps every consumer (prompt join, gateway poll
+    deadline, human-wait ceiling, authorization gate) platform-safe at once.
     """
     try:
-        return int(_get_approval_config().get("timeout", 300))
+        raw = int(_get_approval_config().get("timeout", 300))
     except (ValueError, TypeError):
         return 300
+    try:
+        from agent.deadline import MAX_SAFE_TIMEOUT_S
+
+        safe_cap = int(MAX_SAFE_TIMEOUT_S)
+    except Exception:
+        # Fail CLOSED: returning the raw value here would re-open the exact
+        # time_t overflow this clamp exists to prevent. ~1 year, matching
+        # agent.deadline.MAX_SAFE_TIMEOUT_S.
+        safe_cap = 365 * 24 * 3600
+    if raw > safe_cap:
+        logger.warning(
+            "approvals.timeout=%s exceeds the platform-safe maximum; "
+            "clamping to %ss",
+            raw,
+            safe_cap,
+        )
+        return safe_cap
+    return raw
 
 
 def _get_cron_approval_mode() -> str:
@@ -3543,8 +3603,22 @@ def _smart_approve(command: str, description: str) -> str:
     Inspired by OpenAI Codex's Smart Approvals guardian subagent
     (openai/codex#13860).
     """
+    _smart_t0 = time.monotonic()
     try:
-        from agent.auxiliary_client import call_llm
+        from agent.auxiliary_client import _get_task_timeout, call_llm
+
+        # Explicit timeout for the guardian call. This synchronous call gates
+        # EVERY flagged terminal command — relying on the timeout being
+        # resolved correctly inside call_llm has burned users in production:
+        # a stalled provider response silently froze the agent turn for tens
+        # of minutes with zero log output (#82846, #72500). Pass the same
+        # configured value explicitly (belt) and log the call + duration
+        # (suspenders) so a hang is visible in the logs instead of silent.
+        smart_timeout = _get_task_timeout("approval")
+        logger.debug(
+            "Smart approvals: assessing risk for command (timeout=%ss)",
+            smart_timeout,
+        )
 
         # Strip shell comments to remove the easiest injection vector.
         sanitized_command = _strip_shell_comments(command)
@@ -3601,6 +3675,11 @@ def _smart_approve(command: str, description: str) -> str:
             ],
             temperature=0,
             max_tokens=16,
+            timeout=smart_timeout,
+        )
+        logger.debug(
+            "Smart approvals: LLM call completed in %.1fs",
+            time.monotonic() - _smart_t0,
         )
 
         answer = (response.choices[0].message.content or "").strip().upper()
@@ -3613,7 +3692,15 @@ def _smart_approve(command: str, description: str) -> str:
             return "escalate"
 
     except Exception as e:
-        logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
+        # WARNING (was DEBUG): a failed/blocked guardian call is a real event
+        # the operator needs to see — the whole point of #82846 is that the
+        # hang was invisible. Log the elapsed time and error class too.
+        logger.warning(
+            "Smart approvals: LLM call failed after %.1fs (%s: %s), escalating",
+            time.monotonic() - _smart_t0,
+            type(e).__name__,
+            e,
+        )
         return "escalate"
 
 

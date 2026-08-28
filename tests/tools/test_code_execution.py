@@ -411,7 +411,7 @@ class TestStubSchemaDrift(unittest.TestCase):
     # Parameters that are internal (injected by the handler, not user-facing)
     _INTERNAL_PARAMS = {"task_id", "user_task"}
     # Parameters intentionally blocked in the sandbox
-    _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
+    _BLOCKED_TERMINAL_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns"}
 
     def test_stubs_cover_all_schema_params(self):
         """Every user-facing parameter in the real schema must appear in the
@@ -801,7 +801,7 @@ class TestRpcTokenAuthorization(unittest.TestCase):
     """
 
     def _drive_server(self, rpc_token, requests):
-        """Run _rpc_server_loop against a real AF_UNIX socketpair.
+        """Run _rpc_server_loop against a real connected socketpair.
 
         Sends each dict in *requests* as a newline-delimited JSON message
         and returns the list of decoded JSON responses.
@@ -810,7 +810,7 @@ class TestRpcTokenAuthorization(unittest.TestCase):
 
         # socketpair gives us a connected client end and a "server" end we
         # can hand to accept() by wrapping it in a tiny listener shim.
-        srv, cli = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv, cli = socket.socketpair()
 
         class _OneShotListener:
             """Minimal object exposing the .accept()/.settimeout() the loop uses."""

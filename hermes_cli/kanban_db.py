@@ -1589,10 +1589,21 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
-    # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
-    # the PRAGMA explicitly so it is observable and survives future wrapper
-    # changes. Parameter binding is not supported for PRAGMA assignments.
-    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    try:
+        # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
+        # the PRAGMA explicitly so it is observable and survives future wrapper
+        # changes. Parameter binding is not supported for PRAGMA assignments.
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except BaseException:
+        # A half-open connection abandoned here would leak its fd AND leave a
+        # stale entry in the connect_tracked live-connection registry (which
+        # only clears on close), permanently blocking byte-level probes of
+        # this database file. Close before re-raising.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -8148,6 +8159,18 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
+
+    # Windows exposes ``os.waitpid`` but not the POSIX WIF*/WEXITSTATUS
+    # helpers. Its documented status value is the process exit code shifted
+    # left by 8 bits, so decode that representation directly.
+    if os.name == "nt":
+        code = raw >> 8
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
+
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
