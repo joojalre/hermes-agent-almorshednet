@@ -129,6 +129,17 @@ def _validate_metadata(value: Any, *, field: str, allow_empty: bool = True) -> s
     return value
 
 
+def _validate_timestamp(value: Any, *, field: str) -> str:
+    normalized = _validate_metadata(value, field=field, allow_empty=False)
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise KnowledgeError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise KnowledgeError(f"{field} must include a timezone")
+    return normalized
+
+
 def _require_id(value: Any, label: str) -> str:
     if not isinstance(value, str) or not _ID_RE.fullmatch(value):
         raise KnowledgeError(f"{label} must be a short ASCII identifier")
@@ -182,7 +193,7 @@ def _source_root(source: dict[str, Any]) -> dict[str, Any]:
     if kind not in VALID_KINDS:
         raise KnowledgeError(f"source {source_id}: kind must be local, drive, or github")
     locator = source.get("locator", "")
-    locator = _validate_metadata(locator, field=f"source {source_id} locator")
+    locator = _validate_metadata(locator, field=f"source {source_id} locator", allow_empty=False)
     reason = _reject_secret_path(locator)
     if reason:
         raise KnowledgeError(f"source {source_id}: {reason}")
@@ -192,6 +203,8 @@ def _source_root(source: dict[str, Any]) -> dict[str, Any]:
     sha = _validate_metadata(sha, field=f"source {source_id} sha")
     if sha and not _HEX_SHA_RE.fullmatch(sha):
         raise KnowledgeError(f"source {source_id}: sha must be hexadecimal")
+    if not revision and not sha:
+        raise KnowledgeError(f"source {source_id}: revision or sha is required")
 
     content = source.get("content")
     if content is not None:
@@ -234,7 +247,7 @@ def _record_from(
         raise KnowledgeError(f"record {record_id}: statement is empty or too long")
     if not isinstance(domain, str) or not domain.strip() or len(domain.strip()) > MAX_DOMAIN_CHARS:
         raise KnowledgeError(f"record {record_id}: domain is empty or too long")
-    if status not in VALID_STATUSES:
+    if not isinstance(status, str) or status not in VALID_STATUSES:
         raise KnowledgeError(f"record {record_id}: invalid status")
     statement = " ".join(statement.split())
     domain = " ".join(domain.split())
@@ -244,7 +257,7 @@ def _record_from(
     if _INSTRUCTION_RE.search(statement):
         raise KnowledgeError(f"record {record_id}: instruction-like text is not a fact")
     fact_key = raw.get("fact_key", "")
-    if fact_key and (not isinstance(fact_key, str) or len(fact_key) > MAX_ID_CHARS):
+    if not isinstance(fact_key, str) or len(fact_key) > MAX_ID_CHARS:
         raise KnowledgeError(f"record {record_id}: fact_key is invalid")
     source = sources[source_id]
     revision = _validate_metadata(
@@ -257,10 +270,9 @@ def _record_from(
     )
     if sha and not _HEX_SHA_RE.fullmatch(sha):
         raise KnowledgeError(f"record {record_id}: sha must be hexadecimal")
-    record_verified_at = _validate_metadata(
+    record_verified_at = _validate_timestamp(
         raw.get("verified_at") or verified_at,
         field=f"record {record_id} verified_at",
-        allow_empty=False,
     )
     return {
         "id": record_id,
@@ -281,9 +293,7 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
     run_id = manifest.get("run_id")
     if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
         raise KnowledgeError("run_id must be a short ASCII identifier")
-    verified_at = manifest.get("verified_at")
-    if not isinstance(verified_at, str) or not verified_at or len(verified_at) > 64:
-        raise KnowledgeError("verified_at must be a manifest-level timestamp")
+    verified_at = _validate_timestamp(manifest.get("verified_at"), field="verified_at")
     raw_sources = manifest.get("sources")
     raw_records = manifest.get("records")
     if not isinstance(raw_sources, list) or not raw_sources or len(raw_sources) > MAX_SOURCE_COUNT:
@@ -378,17 +388,16 @@ def _load_memory_entries() -> tuple[str, list[str]]:
 def _write_managed_memory(block: str, run_id: str) -> dict[str, Any]:
     path = _memory_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw_before, _ = _load_memory_entries()
-    before_sha = _sha256_text(raw_before)
     backup_path = get_hermes_home() / AUDIT_DIRNAME / "backups" / run_id / "MEMORY.md"
     backup_path.parent.mkdir(parents=True, exist_ok=True)
-    if not backup_path.exists():
-        atomic_write_text(backup_path, raw_before)
 
     with MemoryStore._file_lock(path):
         raw, read_ok = MemoryStore._read_raw_checked(path)
         if not read_ok:
             raise KnowledgeError("MEMORY.md became unreadable; write refused")
+        before_sha = _sha256_text(raw)
+        if not backup_path.exists():
+            atomic_write_text(backup_path, raw)
         store = load_on_disk_store()
         current_chars = len(raw)
         effective_limit = max(store.memory_char_limit, current_chars + len(block) + len(ENTRY_DELIMITER))
@@ -423,6 +432,19 @@ def _append_audit(event: dict[str, Any]) -> None:
         if len(previous.encode("utf-8")) > 5 * 1024 * 1024:
             raise KnowledgeError("knowledge audit exceeds 5 MiB; rotate it before another apply")
         atomic_write_text(path, previous + json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _verified_memory_path(memory: Any) -> Path:
+    if not isinstance(memory, dict):
+        raise KnowledgeError("audit memory record is invalid")
+    raw_path = memory.get("path")
+    if raw_path is not None and not isinstance(raw_path, str):
+        raise KnowledgeError("audit memory path is invalid")
+    candidate = Path(raw_path).expanduser().resolve() if raw_path else _memory_path().resolve()
+    expected = _memory_path().resolve()
+    if candidate != expected:
+        raise KnowledgeError("audit memory path is outside the active Hermes profile")
+    return candidate
 
 
 def _summary(prepared: dict[str, Any], memory: dict[str, Any]) -> dict[str, Any]:
@@ -513,7 +535,7 @@ def _verify(args: Any) -> int:
             raise KnowledgeError(f"run-id not found: {args.run_id}")
         event = events[-1]
         memory = event.get("memory") or {}
-        memory_path = Path(memory.get("path", _memory_path()))
+        memory_path = _verified_memory_path(memory)
         current = memory_path.read_text(encoding="utf-8") if memory_path.exists() else ""
         managed = any(entry.startswith(MANAGED_HEADER) and args.run_id in entry for entry in MemoryStore._parse_entries(current))
         after_sha = _sha256_text(current)
