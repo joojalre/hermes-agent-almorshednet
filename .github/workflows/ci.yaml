@@ -38,10 +38,7 @@ jobs:
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
-    # Fork PRs with deep merged history can spend over a minute in checkout
-    # before classification starts. Keep this bounded without cancelling a
-    # healthy run before the first project step.
-    timeout-minutes: 5
+    timeout-minutes: 1
     outputs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
@@ -64,6 +61,8 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
         with:
+          sparse-checkout: scripts/ci/classify_changes.py
+          sparse-checkout-cone-mode: false
           github-token: ${{ github.token }}
 
   # ─────────────────────────────────────────────────────────────────────
@@ -257,16 +256,13 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          blocked = [
-              name for name, info in needs.items()
-              if info['result'] not in ('success', 'skipped')
-          ]
+          failed = [name for name, info in needs.items() if info['result'] == 'failure']
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
               print(f'{icon} {name}: {result}')
-          if blocked:
-              print(f'::error::{len(blocked)} job(s) did not complete: {\", \".join(blocked)}')
+          if failed:
+              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "

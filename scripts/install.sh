@@ -882,20 +882,22 @@ check_cxx_compiler() {
     return 1
 }
 
-# The dependency tree's real Node floor is >=22.22.0, set by react-router 8.3.0
-# (`engines.node`), with Vite ^8 next at `^20.19 || >=22.12`. Keep this in sync
-# with the root package.json — a gate looser than the manifest lets an install
-# proceed to a `npm ci` that then dies with EBADENGINE, and a gate stricter than
-# the manifest replaces a working user toolchain for nothing. Returns 0 when the
-# given `node --version` string clears the floor; anything below it is replaced
-# with the Hermes-managed Node $NODE_VERSION.
+# The dependency tree supports Node 22.22+, 24.11+, and 26+. nanoid 6 excludes
+# Node 23 and 25 while its >=26 arm accepts later releases, and @babel/* 8.x
+# requires ^22.18.0 || >=24.11.0 — so accepting 23/25 or an early Node 24
+# here only defers the failure to `npm ci` under engine-strict. Keep this in
+# sync with the root package.json. Anything outside the supported lines is
+# replaced with the Hermes-managed Node $NODE_VERSION.
 node_satisfies_build() {
     local ver="${1#v}"
+    case "$ver" in *-*) return 1 ;; esac
     local major="${ver%%.*}"
     local minor="${ver#*.}"; minor="${minor%%.*}"
     case "$major" in ''|*[!0-9]*) return 1 ;; esac
     case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
-    if [ "$major" -ge 22 ] && { [ "$major" -gt 22 ] || [ "$minor" -ge 22 ]; }; then return 0; fi
+    if [ "$major" -eq 22 ] && [ "$minor" -ge 22 ]; then return 0; fi
+    if [ "$major" -eq 24 ] && [ "$minor" -ge 11 ]; then return 0; fi
+    if [ "$major" -ge 26 ]; then return 0; fi
     return 1
 }
 
@@ -963,7 +965,7 @@ check_node() {
     if command -v node &> /dev/null && ! command -v npm &> /dev/null; then
         log_warn "node found but npm is not on PATH (stray node symlink?) — installing Hermes-managed Node $NODE_VERSION LTS..."
     elif command -v node &> /dev/null; then
-        log_warn "Node.js $(node --version) is too old (Hermes requires Node >=26) — installing Hermes-managed Node $NODE_VERSION..."
+        log_warn "Node.js $(node --version) is unsupported (Hermes requires Node 22.22+, 24.11+, or 26+) — installing Hermes-managed Node $NODE_VERSION..."
     elif [ "$DISTRO" = "termux" ]; then
         log_info "Node.js not found — installing Node.js via pkg..."
     else
@@ -1709,7 +1711,22 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        #
+        # Strip UV_NO_CONFIG for this one invocation. The global export at
+        # script start (the #21269 sudo -u hygiene guard) also hides the
+        # project's own [tool.uv] policy — exclude-newer and its package
+        # exemptions — from uv. The resolver then runs under a different
+        # policy than the one uv.lock was resolved under, and --locked
+        # turns that mismatch fatal:
+        #   error: The lockfile at `uv.lock` needs to be updated, but
+        #   `--locked` was provided.
+        # Every fresh install then falls through to the non-hash-verified
+        # PyPI fallback tiers, defeating the point of Tier 0. Runtime code
+        # already strips UV_NO_CONFIG before its own locked syncs for the
+        # same reason (hermes_cli/managed_uv.py, "Locked sync must see
+        # project [tool.uv] exclude-newer"). The export stays in effect for
+        # every other uv call in this script.
+        if env -u UV_NO_CONFIG UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -3219,8 +3236,8 @@ install_desktop() {
     # failure, not a silent skip — a silent skip yields a "complete" install
     # with no app and a confusing "couldn't find a built desktop" at launch.
     # Always re-resolve Node here. Stages run in separate processes, so we can't
-    # trust an earlier check; more importantly check_node now enforces the build
-    # floor (Node >=26) and prepends the Hermes-managed Node to PATH, so
+    # trust an earlier check; more importantly check_node now enforces the
+    # supported Node lines and prepends the Hermes-managed Node to PATH, so
     # the build never runs on a too-old system Node — the cause of the opaque
     # "Build desktop app … exit code 1" failure (Vite crashes on old Node).
     check_node

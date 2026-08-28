@@ -16,7 +16,7 @@ import type {
 } from '@/global'
 import { checkHermesUpdate, getActionStatus, updateHermes } from '@/hermes'
 import { translateNow } from '@/i18n'
-import { persistString, storedString } from '@/lib/storage'
+import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
 import { $connectionsRegistry, refreshConnectionsRegistry } from '@/store/connections'
 import { reconnectGateway } from '@/store/gateway-reconnect'
 import { dismissNotification, notify } from '@/store/notifications'
@@ -52,6 +52,17 @@ export const $updateApply = atom<UpdateApplyState>(IDLE)
 export const $updateChecking = atom<boolean>(false)
 export const $updateOverlayOpen = atom<boolean>(false)
 export const $updateStatus = atom<DesktopUpdateStatus | null>(null)
+
+const AUTOMATIC_UPDATES_STORAGE_KEY = 'hermes:automatic-updates-enabled'
+
+// Automatic updates are local to this desktop and default on so a repaired
+// source install does not silently fall back to manual updates again.
+export const $automaticUpdatesEnabled = atom(storedBoolean(AUTOMATIC_UPDATES_STORAGE_KEY, true))
+$automaticUpdatesEnabled.subscribe(enabled => persistBoolean(AUTOMATIC_UPDATES_STORAGE_KEY, enabled))
+
+export function setAutomaticUpdatesEnabled(enabled: boolean): void {
+  $automaticUpdatesEnabled.set(enabled)
+}
 
 // Client and backend are independently updatable; each keeps its own state.
 export const $backendUpdateStatus = atom<DesktopUpdateStatus | null>(null)
@@ -392,7 +403,7 @@ export async function checkBackendUpdates(): Promise<DesktopUpdateStatus | null>
   }
 }
 
-export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
+export async function checkUpdates({ autoApply = false }: { autoApply?: boolean } = {}): Promise<DesktopUpdateStatus | null> {
   const bridge = window.hermesDesktop?.updates
 
   if (!bridge || $updateChecking.get()) {
@@ -405,6 +416,9 @@ export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
     const status = await bridge.check()
     $updateStatus.set(status)
     maybeNotifyUpdateAvailable(status)
+    if (autoApply) {
+      maybeApplyAutomaticClientUpdate(status)
+    }
     void refreshDesktopVersion()
 
     return status
@@ -634,6 +648,29 @@ function legacyBackendReachedTarget(
 }
 
 let backendUpdateInFlight: Promise<DesktopUpdateApplyResult> | null = null
+let automaticClientUpdateInFlight = false
+
+function maybeApplyAutomaticClientUpdate(status: DesktopUpdateStatus | null): void {
+  const available = Boolean(status && ((status.behind ?? 0) > 0 || status.updateAvailable))
+
+  if (
+    !$automaticUpdatesEnabled.get() ||
+    !available ||
+    status?.supported === false ||
+    status?.error ||
+    automaticClientUpdateInFlight ||
+    $updateApply.get().applying
+  ) {
+    return
+  }
+
+  automaticClientUpdateInFlight = true
+  $updateOverlayTarget.set('client')
+  $updateOverlayOpen.set(true)
+  void applyUpdates().finally(() => {
+    automaticClientUpdateInFlight = false
+  })
+}
 
 async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
   dismissNotification(UPDATE_TOAST_ID)
@@ -966,7 +1003,7 @@ export function startUpdatePoller(): void {
   }
 
   pollerStarted = true
-  void checkUpdates()
+  void checkUpdates({ autoApply: true })
   void checkBackendUpdates()
   void refreshDesktopVersion()
   bridge.onProgress(ingestProgress)
@@ -989,7 +1026,7 @@ export function startUpdatePoller(): void {
   window.addEventListener('focus', onFocus)
   backgroundTimer = setInterval(
     () => {
-      void checkUpdates()
+      void checkUpdates({ autoApply: true })
       void checkBackendUpdates()
     },
     30 * 60 * 1000
@@ -1017,7 +1054,7 @@ function onFocus() {
   }
 
   lastFocusAt = now
-  void checkUpdates()
+  void checkUpdates({ autoApply: true })
   void checkBackendUpdates()
   void refreshDesktopVersion()
 }

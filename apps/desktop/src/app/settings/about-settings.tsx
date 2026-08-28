@@ -4,10 +4,13 @@ import { useEffect, useState } from 'react'
 import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { Switch } from '@/components/ui/switch'
 import { type Translations, useI18n } from '@/i18n'
 import { AlertTriangle, CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
+import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import {
+  $automaticUpdatesEnabled,
   $desktopVersion,
   $updateApply,
   $updateChecking,
@@ -15,6 +18,7 @@ import {
   checkUpdates,
   openUpdatesWindow,
   refreshDesktopVersion,
+  setAutomaticUpdatesEnabled,
   startActiveUpdate
 } from '@/store/updates'
 
@@ -50,6 +54,7 @@ export function AboutSettings() {
   const { t } = useI18n()
   const a = t.settings.about
   const version = useStore($desktopVersion)
+  const automaticUpdatesEnabled = useStore($automaticUpdatesEnabled)
   const status = useStore($updateStatus)
   const apply = useStore($updateApply)
   const checking = useStore($updateChecking)
@@ -200,6 +205,16 @@ export function AboutSettings() {
         </div>
 
         <ListRow
+          action={
+            <Switch
+              aria-label={a.automaticUpdates}
+              checked={automaticUpdatesEnabled}
+              onCheckedChange={enabled => {
+                triggerHaptic('selection')
+                setAutomaticUpdatesEnabled(enabled)
+              }}
+            />
+          }
           description={a.automaticUpdatesDesc}
           hint={a.branchCommit(status?.branch ?? 'unknown', status?.currentSha?.slice(0, 7) ?? 'unknown')}
           title={a.automaticUpdates}

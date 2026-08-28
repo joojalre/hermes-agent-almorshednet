@@ -48,7 +48,7 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
+            runner: windows-latest-32-core
             marker: windows_only
     steps:
       - name: Checkout code

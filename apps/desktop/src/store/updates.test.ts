@@ -95,6 +95,7 @@ const {
   $updateOverlayTarget,
   requestActiveUpdate,
   resetUpdateApplyState,
+  setAutomaticUpdatesEnabled,
   startUpdatePoller,
   stopUpdatePoller,
   $updateStatus
@@ -1194,12 +1195,16 @@ describe('applyBackendUpdate recovery', () => {
 
 describe('startUpdatePoller', () => {
   const checkMock = vi.fn()
+  const applyMock = vi.fn()
   const onProgressMock = vi.fn()
   const listeners: Record<string, Function> = {}
 
   beforeEach(() => {
     storage.clear()
+    setAutomaticUpdatesEnabled(true)
     checkMock.mockReset()
+    applyMock.mockReset()
+    applyMock.mockResolvedValue({ ok: true })
     onProgressMock.mockReset()
     Object.keys(listeners).forEach(k => delete listeners[k])
     checkMock.mockResolvedValue({
@@ -1210,7 +1215,7 @@ describe('startUpdatePoller', () => {
     })
     $updateStatus.set(null)
     ;(globalThis as unknown as { window: unknown }).window = {
-      hermesDesktop: { updates: { check: checkMock, onProgress: onProgressMock } },
+      hermesDesktop: { updates: { apply: applyMock, check: checkMock, onProgress: onProgressMock } },
       addEventListener: vi.fn((event: string, handler: Function) => {
         listeners[event] = handler
       }),
@@ -1234,6 +1239,21 @@ describe('startUpdatePoller', () => {
 
     expect(checkMock).toHaveBeenCalled()
     expect($updateStatus.get()?.behind).toBe(5)
+  })
+
+  it('applies a client update automatically when the setting is enabled', async () => {
+    startUpdatePoller()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(applyMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not apply updates automatically when the setting is disabled', async () => {
+    setAutomaticUpdatesEnabled(false)
+    startUpdatePoller()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(applyMock).not.toHaveBeenCalled()
   })
 
   it('calls checkUpdates() on each interval tick', async () => {

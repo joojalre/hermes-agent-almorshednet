@@ -476,6 +476,7 @@ from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.memory import build_memory_parser
+from hermes_cli.subcommands.knowledge import build_knowledge_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
@@ -3437,6 +3438,7 @@ def cmd_chat(args):
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
+        "oneshot": bool(getattr(args, "oneshot_exit", False)),
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
         "worktree": getattr(args, "worktree", False),
@@ -11165,7 +11167,7 @@ def cmd_profile(args):
 
             # Profile dir for display
             try:
-                profile_dir_display = "~/" + str(profile_dir.relative_to(Path.home()))
+                profile_dir_display = "~/" + profile_dir.relative_to(Path.home()).as_posix()
             except ValueError:
                 profile_dir_display = str(profile_dir)
 
@@ -12359,7 +12361,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
-        "journey", "memory-graph", "learning",
+        "journey", "memory-graph", "learning", "knowledge",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
@@ -12863,6 +12865,13 @@ def cmd_memory(args):
         memory_command(args)
 
 
+def cmd_knowledge(args):
+    """Run the bounded foreground knowledge synchronizer."""
+    from hermes_cli.knowledge import knowledge_command
+
+    return knowledge_command(args)
+
+
 def cmd_acp(args):
     """Launch Hermes Agent as an ACP server."""
     try:
@@ -13319,7 +13328,7 @@ def main():
         if not src:
             print(f"✗ Could not resolve the {browser} profile directory.", file=sys.stderr)
             return 1
-        closed, msg = close_browser_holding_profile(src, browser=browser)
+        closed, msg = close_browser_holding_profile(src)
         if closed:
             print(f"✓ {msg}")
             return 0
@@ -13800,6 +13809,11 @@ def main():
     # memory command  (parser built in hermes_cli/subcommands/memory.py)
     # =========================================================================
     build_memory_parser(subparsers, cmd_memory=cmd_memory)
+
+    # =======================================================================
+    # knowledge command — bounded, local-first memory synchronization
+    # =======================================================================
+    build_knowledge_parser(subparsers, cmd_knowledge=cmd_knowledge)
 
     # =========================================================================
     # tools command  (parser built in hermes_cli/subcommands/tools.py)
