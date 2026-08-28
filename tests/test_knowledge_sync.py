@@ -65,6 +65,7 @@ def test_apply_and_verify_are_idempotent_and_do_not_touch_user(tmp_path, monkeyp
     first = (memories / "MEMORY.md").read_bytes()
     backup = home / "knowledge" / "backups" / "test-run-001" / "MEMORY.md"
     assert backup.read_bytes() == b"existing"
+    assert json.loads((home / "knowledge" / "knowledge-sync.jsonl").read_text(encoding="utf-8").splitlines()[-1])["memory"]["before_sha256"] == knowledge._sha256_bytes(b"existing")
     assert knowledge._sync(args) == 0
     assert (memories / "MEMORY.md").read_bytes() == first
     assert backup.read_bytes() == b"existing"
@@ -122,6 +123,54 @@ def test_sensitive_metadata_and_non_hex_sha_are_rejected(tmp_path, monkeypatch):
     assert knowledge._sync(args) == 2
     args.manifest = str(bad_sha)
     assert knowledge._sync(args) == 2
+
+
+def test_timestamp_and_source_revision_are_required(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    invalid_timestamp = _manifest(tmp_path / "invalid-timestamp.json")
+    data = json.loads(invalid_timestamp.read_text(encoding="utf-8"))
+    data["verified_at"] = "yesterday"
+    invalid_timestamp.write_text(json.dumps(data), encoding="utf-8")
+    missing_revision = _manifest(tmp_path / "missing-revision.json")
+    data = json.loads(missing_revision.read_text(encoding="utf-8"))
+    data["sources"][0].pop("revision")
+    missing_revision.write_text(json.dumps(data), encoding="utf-8")
+
+    class Args:
+        pass
+
+    args = Args()
+    args.dry_run = True
+    args.apply = False
+    args.json = True
+    args.manifest = str(invalid_timestamp)
+    assert knowledge._sync(args) == 2
+    args.manifest = str(missing_revision)
+    assert knowledge._sync(args) == 2
+
+
+def test_verify_refuses_audit_path_outside_active_profile(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    (home / "memories").mkdir(parents=True)
+    (home / "knowledge").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    audit = home / "knowledge" / "knowledge-sync.jsonl"
+    audit.write_text(json.dumps({
+        "run_id": "path-check-001",
+        "memory": {
+            "status": "applied",
+            "path": str(tmp_path / "outside" / "MEMORY.md"),
+            "after_sha256": "0" * 64,
+        },
+    }) + "\n", encoding="utf-8")
+
+    class Args:
+        run_id = "path-check-001"
+        json = True
+
+    assert knowledge._verify(Args()) == 2
 
 
 def test_conflicting_fact_key_is_not_written(tmp_path, monkeypatch):
