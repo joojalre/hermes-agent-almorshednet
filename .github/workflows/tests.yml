@@ -97,18 +97,17 @@ jobs:
         # set is identical to the list the removed matrix job used to pass in.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          scripts/run_tests.sh --slice "${{ matrix.slice }}"
         env:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # 96 workers apply only to the dedicated upstream runner. Forks keep
-          # the harness default for their actual CPU count inside each slice.
-          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '96' || '' }}
+          # 96 workers apply only to the dedicated upstream runner. Forks use
+          # two workers per slice to avoid timing flakes from oversubscription.
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '96' || '2' }}
           # Fork slices can legitimately take longer per isolated subprocess
           # under shared-runner load; retain a bounded per-file ceiling.
           HERMES_TEST_FILE_TIMEOUT: ${{ github.repository == 'NousResearch/hermes-agent' && '300' || '600' }}
-          HERMES_TEST_SLICE: ${{ matrix.slice }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
