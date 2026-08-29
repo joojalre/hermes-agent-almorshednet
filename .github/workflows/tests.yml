@@ -14,11 +14,15 @@ concurrency:
 jobs:
   test:
     name: Run tests
-    # One standard GitHub-hosted runner keeps this reusable workflow available
-    # to forks that do not have larger-runner entitlements. The test runner
-    # sizes its own file-level parallelism from the available CPU count.
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Upstream retains its dedicated larger runner. Forks use standard
+    # GitHub-hosted runners and split the same complete suite into bounded
+    # slices so no job relies on unavailable larger-runner entitlements.
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && 'ubuntu-latest-96-core' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(github.repository == 'NousResearch/hermes-agent' && '["1/1"]' || '["1/12", "2/12", "3/12", "4/12", "5/12", "6/12", "7/12", "8/12", "9/12", "10/12", "11/12", "12/12"]') }}
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -98,10 +102,13 @@ jobs:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # Standard GitHub-hosted runners expose two cores. Keep one pytest
-          # subprocess per core: the previous 96-worker setting belonged to a
-          # larger runner and causes severe oversubscription on fork CI.
-          HERMES_TEST_WORKERS: 2
+          # 96 workers apply only to the dedicated upstream runner. Forks keep
+          # the harness default for their actual CPU count inside each slice.
+          HERMES_TEST_WORKERS: ${{ github.repository == 'NousResearch/hermes-agent' && '96' || '' }}
+          # Fork slices can legitimately take longer per isolated subprocess
+          # under shared-runner load; retain a bounded per-file ceiling.
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.repository == 'NousResearch/hermes-agent' && '300' || '600' }}
+          HERMES_TEST_SLICE: ${{ matrix.slice }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
