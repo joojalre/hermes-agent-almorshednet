@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from types import FrameType
+from typing import Protocol
 
 import psutil
 
@@ -119,6 +120,12 @@ class _DescendantTracker:
             return list(self._tracked.values())
 
 
+class _ProcessTracker(Protocol):
+    def start(self) -> None: ...
+
+    def stop(self) -> list[psutil.Process]: ...
+
+
 def _signal_descendants(
     descendants: Sequence[psutil.Process], signal_number: int
 ) -> None:
@@ -190,10 +197,11 @@ def run_with_timebox(
     grace_seconds: int,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     terminate_group: Callable[[int, int], None] = _terminate_group,
+    tracker_factory: Callable[[int], _ProcessTracker] = _DescendantTracker,
 ) -> int:
     """Run *command* and terminate its complete process tree on timeout."""
     process = popen(list(command), start_new_session=os.name != "nt")
-    tracker = _DescendantTracker(process.pid)
+    tracker = tracker_factory(process.pid)
     tracker.start()
     try:
         result = process.wait(timeout=timeout_seconds)

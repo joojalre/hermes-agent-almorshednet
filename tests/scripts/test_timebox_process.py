@@ -30,6 +30,18 @@ class FakeProcess:
         return None
 
 
+class FakeTracker:
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> list[psutil.Process]:
+        return []
+
+
+def _fake_tracker(_pid: int) -> FakeTracker:
+    return FakeTracker()
+
+
 def test_returns_command_exit_code() -> None:
     process = FakeProcess([0])
 
@@ -38,6 +50,7 @@ def test_returns_command_exit_code() -> None:
         timeout_seconds=10,
         grace_seconds=2,
         popen=lambda *args, **kwargs: process,
+        tracker_factory=_fake_tracker,
     )
 
     assert result == 0
@@ -53,6 +66,7 @@ def test_timeout_terminates_the_process_group() -> None:
         grace_seconds=2,
         popen=lambda *args, **kwargs: process,
         terminate_group=lambda pid, signum: signals.append((pid, signum)),
+        tracker_factory=_fake_tracker,
     )
 
     assert result == TIMEOUT_EXIT_CODE
@@ -73,6 +87,7 @@ def test_timeout_escalates_to_kill_after_grace_period() -> None:
         grace_seconds=2,
         popen=lambda *args, **kwargs: process,
         terminate_group=lambda pid, signum: signals.append((pid, signum)),
+        tracker_factory=_fake_tracker,
     )
 
     assert result == TIMEOUT_EXIT_CODE
@@ -90,6 +105,7 @@ def test_keyboard_interrupt_terminates_the_process_group() -> None:
             grace_seconds=2,
             popen=lambda *args, **kwargs: process,
             terminate_group=lambda pid, signum: signals.append((pid, signum)),
+            tracker_factory=_fake_tracker,
         )
 
     assert signals == [(4242, signal.SIGINT)]
@@ -122,6 +138,7 @@ def test_repeated_cancellation_does_not_interrupt_cleanup() -> None:
             grace_seconds=2,
             popen=lambda *args, **kwargs: process,
             terminate_group=lambda pid, signum: signals.append((pid, signum)),
+            tracker_factory=_fake_tracker,
         )
 
     assert signals == [(4242, signal.SIGTERM), (4242, KILL_SIGNAL)]
