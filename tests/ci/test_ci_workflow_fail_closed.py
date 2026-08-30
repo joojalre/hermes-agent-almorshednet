@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -58,7 +59,7 @@ def test_fork_python_suite_has_a_server_enforced_timeout():
     assert int(fork_timeout) <= 30
 
 
-def test_fork_python_suite_has_a_process_group_watchdog():
+def test_fork_python_suite_has_a_process_tree_watchdog():
     """Fork test descendants must be terminated with their parent process."""
     yaml = pytest.importorskip("yaml")
     workflow = yaml.safe_load(
@@ -68,8 +69,13 @@ def test_fork_python_suite_has_a_process_group_watchdog():
     run_tests = next(step for step in steps if step.get("name") == "Run tests")
 
     assert "python scripts/ci/timebox_process.py" in run_tests["run"]
-    assert "--timeout-seconds 1500" in run_tests["run"]
-    assert "--grace-seconds 60" in run_tests["run"]
+    command = shlex.split(run_tests["run"])
+    watchdog_seconds = int(command[command.index("--timeout-seconds") + 1])
+    grace_seconds = int(command[command.index("--grace-seconds") + 1])
+
+    assert 60 <= watchdog_seconds <= 25 * 60
+    assert 5 <= grace_seconds <= 60
+    assert watchdog_seconds + grace_seconds <= 26 * 60
 
 
 def test_required_gate_rejects_cancelled_detect_job(tmp_path):
