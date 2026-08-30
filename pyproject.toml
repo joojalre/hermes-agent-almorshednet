@@ -42,10 +42,6 @@ dependencies = [
   "python-dotenv==1.2.2",
   "fire==0.7.1",
   "httpx[socks]==0.28.1",
-  # h2 is transitive via HTTP stacks but must be pinned in install metadata.
-  # This closes the upgrade-gap where `uv pip install -e ".[all]"` without
-  # --upgrade can skip upgrading an already-installed vulnerable version.
-  "h2==4.4.1",  # GHSA-6hr6-w5qg-qmwg / CVE-2026-71554
   "rich==14.3.3",
   "tenacity==9.1.4",
   "pyyaml==6.0.3",
@@ -397,6 +393,11 @@ override-dependencies = [
   # requests with RSA and AES, and that API did not break in 49 or 50.
   # Remove this line when alibabacloud-tea-openapi lifts the cap.
   "cryptography>=50,<51",
+  # h2 is transitive, so keep it out of core dependencies. The update path
+  # uses `uv pip install -e .[all]` without `--upgrade`; this override forces
+  # an already-installed vulnerable version onto the patched release whenever
+  # an enabled extra pulls h2 into the environment.
+  "h2==4.4.1",  # GHSA-6hr6-w5qg-qmwg / CVE-2026-71554
 ]
 exclude-newer = "14 days"
 # aiohttp, cryptography: same shape — the advisory fixes are newer than the
