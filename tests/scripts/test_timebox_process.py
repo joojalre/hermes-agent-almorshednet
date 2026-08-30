@@ -153,6 +153,7 @@ def test_runner_signal_is_forwarded_to_the_process_tree() -> None:
     assert signals == [(("worker", "root"), signal.SIGTERM)]
 
 
+@pytest.mark.live_system_guard_bypass
 def test_timeout_kills_descendant_in_a_separate_session(tmp_path: Path) -> None:
     """Match run_tests_parallel.py, which starts each pytest in a new session."""
     child_script = tmp_path / "child.py"
@@ -196,6 +197,7 @@ def test_timeout_kills_descendant_in_a_separate_session(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no catchable SIGTERM")
+@pytest.mark.live_system_guard_bypass
 def test_runner_sigterm_cleans_up_a_separate_session_descendant(
     tmp_path: Path,
 ) -> None:
