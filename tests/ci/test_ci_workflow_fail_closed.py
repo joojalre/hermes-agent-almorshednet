@@ -58,6 +58,20 @@ def test_fork_python_suite_has_a_server_enforced_timeout():
     assert int(fork_timeout) <= 30
 
 
+def test_fork_python_suite_has_a_process_group_watchdog():
+    """Fork test descendants must be terminated with their parent process."""
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (_REPO / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["test"]["steps"]
+    run_tests = next(step for step in steps if step.get("name") == "Run tests")
+
+    assert "python scripts/ci/timebox_process.py" in run_tests["run"]
+    assert "--timeout-seconds 1500" in run_tests["run"]
+    assert "--grace-seconds 60" in run_tests["run"]
+
+
 def test_required_gate_rejects_cancelled_detect_job(tmp_path):
     """A cancelled classifier must block the required gate, not skip every lane green."""
     steps = _ci_workflow()["jobs"]["all-checks-pass"]["steps"]
