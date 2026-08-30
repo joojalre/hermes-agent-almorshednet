@@ -37,6 +37,21 @@ def test_fork_python_suite_uses_twelve_balanced_slices():
     assert '"1/1"' in slice_expression
 
 
+def test_fork_python_suite_has_a_shell_watchdog():
+    """A stuck hosted runner must fail clearly instead of consuming hours."""
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (_REPO / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["test"]["steps"]
+    run_tests = next(step for step in steps if step.get("name") == "Run tests")
+
+    assert 'GITHUB_REPOSITORY}" = "NousResearch/hermes-agent"' in run_tests["run"]
+    assert "timeout --signal=TERM --kill-after=60s 25m scripts/run_tests.sh" in run_tests[
+        "run"
+    ]
+
+
 def test_required_gate_rejects_cancelled_detect_job(tmp_path):
     """A cancelled classifier must block the required gate, not skip every lane green."""
     steps = _ci_workflow()["jobs"]["all-checks-pass"]["steps"]
