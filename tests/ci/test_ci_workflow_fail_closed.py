@@ -62,7 +62,7 @@ def test_fork_python_suite_has_a_server_enforced_timeout():
     assert int(fork_timeout) <= 30
 
 
-def test_fork_python_suite_has_a_process_tree_watchdog():
+def test_fork_python_suite_has_a_process_group_watchdog():
     """Fork test descendants must be terminated with their parent process."""
     yaml = pytest.importorskip("yaml")
     workflow = yaml.safe_load(
