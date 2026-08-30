@@ -19,6 +19,13 @@ def _ci_workflow() -> dict:
     return yaml.safe_load((_REPO / ".github/workflows/ci.yaml").read_text(encoding="utf-8"))
 
 
+def _workflow(name: str) -> dict:
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load(
+        (_REPO / ".github/workflows" / name).read_text(encoding="utf-8")
+    )
+
+
 def test_detect_timeout_has_checkout_headroom():
     """A slow hosted-runner fetch must not cancel classification after one minute."""
     timeout_minutes = _ci_workflow()["jobs"]["detect"]["timeout-minutes"]
@@ -56,6 +63,32 @@ def test_fork_python_suite_has_a_server_enforced_timeout():
     assert upstream_repository == "NousResearch/hermes-agent"
     assert int(upstream_timeout) == 60
     assert int(fork_timeout) <= 30
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name", "must_run_after_failed_needs"),
+    [
+        ("ci.yaml", "detect", False),
+        ("ci.yaml", "osv-scanner", False),
+        ("ci.yaml", "all-checks-pass", True),
+        ("ci.yaml", "ci-timings", True),
+        ("nix.yml", "detect", False),
+    ],
+)
+def test_fork_main_push_skips_duplicate_validation(
+    workflow_name: str, job_name: str, must_run_after_failed_needs: bool
+):
+    """A fork merge must not repeat the PR validation that just passed."""
+    condition = str(_workflow(workflow_name)["jobs"][job_name].get("if", ""))
+    normalized = re.sub(r"\s+", "", condition)
+    fork_guard = (
+        "github.event_name=='pull_request'||"
+        "github.repository=='NousResearch/hermes-agent'"
+    )
+
+    assert fork_guard in normalized
+    if must_run_after_failed_needs:
+        assert normalized.startswith("always()&&(")
 
 
 def test_required_gate_rejects_cancelled_detect_job(tmp_path):
