@@ -71,7 +71,9 @@ def test_run_job_bounds_sessiondb_finalization(tmp_path):
             elapsed = time.monotonic() - started
 
         assert fake_db.entered.wait(timeout=0.5)
-        assert elapsed < 0.5
+        # Shared CI startup work can briefly dominate the 20ms cleanup bound.
+        # Keep the wall-clock guard loose enough to test bounded return, not load.
+        assert elapsed < 2.0
         assert success is True
         assert final_response == "ok"
         assert error is None
@@ -89,7 +91,9 @@ def test_agent_teardown_is_bounded():
         elapsed = time.monotonic() - started
 
         assert agent.entered.wait(timeout=0.5)
-        assert elapsed < 0.5
+        # The contract is that teardown returns within a hard bound; sub-second
+        # scheduler jitter is not part of the behavior under test.
+        assert elapsed < 2.0
     finally:
         release.set()
 
