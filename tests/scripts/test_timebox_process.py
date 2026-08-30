@@ -1,4 +1,4 @@
-"""Tests for the hosted-runner process-group watchdog."""
+"""Tests for the hosted-runner process-tree watchdog."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Run a command in a bounded process group for hosted CI runners."""
+"""Run a command inside a bounded, recursively supervised process tree."""
 
 from __future__ import annotations
 
