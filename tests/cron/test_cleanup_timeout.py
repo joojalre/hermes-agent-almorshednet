@@ -25,8 +25,10 @@ class HangingSessionDB:
     def __init__(self, release: threading.Event):
         self.release = release
         self.entered = threading.Event()
+        self.entered_at: float | None = None
 
     def get_compression_tip(self, _session_id):
+        self.entered_at = time.monotonic()
         self.entered.set()
         self.release.wait()
         return None
@@ -66,14 +68,12 @@ def test_run_job_bounds_sessiondb_finalization(tmp_path):
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            started = time.monotonic()
             success, _output, final_response, error = run_job(job)
-            elapsed = time.monotonic() - started
 
         assert fake_db.entered.wait(timeout=0.5)
-        # Shared CI startup work can briefly dominate the 20ms cleanup bound.
-        # Keep the wall-clock guard loose enough to test bounded return, not load.
-        assert elapsed < 2.0
+        assert fake_db.entered_at is not None
+        cleanup_elapsed = time.monotonic() - fake_db.entered_at
+        assert cleanup_elapsed < 0.5
         assert success is True
         assert final_response == "ok"
         assert error is None
@@ -91,9 +91,7 @@ def test_agent_teardown_is_bounded():
         elapsed = time.monotonic() - started
 
         assert agent.entered.wait(timeout=0.5)
-        # The contract is that teardown returns within a hard bound; sub-second
-        # scheduler jitter is not part of the behavior under test.
-        assert elapsed < 2.0
+        assert elapsed < 0.5
     finally:
         release.set()
 
