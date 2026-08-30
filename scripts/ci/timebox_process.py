@@ -28,7 +28,7 @@ def _terminate_group(pid: int, signal_number: int) -> None:
         )
         return
     try:
-        os.killpg(pid, signal_number)
+        os.killpg(pid, signal_number)  # windows-footgun: ok - guarded above
     except ProcessLookupError:
         pass
 
