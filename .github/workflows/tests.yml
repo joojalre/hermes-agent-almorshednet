@@ -110,8 +110,8 @@ jobs:
           else
             # A hosted fork runner can occasionally lose a test descendant
             # while the job stays marked in progress. Run the whole command
-            # in an isolated process group so the watchdog can terminate the
-            # parent and every descendant together.
+            # under a recursive process-tree supervisor so the watchdog can
+            # terminate workers even when they start separate sessions.
             python scripts/ci/timebox_process.py \
               --timeout-seconds 1500 \
               --grace-seconds 60 \

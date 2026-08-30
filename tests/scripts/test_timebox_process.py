@@ -1,4 +1,4 @@
-"""Tests for the hosted-runner process-group watchdog."""
+"""Tests for the hosted-runner process-tree watchdog."""
 
 from __future__ import annotations
 
@@ -19,15 +19,42 @@ class FakeProcess:
     def __init__(self, outcomes: list[int | BaseException]) -> None:
         self.outcomes = outcomes
         self.pid = 4242
+        self.returncode: int | None = None
 
-    def wait(self, timeout: int | None = None) -> int:
+    def wait(self, timeout: float | None = None) -> int:
+        if not self.outcomes and self.returncode is not None:
+            return self.returncode
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
-        return int(outcome)
+        self.returncode = int(outcome)
+        return self.returncode
 
-    def poll(self) -> None:
-        return None
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+def _fake_tree_callbacks(
+    alive_outcomes: list[list[str]],
+) -> tuple[
+    list[tuple[tuple[str, ...], int]],
+    dict[str, Any],
+]:
+    tracked = ["worker", "root"]
+    signals: list[tuple[tuple[str, ...], int]] = []
+
+    def wait_processes(_processes: list[str], _timeout: float) -> list[str]:
+        return alive_outcomes.pop(0) if alive_outcomes else []
+
+    callbacks: dict[str, Any] = {
+        "capture_tree": lambda _pid: tracked,
+        "signal_processes": lambda processes, signum: signals.append((
+            tuple(processes),
+            signum,
+        )),
+        "wait_processes": wait_processes,
+    }
+    return signals, callbacks
 
 
 def test_returns_command_exit_code() -> None:
@@ -43,20 +70,20 @@ def test_returns_command_exit_code() -> None:
     assert result == 0
 
 
-def test_timeout_terminates_the_process_group() -> None:
+def test_timeout_terminates_the_complete_process_tree() -> None:
     process = FakeProcess([subprocess.TimeoutExpired(["tests-command"], 10), -15])
-    signals: list[tuple[int, int]] = []
+    signals, callbacks = _fake_tree_callbacks([[]])
 
     result = run_with_timebox(
         ["tests-command"],
         timeout_seconds=10,
         grace_seconds=2,
         popen=lambda *args, **kwargs: process,
-        terminate_group=lambda pid, signum: signals.append((pid, signum)),
+        **callbacks,
     )
 
     assert result == TIMEOUT_EXIT_CODE
-    assert signals == [(4242, signal.SIGTERM)]
+    assert signals == [(("worker", "root"), signal.SIGTERM)]
 
 
 def test_timeout_escalates_to_kill_after_grace_period() -> None:
@@ -72,7 +99,7 @@ def test_timeout_escalates_to_kill_after_grace_period() -> None:
         timeout_seconds=10,
         grace_seconds=2,
         popen=lambda *args, **kwargs: process,
-        terminate_group=lambda pid, signum: signals.append((pid, signum)),
+        **callbacks,
     )
 
     assert result == TIMEOUT_EXIT_CODE
