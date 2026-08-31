@@ -151,26 +151,6 @@ _ARABIC_NORMALIZED_INSTRUCTION_RE = re.compile(
     rf")",
     re.IGNORECASE,
 )
-_ARABIC_PAST_MARKER_RE = (
-    r"(?:تلقائ(?:يا|ياً)|بنجاح|أمس|سابق(?:ا|اً)|مسبق(?:ا|اً)|دون\s+تدخل)"
-)
-_ARABIC_UNVOCALIZED_PAST_RE = re.compile(
-    rf"^\s*(?:نفذ|شغل|ثبت|أرسل|ارسل|تجاهل)\s+"
-    rf"\S+\s+\S+"
-    rf"(?:\s+\S+){{0,3}}\s+{_ARABIC_PAST_MARKER_RE}(?!\w)"
-    rf"[.!؟]?\s*$",
-    re.IGNORECASE,
-)
-_ARABIC_UNMARKED_PAST_RE = re.compile(
-    r"^\s*(?:نفذ|شغل|ثبت|أرسل|ارسل|تجاهل)\s+"
-    r"ال[^\W\d_]+\s+ال[^\W\d_]+[.!؟]?\s*$",
-    re.IGNORECASE,
-)
-_ARABIC_REQUEST_CONTEXT_RE = re.compile(
-    r"(?:يرجى|الرجاء|من\s+فضلك|"
-    r"(?<!\w)(?:الآن|فور(?:ا|اً)|حال(?:ا|اً)|المطلوب(?:ة|ون|ين)?)(?!\w))",
-    re.IGNORECASE,
-)
 _PRESENTATION_PREFIX_RE = re.compile(
     r"^\s*(?:(?:[-*+>•]|\d{1,3}[.)])\s+|\[(?: |x|X)\]\s+|"
     r"[\"'`“”‘’]\s*){0,4}"
@@ -244,14 +224,6 @@ def _scan_text(value: str, *, field: str) -> str | None:
 def _is_instruction_like(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = _PRESENTATION_PREFIX_RE.sub("", normalized, count=1)
-    if (
-        (
-            _ARABIC_UNVOCALIZED_PAST_RE.search(normalized)
-            or _ARABIC_UNMARKED_PAST_RE.search(normalized)
-        )
-        and not _ARABIC_REQUEST_CONTEXT_RE.search(normalized)
-    ):
-        return False
     if _INSTRUCTION_RE.search(normalized):
         return True
     if _ARABIC_VOCALIZED_IMPERATIVE_RE.search(normalized):
@@ -879,6 +851,7 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
 
     records = event["records"]
     record_ids = [item["id"] for item in records]
+    rejected_indices = [item["index"] for item in event["rejected"]]
     duplicate_ids = [item["id"] for item in event["duplicates"]]
     conflicting_records = {
         (item["id"], item["fact_key"])
@@ -914,6 +887,10 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
 
     if (
         len(event["rejected"]) > MAX_RECORD_COUNT
+        or (
+            event["schema_version"] >= AUDIT_SCHEMA_VERSION
+            and len(rejected_indices) != len(set(rejected_indices))
+        )
         or any(
             type(item["index"]) is not int
             or not 1 <= item["index"] <= MAX_RECORD_COUNT
@@ -971,6 +948,7 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
             or not re.fullmatch(r"[0-9a-f]{64}", memory["after_sha256"])
         ):
             raise KnowledgeError("knowledge audit is malformed")
+        _verified_memory_path(memory)
     elif memory.get("status") != "dry-run":
         raise KnowledgeError("knowledge audit is malformed")
 
