@@ -1852,8 +1852,10 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
     rpc.on_info = finish_only_after_stop_intent
     result = runtime.cancel(identity, cancel_id="cancel-raced")
 
-    assert result["status"] == "settled"
-    assert result["result"]["text"] == "Already done."
+    assert result["status"] in {"stopping", "settled"}
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    settled = state.get_task(db, identity)
+    assert settled["result"]["text"] == "Already done."
     assert runtime.stop(timeout=1.0)
 
 
