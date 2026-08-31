@@ -221,11 +221,12 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     calls = _capture_spawn(monkeypatch)
     home = _managed_home(tmp_path, teammates=("researcher",))
     agent = _FakeAgent(home, title="Bot Chat")
+    message = 'status? give me the "final" numbers $(and this is not shell)'
 
     result = json.loads(
         bot_mode_dm.message_agent_tool(
             target="@researcher",
-            message='status? give me the "final" numbers $(and this is not shell)',
+            message=message,
             agent=agent,
         )
     )
@@ -256,7 +257,7 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
         "-Q",
     ]
     # message body rides the temp file, never the command line
-    assert "final" not in command
+    assert message not in command
     assert "$(" not in command
 
     # attribution prefix applied server-side; body verbatim inside the file

@@ -567,8 +567,15 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
                 # after subprocess.run returns, not merely after stdin reaches EOF.
+                child_env = os.environ.copy()
+                child_env["PYTHONIOENCODING"] = "utf-8"
                 with open(dm_file, "r", encoding="utf-8") as stream:
-                    return subprocess.run(argv, stdin=stream, check=False).returncode
+                    return subprocess.run(
+                        argv,
+                        stdin=stream,
+                        check=False,
+                        env=child_env,
+                    ).returncode
             proc = subprocess.run(
                 [*argv, "--query-file", dm_file],
                 check=False,
