@@ -1170,7 +1170,7 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
     assert stopping["cancel_id"] == "stop-1"
 
 
-def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
+def test_demote_retry_stops_newer_turn_before_authority_transfer(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -1184,7 +1184,10 @@ def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
             self.expected_task_ids: list[str] = []
 
         def info(self, *, profile, session_id, source):
-            return {"active": True, "task_id": self.active_task_id}
+            return {
+                "active": self.active_task_id is not None,
+                "task_id": self.active_task_id,
+            }
 
         def interrupt(self, *, profile, session_id, source, expected_task_id):
             self.expected_task_ids.append(expected_task_id)
@@ -1269,6 +1272,42 @@ def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
         event["kind"] == "authority.lost" for event in service._events("room-1")
     )
 
+    first_stopping = driver.get_task(db, task["identity"])
+    assert first_stopping["status"] == "stopping"
+    rpc.active_task_id = None
+    first_cancelled = service.runtime.cancel(
+        task["identity"],
+        cancel_id=first_stopping["cancel_id"],
+    )
+    assert first_cancelled["status"] == "cancelled"
+
+    service.send(
+        room_id="room-1",
+        event_id="user-2",
+        payload={"text": "@ops inspect again", "thread_id": "thread-2"},
+    )
+    newer_task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    driver.start_task(
+        db,
+        newer_task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    rpc.active_task_id = newer_task["identity"].task_id
+
+    with pytest.raises(RuntimeError, match="still stopping"):
+        service.demote_room(
+            "room-1",
+            observed_gateway_id=observation["authority_gateway_id"],
+            observed_epoch=observation["authority_epoch"],
+        )
+
+    still_local = hosted_rooms.room_state(db, room_id="room-1")
+    assert still_local["authority_gateway_id"] == room["authority_gateway_id"]
+    assert still_local["authority_epoch"] == room["authority_epoch"]
+    assert driver.get_task(db, newer_task["identity"])["status"] == "stopping"
+
     rpc.acknowledge = True
     result = service.demote_room(
         "room-1",
@@ -1280,7 +1319,8 @@ def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
     assert result["authority_epoch"] == 2
     assert rpc.expected_task_ids == [
         task["identity"].task_id,
-        task["identity"].task_id,
+        newer_task["identity"].task_id,
+        newer_task["identity"].task_id,
     ]
     stop_ids = [
         event["payload"]["cancel_id"]

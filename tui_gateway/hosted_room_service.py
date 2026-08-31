@@ -539,7 +539,7 @@ class HostedRoomService:
 
             self.stop_room(
                 room_id,
-                cancel_id=f"authority-demote:{uuid.uuid4().hex}",
+                cancel_id=f"authority-demote:{observed_epoch}:{uuid.uuid4().hex}",
                 require_acknowledged=True,
             )
             return demote_room(
