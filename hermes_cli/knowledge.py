@@ -305,6 +305,13 @@ def _record_from(
         raise KnowledgeError(reason)
     if _INSTRUCTION_RE.search(statement):
         raise KnowledgeError(f"record {record_id}: instruction-like text is not a fact")
+    reason = _scan_text(domain, field=f"record {record_id} domain")
+    if reason:
+        raise UnsafeKnowledgeError(reason)
+    if _INSTRUCTION_RE.search(domain):
+        raise UnsafeKnowledgeError(
+            f"record {record_id}: instruction-like text is not a domain"
+        )
     fact_key = raw.get("fact_key", "")
     if not isinstance(fact_key, str) or len(fact_key) > MAX_ID_CHARS:
         raise KnowledgeError(f"record {record_id}: fact_key is invalid")
@@ -760,8 +767,18 @@ def _verify(args: Any) -> int:
         path = _audit_path()
         if not path.exists():
             raise KnowledgeError("knowledge audit does not exist")
+        raw = _read_bounded_bytes(
+            path,
+            limit=MAX_AUDIT_BYTES,
+            read_error="cannot read knowledge audit",
+            size_error="knowledge audit exceeds 5 MiB; rotate it before verify",
+        )
+        try:
+            audit_text = raw.decode("utf-8")
+        except UnicodeError as exc:
+            raise KnowledgeError(f"cannot read knowledge audit: {exc}") from exc
         events = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in audit_text.splitlines():
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
