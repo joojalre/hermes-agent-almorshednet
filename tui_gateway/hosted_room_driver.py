@@ -810,15 +810,25 @@ class HostedRoomRuntime:
                 return
             if self._route_retry_is_deferred(task):
                 return
-            lease = self._renew_lease_if_needed(binding, lease)
-            attempt = state.start_task(
-                self.db_path,
-                task["identity"],
-                lease,
-                expected_cancel_generation=task["cancel_generation"],
-                clock=self.clock,
-            )
-            self._execute_attempt(binding, task, attempt)
+            profile = task["payload"]["target_profile"]
+            # Keep the durable task queued until both its remote route and
+            # local profile lock are available. Do not mark it running before
+            # the model's serialization lock is owned.
+            with self.turn_lock(profile):
+                lease = self._renew_lease_if_needed(binding, lease)
+                attempt = state.start_task(
+                    self.db_path,
+                    task["identity"],
+                    lease,
+                    expected_cancel_generation=task["cancel_generation"],
+                    clock=self.clock,
+                )
+                self._execute_attempt(
+                    binding,
+                    task,
+                    attempt,
+                    turn_lock_held=True,
+                )
             current = state.get_task(self.db_path, task["identity"])
             if current["status"] not in state.TERMINAL_STATUSES:
                 return
@@ -911,6 +921,8 @@ class HostedRoomRuntime:
         binding: HostedRoomBinding,
         task: Mapping[str, Any],
         attempt: state.TaskAttempt,
+        *,
+        turn_lock_held: bool = False,
     ) -> None:
         profile = task["payload"]["target_profile"]
         transport = self._transport_for(binding, task)
@@ -918,7 +930,12 @@ class HostedRoomRuntime:
         with self._status_lock:
             self._current_tasks[binding.room_id] = attempt.identity
         try:
-            with self.turn_lock(profile):
+            lock_context = (
+                contextlib.nullcontext()
+                if turn_lock_held
+                else self.turn_lock(profile)
+            )
+            with lock_context:
                 session = self._resolve_or_create(transport, profile, binding.room_id)
                 # An in-process submit should fail before admission or return
                 # after it, but an unexpected exception at that boundary is
@@ -947,14 +964,19 @@ class HostedRoomRuntime:
                         )
                         if self.publish_terminal is not None:
                             self.publish_terminal(binding, settled)
-                    except state.StaleTaskError:
+                    except (state.StaleLeaseError, state.StaleTaskError):
                         try:
                             current = state.get_task(self.db_path, attempt.identity)
                             if current["status"] == "stopping":
+                                # The Stop path may run after this attempt's
+                                # original lease expired. Re-acquire the
+                                # current room lease before committing a
+                                # completion that beat the unacknowledged Stop.
+                                lease = self._ensure_lease(binding)
                                 settled = state.settle_stopping_task(
                                     self.db_path,
                                     attempt.identity,
-                                    attempt.lease,
+                                    lease,
                                     expected_execution_generation=attempt.execution_generation,
                                     expected_cancel_generation=int(
                                         current["cancel_generation"]
@@ -969,14 +991,12 @@ class HostedRoomRuntime:
                                 )
                                 if self.publish_terminal is not None:
                                     self.publish_terminal(binding, settled)
-                        except (state.StaleLeaseError, state.StaleTaskError):
+                        except (
+                            state.LeaseHeldError,
+                            state.StaleLeaseError,
+                            state.StaleTaskError,
+                        ):
                             pass
-                    except state.StaleLeaseError:
-                        # Cancellation, disband, or authority transfer won the
-                        # durable race. The model result is intentionally
-                        # discarded; never turn a correct fence into a worker
-                        # thread exception.
-                        pass
                     except state.DriverStateError as exc:
                         # A malformed terminal receipt must not escape the
                         # callback and hold the profile lock until the deadline.

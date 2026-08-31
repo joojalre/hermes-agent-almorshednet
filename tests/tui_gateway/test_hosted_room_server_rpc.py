@@ -12,6 +12,7 @@ from tui_gateway.hosted_room_server_rpc import (
     HostedRoomServerRPC,
     HostedRoomSessionError,
 )
+from tui_gateway.transport import bind_transport, current_transport, reset_transport
 
 
 def _server():
@@ -90,6 +91,29 @@ def test_routes_exact_hidden_session_and_internal_task_proof():
     rpc.resume(profile="ops", session_id="stored", source="bot_room")
     resume = next(params for method, params in calls if method == "session.resume")
     assert resume["source"] == "bot_room"
+
+
+def test_handler_calls_use_a_private_drop_transport_and_restore_the_caller():
+    server, _calls = _server()
+    seen = []
+
+    def create(rid, _params):
+        seen.append(current_transport())
+        return {"id": rid, "result": {"session_id": "runtime"}}
+
+    server._methods["session.create"] = create
+    caller = SimpleNamespace(write=lambda _obj: True, close=lambda: None)
+    token = bind_transport(caller)
+    try:
+        rpc = HostedRoomServerRPC(server)
+        rpc.create(profile="ops", title="Group: room", source="bot_room")
+        assert current_transport() is caller
+    finally:
+        reset_transport(token)
+
+    assert len(seen) == 1
+    assert seen[0] is not caller
+    assert seen[0].write({"private": "room text"}) is True
 
 
 def test_info_and_interrupt_are_exact_task_scoped():

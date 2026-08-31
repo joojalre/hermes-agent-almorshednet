@@ -15,6 +15,17 @@ from types import ModuleType
 from typing import Any, Callable
 
 from gateway import hosted_room_driver as state
+from tui_gateway.transport import bind_transport, reset_transport
+
+
+class _InternalDropTransport:
+    """Accept internal frames without publishing private room traffic."""
+
+    def write(self, _obj: dict) -> bool:
+        return True
+
+    def close(self) -> None:
+        return None
 
 
 class HostedRoomSessionError(RuntimeError):
@@ -32,10 +43,15 @@ class HostedRoomServerRPC:
     def __init__(self, server: ModuleType) -> None:
         self.server = server
         self._ids = itertools.count(1)
+        self._transport = _InternalDropTransport()
 
     def _call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         handler = self.server._methods[method]
-        envelope = handler(f"hosted-room-{next(self._ids)}", params)
+        token = bind_transport(self._transport)
+        try:
+            envelope = handler(f"hosted-room-{next(self._ids)}", params)
+        finally:
+            reset_transport(token)
         error = envelope.get("error") if isinstance(envelope, dict) else None
         if isinstance(error, dict):
             raise HostedRoomSessionError(
