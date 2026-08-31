@@ -161,6 +161,11 @@ _ARABIC_UNVOCALIZED_PAST_RE = re.compile(
     rf"[.!؟]?\s*$",
     re.IGNORECASE,
 )
+_ARABIC_UNMARKED_PAST_RE = re.compile(
+    r"^\s*(?:نفذ|شغل|ثبت|أرسل|ارسل|تجاهل)\s+"
+    r"ال[^\W\d_]+\s+ال[^\W\d_]+[.!؟]?\s*$",
+    re.IGNORECASE,
+)
 _ARABIC_REQUEST_CONTEXT_RE = re.compile(
     r"(?:يرجى|الرجاء|من\s+فضلك|"
     r"(?<!\w)(?:الآن|فور(?:ا|اً)|حال(?:ا|اً)|المطلوب(?:ة|ون|ين)?)(?!\w))",
@@ -240,7 +245,10 @@ def _is_instruction_like(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = _PRESENTATION_PREFIX_RE.sub("", normalized, count=1)
     if (
-        _ARABIC_UNVOCALIZED_PAST_RE.search(normalized)
+        (
+            _ARABIC_UNVOCALIZED_PAST_RE.search(normalized)
+            or _ARABIC_UNMARKED_PAST_RE.search(normalized)
+        )
         and not _ARABIC_REQUEST_CONTEXT_RE.search(normalized)
     ):
         return False
