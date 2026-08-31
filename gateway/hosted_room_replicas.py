@@ -464,6 +464,31 @@ def promote_replica(
     }
 
 
+def validate_demotion_observation(
+    *,
+    room_id: Any,
+    observed_gateway_id: Any,
+    observed_epoch: Any,
+) -> tuple[str, str, int]:
+    """Normalize one externally observed authority lineage."""
+
+    room_id = _validate_identifier(
+        room_id, label="room_id", max_chars=MAX_ROOM_ID_CHARS
+    )
+    observed_gateway_id = _validate_identifier(
+        observed_gateway_id,
+        label="observed_gateway_id",
+        max_chars=MAX_ACTOR_ID_CHARS,
+    )
+    if (
+        isinstance(observed_epoch, bool)
+        or not isinstance(observed_epoch, int)
+        or observed_epoch < 1
+    ):
+        raise ReplicaError("observed_epoch must be a positive integer")
+    return room_id, observed_gateway_id, observed_epoch
+
+
 def demote_room(
     db_path: Path | str,
     *,
@@ -480,20 +505,11 @@ def demote_room(
     the observed lineage so no further local sends can be committed at the
     stale epoch. Idempotent for repeated observations of the same lineage.
     """
-    room_id = _validate_identifier(
-        room_id, label="room_id", max_chars=MAX_ROOM_ID_CHARS
+    room_id, observed_gateway_id, observed_epoch = validate_demotion_observation(
+        room_id=room_id,
+        observed_gateway_id=observed_gateway_id,
+        observed_epoch=observed_epoch,
     )
-    observed_gateway_id = _validate_identifier(
-        observed_gateway_id,
-        label="observed_gateway_id",
-        max_chars=MAX_ACTOR_ID_CHARS,
-    )
-    if (
-        isinstance(observed_epoch, bool)
-        or not isinstance(observed_epoch, int)
-        or observed_epoch < 1
-    ):
-        raise ReplicaError("observed_epoch must be a positive integer")
     now = time.time() if now is None else float(now)
     local_gateway = local_authority_gateway_id()
 

@@ -883,6 +883,22 @@ def test_long_room_id_reuses_bounded_collision_resistant_session_title(
     assert len(rpc.sessions) == 1
 
 
+def test_room_session_title_bounds_max_room_id_and_preserves_uniqueness():
+    assert room_session_title("room-1") == "Group: room-1"
+
+    shared_prefix = "r" * 127
+    first = room_session_title(f"{shared_prefix}a")
+    second = room_session_title(f"{shared_prefix}b")
+
+    assert len(first) <= 100
+    assert len(second) <= 100
+    assert first.startswith("Group: ")
+    assert second.startswith("Group: ")
+    assert first != second
+    assert len(first.rsplit("~", 1)[1]) == 64
+    assert len(second.rsplit("~", 1)[1]) == 64
+
+
 def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
     db: Path,
 ):
