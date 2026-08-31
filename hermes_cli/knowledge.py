@@ -60,14 +60,10 @@ _ENGLISH_INSTRUCTION_GERUND_RE = (
 _ENGLISH_COURTESY_RE = r"(?:please|kindly)"
 _ENGLISH_COURTESY_SEPARATOR_RE = r"(?:\s*[,;:،؛]\s*|\s+)"
 _ENGLISH_MODAL_RE = r"(?:can|could|would|will)"
-_ENGLISH_DO_ACTION_PREFIX_RE = r"do(?:\s+not|n['’]t)?\s+"
 _ENGLISH_MODAL_REQUEST_RE = (
-    rf"{_ENGLISH_MODAL_RE}\s+you{_ENGLISH_COURTESY_SEPARATOR_RE}"
-    rf"(?:{_ENGLISH_COURTESY_RE}{_ENGLISH_COURTESY_SEPARATOR_RE})?"
-    rf"(?:possibly{_ENGLISH_COURTESY_SEPARATOR_RE})?"
-    rf"(?:mind{_ENGLISH_COURTESY_SEPARATOR_RE}{_ENGLISH_INSTRUCTION_GERUND_RE}\b"
-    rf"|(?:(?:not\s+)|{_ENGLISH_DO_ACTION_PREFIX_RE})?"
-    rf"{_ENGLISH_INSTRUCTION_VERB_RE}\b)"
+    rf"{_ENGLISH_MODAL_RE}\s+you\b[^.!?\r\n\u2028\u2029]*"
+    rf"(?:{_ENGLISH_INSTRUCTION_VERB_RE}\b|mind\b"
+    rf"{_ENGLISH_COURTESY_SEPARATOR_RE}{_ENGLISH_INSTRUCTION_GERUND_RE}\b)"
 )
 _ARABIC_ACTION_NOUN_RE = (
     r"(?:حذف|إزالة|ازالة|تنفيذ|تشغيل|رفع|إرسال|ارسال|فتح|تثبيت|نشر|دمج|دفع|تجاهل)"
@@ -272,7 +268,11 @@ def _validate_rendered_metadata(value: Any, *, field: str, allow_empty: bool = T
 
 
 def _validate_timestamp(value: Any, *, field: str) -> str:
-    normalized = _validate_metadata(value, field=field, allow_empty=False)
+    normalized = _validate_rendered_metadata(
+        value,
+        field=field,
+        allow_empty=False,
+    )
     try:
         parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -338,11 +338,16 @@ def _read_manifest(path_value: str) -> tuple[dict[str, Any], str]:
         if _SECRET_VALUE_RE.search(decoded):
             raise KnowledgeError("manifest contains a secret-like value")
         manifest = json.loads(decoded)
+    except RecursionError as exc:
+        raise KnowledgeError("manifest exceeds the supported nesting depth") from exc
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise KnowledgeError(f"manifest is not valid UTF-8 JSON: {exc}") from exc
     if not isinstance(manifest, dict):
         raise KnowledgeError("manifest root must be an object")
-    _reject_sensitive_fields(manifest)
+    try:
+        _reject_sensitive_fields(manifest)
+    except RecursionError as exc:
+        raise KnowledgeError("manifest exceeds the supported nesting depth") from exc
     return manifest, _sha256_bytes(raw)
 
 
@@ -886,7 +891,14 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
         raise KnowledgeError("knowledge audit is malformed")
 
     if (
-        len(event["rejected"]) > MAX_RECORD_COUNT
+        (
+            event["schema_version"] >= AUDIT_SCHEMA_VERSION
+            and len(records)
+            + len(event["rejected"])
+            + len(event["duplicates"])
+            > MAX_RECORD_COUNT
+        )
+        or len(event["rejected"]) > MAX_RECORD_COUNT
         or (
             event["schema_version"] >= AUDIT_SCHEMA_VERSION
             and len(rejected_indices) != len(set(rejected_indices))
