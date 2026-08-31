@@ -143,6 +143,9 @@ _ARABIC_NORMALIZED_INSTRUCTION_RE = re.compile(
     rf")",
     re.IGNORECASE,
 )
+_PRESENTATION_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:[-*+>•]|\d{1,3}[.)])\s+|[\"'`“”‘’]\s*){0,4}"
+)
 _SENSITIVE_FIELD_NAMES = {
     "api_key", "apikey", "access_token", "refresh_token", "client_secret",
     "password", "private_key", "cookie", "authorization", "credential",
@@ -211,6 +214,7 @@ def _scan_text(value: str, *, field: str) -> str | None:
 
 def _is_instruction_like(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value)
+    normalized = _PRESENTATION_PREFIX_RE.sub("", normalized, count=1)
     if _INSTRUCTION_RE.search(normalized):
         return True
     if _ARABIC_VOCALIZED_IMPERATIVE_RE.search(normalized):
@@ -802,6 +806,9 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
         for item in records
         if item["status"] == "CONFLICTING"
     }
+    conflict_entries = [
+        (item["id"], item["fact_key"]) for item in event["conflicts"]
+    ]
     if (
         len(records) > MAX_RECORD_COUNT
         or any(
@@ -837,14 +844,17 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
             for item in event["duplicates"]
         )
         or len(event["conflicts"]) > MAX_RECORD_COUNT
+        or (
+            event["schema_version"] >= AUDIT_SCHEMA_VERSION
+            and (
+                len(conflict_entries) != len(set(conflict_entries))
+                or set(conflict_entries) != conflicting_records
+            )
+        )
         or any(
             not _ID_RE.fullmatch(item["id"])
             or not item["fact_key"]
             or len(item["fact_key"]) > MAX_ID_CHARS
-            or (
-                event["schema_version"] >= AUDIT_SCHEMA_VERSION
-                and (item["id"], item["fact_key"]) not in conflicting_records
-            )
             for item in event["conflicts"]
         )
     ):
