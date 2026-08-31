@@ -161,8 +161,9 @@ _ARABIC_UNVOCALIZED_PAST_RE = re.compile(
     rf"[.!؟]?\s*$",
     re.IGNORECASE,
 )
-_ARABIC_COURTESY_CONTEXT_RE = re.compile(
-    r"(?:يرجى|الرجاء|من\s+فضلك)",
+_ARABIC_REQUEST_CONTEXT_RE = re.compile(
+    r"(?:يرجى|الرجاء|من\s+فضلك|"
+    r"(?<!\w)(?:الآن|فور(?:ا|اً)|حال(?:ا|اً)|المطلوب(?:ة|ون|ين)?)(?!\w))",
     re.IGNORECASE,
 )
 _PRESENTATION_PREFIX_RE = re.compile(
@@ -240,7 +241,7 @@ def _is_instruction_like(value: str) -> bool:
     normalized = _PRESENTATION_PREFIX_RE.sub("", normalized, count=1)
     if (
         _ARABIC_UNVOCALIZED_PAST_RE.search(normalized)
-        and not _ARABIC_COURTESY_CONTEXT_RE.search(normalized)
+        and not _ARABIC_REQUEST_CONTEXT_RE.search(normalized)
     ):
         return False
     if _INSTRUCTION_RE.search(normalized):
@@ -438,6 +439,16 @@ def _record_from(
         raise KnowledgeError(f"record {record_id}: invalid status")
     statement = " ".join(statement.split())
     domain = " ".join(domain.split())
+    statement = _validate_rendered_metadata(
+        statement,
+        field=f"record {record_id} statement",
+        allow_empty=False,
+    )
+    domain = _validate_rendered_metadata(
+        domain,
+        field=f"record {record_id} domain",
+        allow_empty=False,
+    )
     reason = _scan_text(statement, field=f"record {record_id} statement")
     if reason:
         raise KnowledgeError(reason)
@@ -533,7 +544,7 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
         records.append(record)
 
     deduped = []
-    seen = set()
+    seen: dict[tuple[str, str, str], dict[str, Any]] = {}
     duplicates = []
     for record in records:
         key = (
@@ -541,10 +552,13 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
             _comparison_text(record["domain"]),
             _comparison_text(record["statement"]),
         )
-        if key in seen:
+        retained = seen.get(key)
+        if retained is not None:
+            if record["status"] == "CONFLICTING":
+                retained["status"] = "CONFLICTING"
             duplicates.append({"id": record["id"], "reason": "duplicate fact"})
             continue
-        seen.add(key)
+        seen[key] = record
         deduped.append(record)
 
     conflicts = [
@@ -857,6 +871,7 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
 
     records = event["records"]
     record_ids = [item["id"] for item in records]
+    duplicate_ids = [item["id"] for item in event["duplicates"]]
     conflicting_records = {
         (item["id"], item["fact_key"])
         for item in records
@@ -898,6 +913,13 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
             for item in event["rejected"]
         )
         or len(event["duplicates"]) > MAX_RECORD_COUNT
+        or (
+            event["schema_version"] >= AUDIT_SCHEMA_VERSION
+            and (
+                len(duplicate_ids) != len(set(duplicate_ids))
+                or not set(duplicate_ids).isdisjoint(record_ids)
+            )
+        )
         or any(
             not _ID_RE.fullmatch(item["id"])
             or item["reason"] != "duplicate fact"
