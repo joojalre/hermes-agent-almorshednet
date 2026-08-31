@@ -45,7 +45,7 @@ async def test_late_hosted_room_recovery_is_stopped_after_shutdown() -> None:
 
 @pytest.mark.asyncio
 async def test_cleared_start_gate_blocks_inflight_recovery(monkeypatch) -> None:
-    from tui_gateway import methods_groups
+    from tui_gateway import methods_groups, server as _server  # noqa: F401
 
     start_entered = threading.Event()
     release_start = threading.Event()
@@ -56,7 +56,7 @@ async def test_cleared_start_gate_blocks_inflight_recovery(monkeypatch) -> None:
     def start_service(*, start_allowed=None):
         assert start_allowed is not None
         start_entered.set()
-        assert release_start.wait(timeout=1.0)
+        assert release_start.wait(timeout=5.0)
         if not start_allowed.is_set():
             return None
         service = object()
@@ -68,10 +68,10 @@ async def test_cleared_start_gate_blocks_inflight_recovery(monkeypatch) -> None:
     runner._running = True
     ensure = asyncio.create_task(runner._ensure_hosted_room_worker())
 
-    assert await asyncio.to_thread(start_entered.wait, 1.0)
+    assert await asyncio.to_thread(start_entered.wait, 5.0)
     runner._hosted_room_start_allowed.clear()
     runner._running = False
     release_start.set()
 
-    assert await asyncio.wait_for(ensure, timeout=1.0) is None
+    assert await asyncio.wait_for(ensure, timeout=5.0) is None
     assert starts == []

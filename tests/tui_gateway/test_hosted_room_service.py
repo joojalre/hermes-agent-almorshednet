@@ -480,6 +480,92 @@ def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path)
     assert replayed == events
 
 
+def test_terminal_publication_retries_after_a_newer_user_wins_the_append_race(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="user-1",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops first", "thread_id": "thread-1"},
+    )
+    binding = service.bindings()[0]
+    service.prepare_room(binding)
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="worker",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    attempt = driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    driver.settle_task(
+        db,
+        attempt,
+        settlement_id="late-reply",
+        status="settled",
+        result={"text": "stale answer"},
+        clock=time.time,
+    )
+
+    original_append_events = hosted_rooms.append_events
+    injected = False
+
+    def append_after_newer_user(*args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            _append_room_event(
+                db,
+                room_id="room-1",
+                event_id="user-2",
+                kind="message.user",
+                actor={"kind": "user", "id": "desktop"},
+                payload={"text": "@ops newer", "thread_id": "thread-1"},
+            )
+        return original_append_events(*args, **kwargs)
+
+    monkeypatch.setattr(hosted_rooms, "append_events", append_after_newer_user)
+    with pytest.raises(hosted_rooms.RoomConflictError, match="latest sequence"):
+        service.prepare_room(binding)
+
+    assert not any(
+        event["kind"].startswith("turn.") and event["payload"].get("task_id") == task["identity"].task_id
+        for event in service._events("room-1")
+    )
+    service.prepare_room(binding)
+    terminal = next(
+        event
+        for event in service._events("room-1")
+        if event["kind"] == "turn.cancelled"
+        and event["payload"].get("task_id") == task["identity"].task_id
+    )
+    assert terminal["payload"]["reason"] == "superseded_by_newer_user_event"
+
+
 def test_terminal_publication_reserves_the_whole_plan_before_append(
     tmp_path: Path,
     monkeypatch,
@@ -581,6 +667,54 @@ def test_terminal_publication_recovers_legacy_member_prefix_at_normal_limit(
     assert [event["event_id"] for event in service._events("room-1")] == [
         "member-1",
         "terminal-1",
+    ]
+
+
+def test_terminal_only_publication_uses_bounded_recovery_reserve(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="user-1",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    monkeypatch.setattr(hosted_rooms, "MAX_EVENTS_PER_ROOM", 1)
+    terminal = discussion.EventPlan(
+        event_id="cancelled-1",
+        kind="turn.cancelled",
+        actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
+        payload={"task_id": "task-1", "reason": "stopped"},
+        authority_gateway_id=str(room["authority_gateway_id"]),
+        authority_epoch=int(room["authority_epoch"]),
+    )
+
+    service._append_plan(
+        "room-1",
+        discussion.PublicationPlan(
+            task_id="task-1",
+            terminal_kind="turn.cancelled",
+            events=(terminal,),
+        ),
+    )
+
+    assert [event["event_id"] for event in service._events("room-1")] == [
+        "user-1",
+        "cancelled-1",
     ]
 
 
@@ -1014,6 +1148,38 @@ def test_stop_fence_prevents_the_next_room_member_from_starting(
     assert any(
         event["kind"] == "room.stop_requested" for event in service._events("room-1")
     )
+
+
+def test_retrying_old_stop_id_does_not_cancel_newer_room_work(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    monkeypatch.setattr(service, "local_profiles", lambda: ("default", "ops"))
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "@ops first", "thread_id": "thread-1"},
+    )
+    assert service.stop_room("room-1", cancel_id="stop-1") == 1
+    service.send(
+        room_id="room-1",
+        event_id="user-2",
+        payload={"text": "@ops newer", "thread_id": "thread-1"},
+    )
+    newer = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+
+    assert service.stop_room("room-1", cancel_id="stop-1") == 0
+    assert driver.get_task(db, newer["identity"])["status"] == "queued"
 
 
 def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(

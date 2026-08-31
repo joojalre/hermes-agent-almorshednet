@@ -1892,6 +1892,7 @@ def append_events(
     *,
     events: list[dict[str, Any]],
     allow_terminal_recovery: bool = False,
+    expected_latest_seq: int | None = None,
 ) -> list[dict[str, Any]]:
     """Append one same-room publication plan in a single transaction.
 
@@ -1902,6 +1903,12 @@ def append_events(
 
     if not isinstance(events, list) or not events:
         raise HostedRoomError("events must be a non-empty list")
+    if expected_latest_seq is not None and (
+        isinstance(expected_latest_seq, bool)
+        or not isinstance(expected_latest_seq, int)
+        or expected_latest_seq < 0
+    ):
+        raise HostedRoomError("expected_latest_seq must be a non-negative integer")
     required = frozenset({"room_id", "event_id", "kind", "actor", "payload"})
     optional = frozenset({"authority_gateway_id", "authority_epoch", "now"})
     prepared: list[dict[str, Any]] = []
@@ -2053,6 +2060,13 @@ def append_events(
             ).fetchone()
             if room is None:
                 _raise_room_not_found(conn, room_id)
+            if (
+                expected_latest_seq is not None
+                and int(room["next_seq"]) - 1 != expected_latest_seq
+            ):
+                raise RoomConflictError(
+                    "hosted room latest sequence changed before event publication"
+                )
             for _, event in pending:
                 if event["authority_scoped"] and (
                     room["authority_gateway_id"]
@@ -2062,14 +2076,8 @@ def append_events(
                     raise AuthorityConflictError("stale hosted room authority")
 
             additional_bytes = sum(event["event_bytes"] for _, event in pending)
-            existing_member_prefix = any(
-                results[index] is not None
-                and event["kind"] == "message.member"
-                for index, event in enumerate(prepared)
-            )
             terminal_recovery = (
                 allow_terminal_recovery
-                and existing_member_prefix
                 and all(
                     event["kind"] in _TERMINAL_COMPLETION_EVENT_KINDS
                     for _, event in pending
