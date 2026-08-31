@@ -154,6 +154,30 @@ def test_cancellation_before_tracker_setup_terminates_the_process_group() -> Non
     assert signals == [(4242, signal.SIGTERM)]
 
 
+def test_cancellation_inside_popen_is_deferred_until_process_is_owned() -> None:
+    """Bootstrap cancellation must wait until the parent can reap the child."""
+    process = FakeProcess([-signal.SIGTERM])
+    signals: list[tuple[int, int]] = []
+    handler = timebox_process._CancellationForwarder()
+
+    def cancelling_popen(*args, **kwargs):
+        handler(signal.SIGTERM, None)
+        return process
+
+    with pytest.raises(timebox_process._CancellationSignal):
+        run_with_timebox(
+            ["tests-command"],
+            timeout_seconds=10,
+            grace_seconds=2,
+            popen=cancelling_popen,
+            terminate_group=lambda pid, signum: signals.append((pid, signum)),
+            tracker_factory=_fake_tracker,
+            startup_guard=handler.defer,
+        )
+
+    assert signals == [(4242, signal.SIGTERM)]
+
+
 def test_repeated_cancellation_does_not_interrupt_cleanup() -> None:
     handler = timebox_process._CancellationForwarder()
 

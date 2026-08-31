@@ -9,7 +9,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import FrameType
 from typing import Protocol
 
@@ -36,12 +37,30 @@ class _CancellationForwarder:
 
     def __init__(self) -> None:
         self._raised = False
+        self._defer_depth = 0
+        self._pending_signal: int | None = None
 
     def __call__(self, signal_number: int, _frame: FrameType | None) -> None:
         if self._raised:
             return
         self._raised = True
+        if self._defer_depth:
+            self._pending_signal = signal_number
+            return
         raise _CancellationSignal(signal_number)
+
+    @contextmanager
+    def defer(self) -> Iterator[None]:
+        """Delay the first cancellation until bootstrap owns the child handle."""
+        self._defer_depth += 1
+        try:
+            yield
+        finally:
+            self._defer_depth -= 1
+            if self._defer_depth == 0 and self._pending_signal is not None:
+                pending_signal = self._pending_signal
+                self._pending_signal = None
+                raise _CancellationSignal(pending_signal)
 
 
 def _terminate_group(pid: int, signal_number: int) -> None:
@@ -199,6 +218,7 @@ def run_with_timebox(
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     terminate_group: Callable[[int, int], None] = _terminate_group,
     tracker_factory: Callable[[int], _ProcessTracker] = _DescendantTracker,
+    startup_guard: Callable[[], AbstractContextManager[None]] = nullcontext,
 ) -> int:
     """Run *command* and terminate its complete process tree on timeout."""
     process: subprocess.Popen[bytes] | None = None
@@ -219,9 +239,10 @@ def run_with_timebox(
         )
 
     try:
-        process = popen(list(command), start_new_session=os.name != "nt")
-        tracker = tracker_factory(process.pid)
-        tracker.start()
+        with startup_guard():
+            process = popen(list(command), start_new_session=os.name != "nt")
+            tracker = tracker_factory(process.pid)
+            tracker.start()
         result = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         print(
@@ -270,6 +291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             command,
             timeout_seconds=args.timeout_seconds,
             grace_seconds=args.grace_seconds,
+            startup_guard=forward_cancellation.defer,
         )
     except _CancellationSignal as cancellation:
         return 128 + cancellation.signal_number

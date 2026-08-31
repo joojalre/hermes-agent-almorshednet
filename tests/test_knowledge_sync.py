@@ -1,5 +1,6 @@
 import io
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -164,12 +165,23 @@ def test_apply_and_verify_are_idempotent_and_do_not_touch_user(tmp_path, monkeyp
     args.json = True
     assert knowledge._sync(args) == 0
     first = (memories / "MEMORY.md").read_bytes()
-    backup = home / "knowledge" / "backups" / "test-run-001" / "MEMORY.md"
-    assert backup.read_bytes() == b"existing"
-    assert json.loads((home / "knowledge" / "knowledge-sync.jsonl").read_text(encoding="utf-8").splitlines()[-1])["memory"]["before_sha256"] == knowledge._sha256_bytes(b"existing")
+    audit_path = home / "knowledge" / "knowledge-sync.jsonl"
+    first_event = json.loads(
+        audit_path.read_text(encoding="utf-8").splitlines()[-1]
+    )
+    first_backup = Path(first_event["memory"]["backup_path"])
+    assert first_backup.read_bytes() == b"existing"
+    assert first_event["memory"]["before_sha256"] == knowledge._sha256_bytes(
+        b"existing"
+    )
     assert knowledge._sync(args) == 0
     assert (memories / "MEMORY.md").read_bytes() == first
-    assert backup.read_bytes() == b"existing"
+    second_event = json.loads(
+        audit_path.read_text(encoding="utf-8").splitlines()[-1]
+    )
+    second_backup = Path(second_event["memory"]["backup_path"])
+    assert second_backup.read_bytes() == first
+    assert first_backup.read_bytes() == b"existing"
     assert (memories / "USER.md").read_text(encoding="utf-8") == "keep user"
 
     verify = Args()
@@ -217,6 +229,13 @@ def test_only_current_records_are_rendered_but_all_are_audited(
                 "source_id": "local-doc",
                 "status": "EXTERNAL",
             },
+            {
+                "id": "conflicting",
+                "domain": "routing",
+                "statement": "Conflicting routing fact.",
+                "source_id": "local-doc",
+                "status": "CONFLICTING",
+            },
         ],
     )
 
@@ -230,6 +249,7 @@ def test_only_current_records_are_rendered_but_all_are_audited(
     assert "Pending routing fact." not in rendered
     assert "Archived routing fact." not in rendered
     assert "External routing fact." not in rendered
+    assert "Conflicting routing fact." not in rendered
 
     event = json.loads(
         (home / "knowledge" / "knowledge-sync.jsonl")
@@ -241,6 +261,7 @@ def test_only_current_records_are_rendered_but_all_are_audited(
         "PENDING",
         "ARCHIVED",
         "EXTERNAL",
+        "CONFLICTING",
     }
 
 
@@ -261,7 +282,10 @@ def test_reused_run_id_with_changed_manifest_is_refused_before_write(
     assert knowledge._sync(args) == 0
     capsys.readouterr()
     audit_path = home / "knowledge" / "knowledge-sync.jsonl"
-    backup_path = home / "knowledge" / "backups" / "test-run-001" / "MEMORY.md"
+    first_event = json.loads(
+        audit_path.read_text(encoding="utf-8").splitlines()[-1]
+    )
+    backup_path = Path(first_event["memory"]["backup_path"])
     before_memory = memory_path.read_bytes()
     before_audit = audit_path.read_bytes()
     before_backup = backup_path.read_bytes()
@@ -276,6 +300,119 @@ def test_reused_run_id_with_changed_manifest_is_refused_before_write(
     assert memory_path.read_bytes() == before_memory
     assert audit_path.read_bytes() == before_audit
     assert backup_path.read_bytes() == before_backup
+
+
+def test_apply_holds_one_transaction_lock_through_memory_and_audit(
+    tmp_path, monkeypatch
+):
+    """The run-id reservation, memory write, and audit commit are one unit."""
+    home = tmp_path / "hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("existing", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manifest = _manifest(tmp_path / "transaction-lock.json")
+    lock_depth = 0
+    real_lock = knowledge.MemoryStore._file_lock
+    real_write = knowledge._write_managed_memory
+    real_append = knowledge._append_audit
+
+    @contextmanager
+    def tracking_lock(path):
+        nonlocal lock_depth
+        with real_lock(path):
+            lock_depth += 1
+            try:
+                yield
+            finally:
+                lock_depth -= 1
+
+    def checked_write(*args, **kwargs):
+        assert lock_depth >= 1, "memory write must be inside the transaction lock"
+        return real_write(*args, **kwargs)
+
+    def checked_append(event):
+        assert lock_depth >= 1, "audit append must be inside the transaction lock"
+        return real_append(event)
+
+    monkeypatch.setattr(
+        knowledge.MemoryStore, "_file_lock", staticmethod(tracking_lock)
+    )
+    monkeypatch.setattr(knowledge, "_write_managed_memory", checked_write)
+    monkeypatch.setattr(knowledge, "_append_audit", checked_append)
+
+    args = SimpleNamespace(
+        manifest=str(manifest), dry_run=False, apply=True, json=True
+    )
+    assert knowledge._sync(args) == 0
+    assert lock_depth == 0
+
+
+def test_failed_attempt_cannot_reuse_an_unrelated_backup(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    memory_path = memories / "MEMORY.md"
+    memory_path.write_text("existing", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manifest = _manifest(tmp_path / "orphan-backup.json")
+    args = SimpleNamespace(
+        manifest=str(manifest), dry_run=False, apply=True, json=True
+    )
+    real_append = knowledge._append_audit
+
+    def fail_append(_event):
+        raise knowledge.KnowledgeError("audit unavailable")
+
+    monkeypatch.setattr(knowledge, "_append_audit", fail_append)
+    assert knowledge._sync(args) == 2
+    capsys.readouterr()
+    assert memory_path.read_text(encoding="utf-8") == "existing"
+
+    memory_path.write_text("changed between attempts", encoding="utf-8")
+    changed = json.loads(manifest.read_text(encoding="utf-8"))
+    changed["records"][0]["statement"] = "A new manifest after failed audit."
+    manifest.write_text(json.dumps(changed), encoding="utf-8")
+    monkeypatch.setattr(knowledge, "_append_audit", real_append)
+
+    assert knowledge._sync(args) == 0
+    event = json.loads(
+        (home / "knowledge" / "knowledge-sync.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    backup_path = Path(event["memory"]["backup_path"])
+    assert backup_path.read_text(encoding="utf-8") == "changed between attempts"
+    assert event["memory"]["before_sha256"] == knowledge._sha256_text(
+        "changed between attempts"
+    )
+
+
+@pytest.mark.parametrize("audit_text", ["not-json\n", "[]\n"])
+def test_apply_fails_closed_on_malformed_audit(
+    tmp_path, monkeypatch, capsys, audit_text
+):
+    home = tmp_path / "hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    memory_path = memories / "MEMORY.md"
+    memory_path.write_text("existing", encoding="utf-8")
+    audit_path = home / "knowledge" / "knowledge-sync.jsonl"
+    audit_path.parent.mkdir(parents=True)
+    audit_path.write_text(audit_text, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manifest = _manifest(tmp_path / "malformed-audit.json")
+    args = SimpleNamespace(
+        manifest=str(manifest), dry_run=False, apply=True, json=True
+    )
+
+    assert knowledge._sync(args) == 2
+    assert "knowledge audit is malformed" in json.loads(
+        capsys.readouterr().out
+    )["error"]
+    assert memory_path.read_text(encoding="utf-8") == "existing"
 
 
 def test_secrets_and_instructions_are_rejected(tmp_path, monkeypatch):

@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,10 @@ def _sha256_text(text: str) -> str:
 
 def _audit_path() -> Path:
     return get_hermes_home() / AUDIT_DIRNAME / AUDIT_FILENAME
+
+
+def _transaction_lock_path() -> Path:
+    return get_hermes_home() / AUDIT_DIRNAME / "knowledge-sync.transaction"
 
 
 def _memory_path() -> Path:
@@ -396,6 +401,7 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
         "manifest_sha256": manifest_sha,
         "sources": source_results,
         "records": accepted,
+        "audit_records": deduped,
         "conflicts": conflicts,
         "rejected": rejected,
         "duplicates": duplicates,
@@ -468,6 +474,7 @@ def _rollback_failed_write(
 def _write_managed_memory(
     block: str,
     run_id: str,
+    manifest_sha: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         store = load_on_disk_store()
@@ -475,17 +482,21 @@ def _write_managed_memory(
             raise KnowledgeError("built-in memory is disabled; write refused")
         path = _memory_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        backup_path = (
-            get_hermes_home() / AUDIT_DIRNAME / "backups" / run_id / "MEMORY.md"
-        )
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-
         with MemoryStore._file_lock(path):
             before_exists = path.exists()
             raw, read_ok = MemoryStore._read_raw_checked(path)
             if not read_ok:
                 raise KnowledgeError("MEMORY.md became unreadable; write refused")
             before_sha = _sha256_text(raw)
+            backup_path = (
+                get_hermes_home()
+                / AUDIT_DIRNAME
+                / "backups"
+                / run_id
+                / manifest_sha
+                / f"{before_sha}.MEMORY.md"
+            )
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
             if not backup_path.exists():
                 atomic_write_text(backup_path, raw)
             effective_limit = store.memory_char_limit
@@ -604,8 +615,10 @@ def _assert_run_manifest_consistency(
     for line in audit_text.splitlines():
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            raise KnowledgeError("knowledge audit is malformed") from exc
+        if not isinstance(event, dict):
+            raise KnowledgeError("knowledge audit is malformed")
         if event.get("run_id") != run_id:
             continue
         if event.get("manifest_sha256") != manifest_sha:
@@ -687,42 +700,48 @@ def _sync(args: Any) -> int:
         manifest, manifest_sha = _read_manifest(args.manifest)
         prepared = _prepare(manifest, manifest_sha)
         is_apply = bool(args.apply)
-        memory = {"status": "dry-run" if not is_apply else "pending"}
-        rollback = None
-        if is_apply:
-            _check_existing_run_manifest(prepared["run_id"], manifest_sha)
-            memory, rollback = _write_managed_memory(
-                _render_memory(prepared), prepared["run_id"]
-            )
-        result = _summary(prepared, memory)
-        event = {
-            "schema_version": SCHEMA_VERSION,
-            "run_id": prepared["run_id"],
-            "manifest_sha256": manifest_sha,
-            "created_at": _now(),
-            "mode": "apply" if is_apply else "dry-run",
-            "sources": prepared["sources"],
-            "records": prepared["records"],
-            "rejected": prepared["rejected"],
-            "duplicates": prepared["duplicates"],
-            "conflicts": prepared["conflicts"],
-            "memory": memory,
-        }
-        if is_apply:
-            try:
-                _append_audit(event)
-            except KnowledgeError as audit_exc:
-                if rollback is None:
-                    raise KnowledgeError(
-                        f"{audit_exc}; memory rollback snapshot is missing"
-                    ) from audit_exc
+        transaction = (
+            MemoryStore._file_lock(_transaction_lock_path())
+            if is_apply
+            else nullcontext()
+        )
+        with transaction:
+            memory = {"status": "dry-run" if not is_apply else "pending"}
+            rollback = None
+            if is_apply:
+                _check_existing_run_manifest(prepared["run_id"], manifest_sha)
+                memory, rollback = _write_managed_memory(
+                    _render_memory(prepared), prepared["run_id"], manifest_sha
+                )
+            result = _summary(prepared, memory)
+            event = {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": prepared["run_id"],
+                "manifest_sha256": manifest_sha,
+                "created_at": _now(),
+                "mode": "apply" if is_apply else "dry-run",
+                "sources": prepared["sources"],
+                "records": prepared["audit_records"],
+                "rejected": prepared["rejected"],
+                "duplicates": prepared["duplicates"],
+                "conflicts": prepared["conflicts"],
+                "memory": memory,
+            }
+            if is_apply:
                 try:
-                    _restore_memory(rollback)
-                except KnowledgeError as rollback_exc:
-                    raise KnowledgeError(
-                        f"{audit_exc}; memory rollback failed: {rollback_exc}"
-                    ) from rollback_exc
-                raise
+                    _append_audit(event)
+                except KnowledgeError as audit_exc:
+                    if rollback is None:
+                        raise KnowledgeError(
+                            f"{audit_exc}; memory rollback snapshot is missing"
+                        ) from audit_exc
+                    try:
+                        _restore_memory(rollback)
+                    except KnowledgeError as rollback_exc:
+                        raise KnowledgeError(
+                            f"{audit_exc}; memory rollback failed: {rollback_exc}"
+                        ) from rollback_exc
+                    raise
         _print_sync(result, prepared, json_mode=args.json)
         return 0
     except KnowledgeError as exc:
