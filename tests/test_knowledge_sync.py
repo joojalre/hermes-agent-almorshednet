@@ -544,6 +544,68 @@ def test_verify_fails_closed_on_structurally_malformed_audit(
     )["error"]
 
 
+def test_apply_accepts_legacy_conflict_audit_and_writes_current_schema(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "hermes"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    legacy_manifest = _manifest(
+        tmp_path / "legacy-conflict.json",
+        records=[
+            {
+                "id": "legacy-a",
+                "fact_key": "legacy.model",
+                "domain": "routing",
+                "statement": "The legacy model is alpha.",
+                "source_id": "local-doc",
+            },
+            {
+                "id": "legacy-b",
+                "fact_key": "legacy.model",
+                "domain": "routing",
+                "statement": "The legacy model is beta.",
+                "source_id": "drive-index",
+            },
+        ],
+    )
+    legacy_args = SimpleNamespace(
+        manifest=str(legacy_manifest), dry_run=False, apply=True, json=True
+    )
+    assert knowledge._sync(legacy_args) == 0
+    capsys.readouterr()
+
+    audit_path = home / "knowledge" / "knowledge-sync.jsonl"
+    legacy_event = json.loads(audit_path.read_text(encoding="utf-8"))
+    legacy_event["schema_version"] = 1
+    legacy_event["records"] = [
+        record
+        for record in legacy_event["records"]
+        if record["status"] != "CONFLICTING"
+    ]
+    assert legacy_event["records"] == []
+    assert legacy_event["conflicts"]
+    audit_path.write_text(json.dumps(legacy_event) + "\n", encoding="utf-8")
+
+    current_manifest = _manifest(tmp_path / "current.json")
+    current_data = json.loads(current_manifest.read_text(encoding="utf-8"))
+    current_data["run_id"] = "current-run-002"
+    current_manifest.write_text(json.dumps(current_data), encoding="utf-8")
+    current_args = SimpleNamespace(
+        manifest=str(current_manifest), dry_run=False, apply=True, json=True
+    )
+
+    assert knowledge._sync(current_args) == 0
+    events = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["schema_version"] for event in events] == [
+        1,
+        knowledge.AUDIT_SCHEMA_VERSION,
+    ]
+
+
 def test_secrets_and_instructions_are_rejected(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     (home / "memories").mkdir(parents=True)
@@ -1296,6 +1358,7 @@ def test_fact_key_conflicts_are_nfkc_casefold_insensitive(
         .read_text(encoding="utf-8")
         .splitlines()[-1]
     )
+    assert event["schema_version"] == knowledge.AUDIT_SCHEMA_VERSION
     assert [record["fact_key"] for record in event["records"]] == [
         "model.default",
         variant,

@@ -25,6 +25,7 @@ from utils import atomic_write_text
 
 
 SCHEMA_VERSION = 1
+AUDIT_SCHEMA_VERSION = 2
 VALID_KINDS = {"local", "drive", "github"}
 VALID_STATUSES = {"CURRENT", "ARCHIVED", "CONFLICTING", "PENDING", "EXTERNAL"}
 MANAGED_HEADER = "## Hermes knowledge (managed)"
@@ -735,7 +736,7 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
     if (
         not _object_has_typed_fields(event, top_level_fields)
         or type(event.get("schema_version")) is not int
-        or event["schema_version"] != SCHEMA_VERSION
+        or event["schema_version"] not in {1, AUDIT_SCHEMA_VERSION}
         or not _RUN_ID_RE.fullmatch(event["run_id"])
         or not re.fullmatch(r"[0-9a-f]{64}", event["manifest_sha256"])
         or not _audit_timestamp_is_valid(event["created_at"])
@@ -840,7 +841,10 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
             not _ID_RE.fullmatch(item["id"])
             or not item["fact_key"]
             or len(item["fact_key"]) > MAX_ID_CHARS
-            or (item["id"], item["fact_key"]) not in conflicting_records
+            or (
+                event["schema_version"] >= AUDIT_SCHEMA_VERSION
+                and (item["id"], item["fact_key"]) not in conflicting_records
+            )
             for item in event["conflicts"]
         )
     ):
@@ -1014,7 +1018,7 @@ def _sync(args: Any) -> int:
                 )
             result = _summary(prepared, memory)
             event = {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": AUDIT_SCHEMA_VERSION,
                 "run_id": prepared["run_id"],
                 "manifest_sha256": manifest_sha,
                 "created_at": _now(),
