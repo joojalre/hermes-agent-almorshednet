@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import sqlite3
 import threading
 import time
@@ -118,6 +119,34 @@ def _wait_for(predicate, timeout=2.0):
     raise AssertionError("condition was not reached")
 
 
+def _approve_room_task_process(
+    db_path: str,
+    room_id: str,
+    member_id: str,
+    task_id: str,
+    execution_generation: int,
+    request_id: str,
+    choice: str,
+    results,
+) -> None:
+    """Exercise the dashboard decision through a distinct spawned process."""
+
+    try:
+        service = HostedRoomService(_server(), db_path=Path(db_path))
+        result = service.approve_room_task(
+            room_id,
+            member_id=member_id,
+            task_id=task_id,
+            execution_generation=execution_generation,
+            request_id=request_id,
+            choice=choice,
+        )
+    except Exception as exc:
+        results.put({"error": f"{type(exc).__name__}: {exc}"})
+    else:
+        results.put({"result": dict(result)})
+
+
 def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path: Path):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)
@@ -213,6 +242,157 @@ def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path)
     service.prepare_room(binding)
     replayed = service._events("room-1")
     assert replayed == events
+
+
+def test_terminal_publication_reserves_the_whole_plan_before_append(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="user-1",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    monkeypatch.setattr(hosted_rooms, "MAX_EVENTS_PER_ROOM", 2)
+    plan = discussion.PublicationPlan(
+        task_id="task-1",
+        terminal_kind="turn.settled",
+        events=(
+            discussion.EventPlan(
+                event_id="member-1",
+                kind="message.member",
+                actor={"kind": "member", "id": "ops"},
+                payload={"text": "done"},
+                authority_gateway_id=str(room["authority_gateway_id"]),
+                authority_epoch=int(room["authority_epoch"]),
+            ),
+            discussion.EventPlan(
+                event_id="terminal-1",
+                kind="turn.settled",
+                actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
+                payload={"task_id": "task-1"},
+                authority_gateway_id=str(room["authority_gateway_id"]),
+                authority_epoch=int(room["authority_epoch"]),
+            ),
+        ),
+    )
+
+    with pytest.raises(hosted_rooms.HostedRoomError, match="history limit"):
+        service._append_plan("room-1", plan)
+
+    assert [event["event_id"] for event in service._events("room-1")] == [
+        "user-1"
+    ]
+
+
+def test_terminal_publication_recovers_legacy_member_prefix_at_normal_limit(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    member = discussion.EventPlan(
+        event_id="member-1",
+        kind="message.member",
+        actor={"kind": "member", "id": "ops"},
+        payload={"text": "done"},
+        authority_gateway_id=str(room["authority_gateway_id"]),
+        authority_epoch=int(room["authority_epoch"]),
+    )
+    terminal = discussion.EventPlan(
+        event_id="terminal-1",
+        kind="turn.settled",
+        actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
+        payload={"task_id": "task-1"},
+        authority_gateway_id=str(room["authority_gateway_id"]),
+        authority_epoch=int(room["authority_epoch"]),
+    )
+    hosted_rooms.append_event(db, **member.append_kwargs("room-1"))
+    monkeypatch.setattr(hosted_rooms, "MAX_EVENTS_PER_ROOM", 1)
+
+    service._append_plan(
+        "room-1",
+        discussion.PublicationPlan(
+            task_id="task-1",
+            terminal_kind="turn.settled",
+            events=(member, terminal),
+        ),
+    )
+
+    assert [event["event_id"] for event in service._events("room-1")] == [
+        "member-1",
+        "terminal-1",
+    ]
+
+
+def test_terminal_publication_rejects_existing_suffix_without_member_prefix(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    member = discussion.EventPlan(
+        event_id="member-1",
+        kind="message.member",
+        actor={"kind": "member", "id": "ops"},
+        payload={"text": "done"},
+        authority_gateway_id=str(room["authority_gateway_id"]),
+        authority_epoch=int(room["authority_epoch"]),
+    )
+    terminal = discussion.EventPlan(
+        event_id="terminal-1",
+        kind="turn.settled",
+        actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
+        payload={"task_id": "task-1"},
+        authority_gateway_id=str(room["authority_gateway_id"]),
+        authority_epoch=int(room["authority_epoch"]),
+    )
+    hosted_rooms.append_event(db, **terminal.append_kwargs("room-1"))
+
+    with pytest.raises(hosted_rooms.EventConflictError, match="ordered prefix"):
+        service._append_plan(
+            "room-1",
+            discussion.PublicationPlan(
+                task_id="task-1",
+                terminal_kind="turn.settled",
+                events=(member, terminal),
+            ),
+        )
+
+    assert [event["event_id"] for event in service._events("room-1")] == [
+        "terminal-1"
+    ]
 
 
 def test_policy_checkpoint_bounds_replay_after_completed_room_history(
@@ -467,7 +647,11 @@ def test_thread_transcript_prunes_committed_message_and_settlement_together(
     )
 
 
-def test_service_uses_low_idle_poll_with_immediate_wakeup(tmp_path: Path):
+def test_service_uses_low_idle_poll_with_immediate_wakeup(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.delenv("HERMES_AGENT_TIMEOUT", raising=False)
     service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
 
     assert service.runtime.poll_interval_seconds == 5.0
@@ -662,17 +846,18 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
     assert stopping["cancel_id"] == "stop-1"
 
 
-def test_local_pending_approval_requires_exact_task_generation_and_request(
+def test_cross_process_pending_approval_requires_exact_generation_and_owner_consumes(
     tmp_path: Path,
 ):
     class ApprovalRPC(_FakeRPC):
         def __init__(self) -> None:
             super().__init__()
             self.approvals = []
+            self.resolved = 0
 
         def approve(self, *, session_id, request_id, choice):
             self.approvals.append((session_id, request_id, choice))
-            return {"resolved": 1}
+            return {"resolved": self.resolved}
 
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)
@@ -736,13 +921,65 @@ def test_local_pending_approval_requires_exact_task_generation_and_request(
             request_id="wrong-request",
         )
 
-    assert service.approve_room_task(
-        "room-1",
-        member_id="ops",
-        task_id=task["identity"].task_id,
-        execution_generation=1,
-        choice="once",
-        request_id="approval-1",
-    ) == {"resolved": 1}
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    dashboard = context.Process(
+        target=_approve_room_task_process,
+        args=(
+            str(db),
+            "room-1",
+            "ops",
+            task["identity"].task_id,
+            1,
+            "approval-1",
+            "once",
+            results,
+        ),
+    )
+    dashboard.start()
+    dashboard.join(timeout=60)
+    try:
+        assert not dashboard.is_alive()
+        assert dashboard.exitcode == 0
+        assert results.get(timeout=5) == {
+            "result": {"choice": "once", "idempotent": False}
+        }
+    finally:
+        if dashboard.is_alive():
+            dashboard.terminate()
+            dashboard.join(timeout=5)
+        results.close()
+        results.join_thread()
+    assert rpc.approvals == []
+
+    # Only the process that owns the live session can wake its local approval
+    # queue. Its next observation consumes the durable dashboard decision.
+    service.runtime._report_pending_action(
+        task,
+        session_id="ops-session",
+        info={
+            "pending_approval": {
+                "request_id": "approval-1",
+                "choices": ["once", "deny"],
+            }
+        },
+    )
     assert rpc.approvals == [("ops-session", "approval-1", "once")]
+    assert service.status("room-1")["pending_actions"]
+
+    rpc.resolved = 1
+    service.runtime._report_pending_action(
+        task,
+        session_id="ops-session",
+        info={
+            "pending_approval": {
+                "request_id": "approval-1",
+                "choices": ["once", "deny"],
+            }
+        },
+    )
+    assert rpc.approvals == [
+        ("ops-session", "approval-1", "once"),
+        ("ops-session", "approval-1", "once"),
+    ]
     assert service.status("room-1")["pending_actions"] == []

@@ -184,6 +184,8 @@ class HostedRoomRuntime:
         self._ambiguous_rooms: dict[str, float] = {}
         self._blocked_rooms: set[str] = set()
         self._status_lock = threading.Lock()
+        self._activity_condition = threading.Condition(self._status_lock)
+        self._activity_generation = 0
         self._current_tasks: dict[str, state.TaskIdentity] = {}
         self._room_schedule_cursor = 0
         self._last_error: str | None = None
@@ -206,6 +208,8 @@ class HostedRoomRuntime:
     def stop(self, *, timeout: float = 5.0) -> bool:
         """Request a bounded clean stop without interrupting accepted turns."""
         self._stop.set()
+        with self._activity_condition:
+            self._activity_condition.notify_all()
         self._wake.set()
         with self._status_lock:
             thread = self._thread
@@ -223,13 +227,27 @@ class HostedRoomRuntime:
 
     def wakeup(self) -> None:
         """Wake the worker after task admission or a room-state change."""
-        with self._status_lock:
+        with self._activity_condition:
             # If the supervisor observes this signal while a room still owns a
             # worker slot, remember to revisit it once that thread exits. This
             # closes the race between terminal publication/route repair and the
             # longer idle fallback without turning idle rooms into a busy loop.
             self._rooms_needing_reschedule.update(self._room_threads)
+            self._activity_generation += 1
+            self._activity_condition.notify_all()
         self._wake.set()
+
+    def _activity_snapshot(self) -> int:
+        with self._activity_condition:
+            return self._activity_generation
+
+    def _wait_for_activity(self, generation: int, timeout: float) -> None:
+        with self._activity_condition:
+            self._activity_condition.wait_for(
+                lambda: self._activity_generation != generation
+                or self._stop.is_set(),
+                timeout=max(0.0, timeout),
+            )
 
     def status(self) -> dict[str, Any]:
         """Return a transport-neutral snapshot of runtime health."""
@@ -426,30 +444,12 @@ class HostedRoomRuntime:
         lease: state.DriverLease,
     ) -> bool:
         """Publish a terminal receipt that arrived before Stop was acknowledged."""
-        transport = self.rpc
-        if transport is None:
-            return False
-        profile = task["payload"]["target_profile"]
-        session = transport.resolve_exact(
-            profile=profile,
-            title=room_session_title(binding.room_id),
-            source=ROOM_SESSION_SOURCE,
-        )
-        if session is None:
-            return False
-        resumed = transport.resume(
-            profile=profile,
-            session_id=_session_id(session),
-            source=ROOM_SESSION_SOURCE,
-        )
-        receipt = _find_terminal_receipt(
-            transport.history(
-                profile=profile,
-                session_id=_session_id(resumed),
-                source=ROOM_SESSION_SOURCE,
-            ),
-            task["identity"],
-            int(task["execution_generation"]),
+        receipt = _durable_terminal_receipt(
+            state.get_terminal_receipt(
+                self.db_path,
+                task["identity"],
+                execution_generation=int(task["execution_generation"]),
+            )
         )
         if receipt is None:
             return False
@@ -494,6 +494,8 @@ class HostedRoomRuntime:
             action = {
                 "kind": "approval",
                 "task_id": task["identity"].task_id,
+                "thread_id": task["identity"].thread_id,
+                "turn_id": task["identity"].turn_id,
                 "execution_generation": int(task["execution_generation"]),
                 "run_id": info.get("run_id"),
                 "session_id": session_id,
@@ -857,6 +859,7 @@ class HostedRoomRuntime:
     ) -> _TerminalReceipt | None:
         lease = attempt.lease
         while not self._stop.is_set():
+            activity_generation = self._activity_snapshot()
             task = state.get_task(self.db_path, attempt.identity)
             if task["status"] in state.TERMINAL_STATUSES:
                 return None
@@ -870,8 +873,9 @@ class HostedRoomRuntime:
                         return None
                 except Exception as exc:
                     self._record_error(f"stop retry remains pending: {exc}")
-                self._wake.wait(self.active_poll_interval_seconds)
-                self._wake.clear()
+                self._wait_for_activity(
+                    activity_generation, self.active_poll_interval_seconds
+                )
                 continue
 
             if time.monotonic() >= deadline_monotonic:
@@ -879,14 +883,12 @@ class HostedRoomRuntime:
                 return None
 
             lease = self._renew_lease_if_needed(binding, lease)
-            receipt = _find_terminal_receipt(
-                transport.history(
-                    profile=profile,
-                    session_id=session_id,
-                    source=ROOM_SESSION_SOURCE,
-                ),
-                attempt.identity,
-                attempt.execution_generation,
+            receipt = _durable_terminal_receipt(
+                state.get_terminal_receipt(
+                    self.db_path,
+                    attempt.identity,
+                    execution_generation=attempt.execution_generation,
+                )
             )
             if receipt is not None:
                 return receipt
@@ -898,8 +900,10 @@ class HostedRoomRuntime:
             )
             self._report_pending_action(task, session_id=session_id, info=info)
             remaining = max(0.0, deadline_monotonic - time.monotonic())
-            self._wake.wait(min(self.active_poll_interval_seconds, remaining))
-            self._wake.clear()
+            self._wait_for_activity(
+                activity_generation,
+                min(self.active_poll_interval_seconds, remaining),
+            )
         return None
 
     @staticmethod
@@ -1010,14 +1014,23 @@ class HostedRoomRuntime:
         self,
         task: Mapping[str, Any],
     ) -> _RecoveryInspection:
-        """Check only live process state before explicit local recovery.
+        """Recover exact durable proof, then inspect live process state.
 
-        A restart loses the in-process terminal callback identity. The ordinary
-        session history is a display projection and cannot prove which durable
-        task attempt authored a row, so never hydrate or infer completion from
-        it. An inactive abandoned attempt remains indeterminate until the user
-        explicitly retries it under a new fenced generation.
+        Ordinary session history is a display projection and cannot prove which
+        task generation authored a row. Terminal recovery therefore uses the
+        private receipt written before callback publication; without one, an
+        inactive abandoned attempt remains indeterminate for explicit retry.
         """
+
+        receipt = _durable_terminal_receipt(
+            state.get_terminal_receipt(
+                self.db_path,
+                task["identity"],
+                execution_generation=int(task["execution_generation"]),
+            )
+        )
+        if receipt is not None:
+            return _RecoveryInspection(terminal=receipt, active=False, status=None)
 
         profile = task["payload"]["target_profile"]
         with self.turn_lock(profile):
@@ -1258,36 +1271,25 @@ def _bounded_terminal_result(receipt: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _find_terminal_receipt(
-    history: Sequence[Mapping[str, Any]],
-    identity: state.TaskIdentity,
-    execution_generation: int,
+def _durable_terminal_receipt(
+    receipt: Mapping[str, Any] | None,
 ) -> _TerminalReceipt | None:
-    for message in reversed(history):
-        if message.get("task_id") != identity.task_id:
-            continue
-        if message.get("execution_generation") != execution_generation:
-            continue
-        if message.get("role") != "assistant":
-            continue
-        status = message.get("status")
-        if status not in {"settled", "failed"}:
-            continue
-        terminal_status = cast(state.TerminalStatus, status)
-        receipt_id = message.get("message_id")
-        if not isinstance(receipt_id, str) or not receipt_id:
-            receipt_id = f"reply:{identity.task_id}:{execution_generation}"
-        return _TerminalReceipt(
-            status=terminal_status,
-            settlement_id=receipt_id,
-            result=_bounded_terminal_result(
-                {
-                    "message_id": receipt_id,
-                    "text": message.get("content", ""),
-                }
-            ),
-        )
-    return None
+    if receipt is None:
+        return None
+    status = receipt.get("status")
+    if status not in {"settled", "failed"}:
+        return None
+    result = receipt.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    settlement_id = receipt.get("settlement_id")
+    if not isinstance(settlement_id, str) or not settlement_id:
+        return None
+    return _TerminalReceipt(
+        status=cast(state.TerminalStatus, status),
+        settlement_id=settlement_id,
+        result=dict(result),
+    )
 
 
 def _info_is_active_for(

@@ -179,21 +179,34 @@ def _(rid, params: dict) -> dict:
             # their own source.
             deny = frozenset({"kanban", "tool"})
 
-            # ``title``: EXACT-title registry lookup, not a listing. The core
-            # UNIQUE title index means at most one session per db carries a
-            # given exact title, so callers that treat a title as an identity
-            # key (Bot Mode's canonical "Bot Chat" — Profile → Named Session)
-            # get a window-free O(1) answer instead of scanning a recency
-            # window that a busy profile can push the row out of. Hidden rows
-            # resolve (canonical chats are born hidden); archived rows and
-            # deny-listed sources do not; compression lineages resolve to the
-            # live tip (``resolved_id``), mirroring profiles.list's
-            # canonical_session resolver. Older clients never send this param;
-            # newer clients falling back to older gateways just get the normal
-            # windowed listing back (the param is ignored) and scan it.
+            # ``title``: EXACT-title registry lookup, not a listing. An owning
+            # surface can also pass ``source`` so duplicate user/internal titles
+            # cannot resolve to each other. Hidden rows resolve (canonical chats
+            # are born hidden); archived rows normally do not; compression
+            # lineages resolve to the live tip (``resolved_id``), mirroring
+            # profiles.list's canonical_session resolver.
             title_lookup = str(params.get("title") or "").strip()
             if title_lookup:
-                row = db.get_session_by_title(title_lookup)
+                source_lookup = str(params.get("source") or "").strip()
+                row = (
+                    db.get_session_by_title(title_lookup, source=source_lookup)
+                    if source_lookup
+                    else db.get_session_by_title(title_lookup)
+                )
+                canonical_room = (
+                    source_lookup.casefold() == "bot_room"
+                    and title_lookup.startswith("Group: ")
+                )
+                if row and canonical_room:
+                    # Room sessions are durable per-room context, not stale
+                    # user chats. Older versions left them unpinned, so the
+                    # periodic archive sweep could hide the canonical row and
+                    # make the room create empty replacements. Resurrect once,
+                    # then pin the whole compression lineage before resolving.
+                    if row.get("archived"):
+                        db.set_session_archived(row["id"], False)
+                    db.set_session_pinned(row["id"], True)
+                    row = db.get_session(row["id"])
                 if row and row.get("archived"):
                     from tools.bot_mode_probe import BOT_CHAT_TITLE
 

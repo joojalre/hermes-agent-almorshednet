@@ -51,10 +51,14 @@ class HostedRoomServerRPC:
     def resolve_exact(
         self, *, profile: str, title: str, source: str
     ) -> Mapping[str, Any] | None:
-        del source
         result = self._call(
             "session.list",
-            {"profile": profile, "title": title, "include_hidden": True},
+            {
+                "profile": profile,
+                "title": title,
+                "source": source,
+                "include_hidden": True,
+            },
         )
         rows = result.get("sessions")
         if not isinstance(rows, list) or not rows:

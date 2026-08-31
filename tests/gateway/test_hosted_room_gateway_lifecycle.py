@@ -91,7 +91,8 @@ async def test_messaging_gateway_supervisor_starts_without_dashboard(monkeypatch
     def get_service():
         return service if state["running"] else None
 
-    def start_service():
+    def start_service(*, start_allowed=None):
+        assert start_allowed is not None and start_allowed.is_set()
         state["starts"] += 1
         state["running"] = True
         return service
@@ -118,7 +119,8 @@ async def test_dead_room_worker_is_restarted_by_gateway_task_supervision(monkeyp
 
     starts = {"count": 0}
 
-    def fail_start():
+    def fail_start(*, start_allowed=None):
+        assert start_allowed is not None and start_allowed.is_set()
         starts["count"] += 1
         raise RuntimeError("worker unavailable")
 

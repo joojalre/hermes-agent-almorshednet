@@ -66,7 +66,14 @@ def test_routes_exact_hidden_session_and_internal_task_proof():
     )
 
     create = next(params for method, params in calls if method == "session.create")
+    lookup = next(params for method, params in calls if method == "session.list")
     submit = next(params for method, params in calls if method == "prompt.submit")
+    assert lookup == {
+        "profile": "ops",
+        "title": "Group: room",
+        "source": "bot_room",
+        "include_hidden": True,
+    }
     assert create["hidden"] is True
     assert create["room_plumbing"] is True
     assert create["follow_profile_config"] is True

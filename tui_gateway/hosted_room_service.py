@@ -122,11 +122,57 @@ class HostedRoomService:
         action: Mapping[str, Any] | None,
     ) -> None:
         key = (room_id, member_id)
-        with self._policy_lock:
-            if action is None:
+        if action is None:
+            driver.clear_member_approval_requests(
+                self.db_path,
+                room_id=room_id,
+                member_id=member_id,
+            )
+            with self._policy_lock:
                 self._pending_actions.pop(key, None)
-            else:
-                self._pending_actions[key] = {**action, "member_id": member_id}
+            return
+        durable_action = {**action, "member_id": member_id}
+        identity = driver.TaskIdentity(
+            room_id=room_id,
+            task_id=str(action.get("task_id") or ""),
+            thread_id=str(action.get("thread_id") or ""),
+            turn_id=str(action.get("turn_id") or ""),
+        )
+        request = driver.publish_approval_request(
+            self.db_path,
+            identity,
+            execution_generation=int(action.get("execution_generation") or 0),
+            member_id=member_id,
+            request_id=str(action.get("request_id") or ""),
+            session_id=str(action.get("session_id") or ""),
+            action=durable_action,
+            clock=time.time,
+        )
+        with self._policy_lock:
+            self._pending_actions[key] = durable_action
+        choice = request.get("choice")
+        if choice not in {"once", "deny"}:
+            return
+        result = self.rpc.approve(
+            session_id=str(request["session_id"]),
+            request_id=str(request["request_id"]),
+            choice=str(choice),
+        )
+        if not isinstance(result, Mapping) or not bool(result.get("resolved")):
+            return
+        if not driver.mark_approval_consumed(
+            self.db_path,
+            identity,
+            execution_generation=int(request["execution_generation"]),
+            member_id=member_id,
+            request_id=str(request["request_id"]),
+            choice=str(choice),
+            clock=time.time,
+        ):
+            raise RuntimeError("room approval decision changed before acknowledgement")
+        with self._policy_lock:
+            self._pending_actions.pop(key, None)
+        self.runtime.wakeup()
 
     def _events(self, room_id: str) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -149,11 +195,11 @@ class HostedRoomService:
             cursor = next_cursor
 
     def _append_plan(self, room_id: str, plan: discussion.PublicationPlan) -> None:
-        for event in plan.events:
-            hosted_rooms.append_event(
-                self.db_path,
-                **event.append_kwargs(room_id),
-            )
+        hosted_rooms.append_events(
+            self.db_path,
+            events=[event.append_kwargs(room_id) for event in plan.events],
+            allow_terminal_recovery=True,
+        )
 
     def _policy_snapshot(self, room: Mapping[str, Any]) -> PolicySnapshot:
         return self.policy_checkpoint.snapshot(
@@ -445,41 +491,32 @@ class HostedRoomService:
     ) -> Mapping[str, Any]:
         """Resolve one exact local approval and wake room observation."""
 
-        key = (room_id, member_id)
-        with self._policy_lock:
-            action = self._pending_actions.get(key)
         requested_approval_id = str(request_id or "")
-        pending_approval_id = str((action or {}).get("request_id") or "")
-        if (
-            action is None
-            or action.get("task_id") != task_id
-            or int(action.get("execution_generation") or 0) != execution_generation
-            or not requested_approval_id
-            or requested_approval_id != pending_approval_id
-        ):
+        pending = next(
+            (
+                request
+                for request in driver.list_pending_approval_requests(
+                    self.db_path,
+                    room_id=room_id,
+                )
+                if request["identity"].task_id == task_id
+                and request["execution_generation"] == execution_generation
+                and request["member_id"] == member_id
+                and request["request_id"] == requested_approval_id
+            ),
+            None,
+        )
+        if pending is None:
             raise RuntimeError("room approval is no longer pending")
-        if choice not in {"once", "deny"}:
-            raise RuntimeError("room approval choice must be once or deny")
-        session_id = str(action.get("session_id") or "")
-        if not session_id:
-            raise RuntimeError("local room approval identity is unavailable")
-        result = self.rpc.approve(
-            session_id=session_id,
+        result = driver.decide_approval_request(
+            self.db_path,
+            pending["identity"],
+            execution_generation=execution_generation,
+            member_id=member_id,
             request_id=requested_approval_id,
             choice=choice,
+            clock=time.time,
         )
-        if result is None:
-            raise RuntimeError("room approval target is unavailable")
-        with self._policy_lock:
-            current = self._pending_actions.get(key)
-            if (
-                current is not None
-                and str(current.get("request_id") or "") == requested_approval_id
-                and current.get("task_id") == task_id
-                and int(current.get("execution_generation") or 0)
-                == execution_generation
-            ):
-                self._pending_actions.pop(key, None)
         self.runtime.wakeup()
         return result
 
@@ -497,15 +534,20 @@ class HostedRoomService:
             for task in tasks
             if task["status"] in {"indeterminate", "deferred"}
         ]
-        with self._policy_lock:
-            pending_actions.extend(
-                dict(action)
-                for (
-                    action_room_id,
-                    _member_id,
-                ), action in self._pending_actions.items()
-                if action_room_id == room_id
+        pending_actions.extend(
+            {
+                **request["action"],
+                **(
+                    {"decision": request["choice"]}
+                    if request.get("choice") is not None
+                    else {}
+                ),
+            }
+            for request in driver.list_pending_approval_requests(
+                self.db_path,
+                room_id=room_id,
             )
+        )
         return {
             "running": runtime["running"],
             "working": bool(
