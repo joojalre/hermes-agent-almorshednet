@@ -32,13 +32,17 @@ concurrency:
 jobs:
   # ─────────────────────────────────────────────────────────────────────
   # detect: run the classifier once. Every downstream job reads its outputs
-  # to decide whether to run. On push/dispatch the classifier fails open
-  # (all lanes true) so post-merge validation is never weakened.
+  # to decide whether to run. Upstream pushes fail open (all lanes true),
+  # while fork pushes skip the validation that already passed on the PR.
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
+    if: github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    # Fork PRs with deep merged history can spend over a minute in checkout
+    # before classification starts. Keep this bounded without cancelling a
+    # healthy run before the first project step.
+    timeout-minutes: 5
     outputs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
@@ -201,6 +205,7 @@ jobs:
 
   osv-scanner:
     name: OSV scan
+    if: github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent'
     uses: ./.github/workflows/osv-scanner.yml
 
   # ─────────────────────────────────────────────────────────────────────
@@ -237,7 +242,7 @@ jobs:
       # its own check. It was never required here, because it is too slow
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
-    if: always()
+    if: always() && (github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -256,13 +261,16 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          blocked = [
+              name for name, info in needs.items()
+              if info['result'] not in ('success', 'skipped')
+          ]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
               print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+          if blocked:
+              print(f'::error::{len(blocked)} job(s) did not complete: {\", \".join(blocked)}')
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "
@@ -280,7 +288,7 @@ jobs:
   ci-timings:
     name: CI timing report
     needs: [all-checks-pass]
-    if: always()
+    if: always() && (github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
