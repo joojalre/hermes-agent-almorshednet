@@ -331,6 +331,70 @@ def test_deleted_frozen_member_is_deferred_before_session_resolution(
     } == {"ops"}
 
 
+def test_profile_deleted_after_admission_is_deferred_and_peer_continues(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _ProfileRecordingRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("research", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Runtime profile fence",
+        members=[
+            {
+                "member_id": "research",
+                "profile": "research",
+                "handle": "research",
+            },
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "Report.", "thread_id": "thread-1"},
+    )
+    assert {
+        task["payload"]["target_profile"]
+        for task in driver.list_tasks(db, room_id="room-1")
+    } == {"research"}
+
+    service.local_profiles = lambda: ("default", "ops")
+    for _ in range(3):
+        service.runtime._run_cycle()
+
+    tasks = {
+        task["payload"]["target_profile"]: task
+        for task in driver.list_tasks(db, room_id="room-1")
+    }
+    assert tasks["research"]["status"] == "deferred"
+    assert tasks["research"]["result"] == {
+        "reason": "member_unavailable",
+        "retryable": True,
+    }
+    assert tasks["ops"]["status"] == "settled"
+    assert rpc.profile_calls == [
+        ("resolve_exact", "ops"),
+        ("create", "ops"),
+        ("submit", "ops"),
+    ]
+    events = service._events("room-1")
+    assert any(
+        event["kind"] == "turn.deferred"
+        and event["payload"]["member_id"] == "research"
+        and event["payload"]["reason"] == "member_unavailable"
+        for event in events
+    )
+    assert any(
+        event["kind"] == "message.member"
+        and event["payload"]["member_id"] == "ops"
+        for event in events
+    )
+
+
 def test_demotion_interrupts_inflight_turn_before_authority_changes(tmp_path: Path):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)

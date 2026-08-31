@@ -15,6 +15,7 @@ from types import ModuleType
 from typing import Any, Callable
 
 from gateway import hosted_room_driver as state
+from tui_gateway.hosted_room_driver import HostedRoomProfileUnavailableError
 from tui_gateway.transport import bind_transport, reset_transport
 
 
@@ -40,10 +41,28 @@ class HostedRoomSessionError(RuntimeError):
 class HostedRoomServerRPC:
     """Normalize the installed server handlers for :class:`HostedRoomRuntime`."""
 
-    def __init__(self, server: ModuleType) -> None:
+    def __init__(
+        self,
+        server: ModuleType,
+        *,
+        profile_available: Callable[[str], bool] | None = None,
+    ) -> None:
         self.server = server
+        self.profile_available = profile_available or (lambda _profile: True)
         self._ids = itertools.count(1)
         self._transport = _InternalDropTransport()
+
+    def _require_profile_available(self, profile: str) -> None:
+        try:
+            available = self.profile_available(profile)
+        except Exception as exc:
+            raise HostedRoomProfileUnavailableError(
+                "hosted room target profile availability could not be verified"
+            ) from exc
+        if not available:
+            raise HostedRoomProfileUnavailableError(
+                "hosted room target profile is unavailable"
+            )
 
     def _call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         handler = self.server._methods[method]
@@ -67,6 +86,7 @@ class HostedRoomServerRPC:
     def resolve_exact(
         self, *, profile: str, title: str, source: str
     ) -> Mapping[str, Any] | None:
+        self._require_profile_available(profile)
         result = self._call(
             "session.list",
             {
@@ -86,6 +106,7 @@ class HostedRoomServerRPC:
         return {"session_id": session_id, "title": row.get("title") or title}
 
     def create(self, *, profile: str, title: str, source: str) -> Mapping[str, Any]:
+        self._require_profile_available(profile)
         return self._call(
             "session.create",
             {
@@ -102,6 +123,7 @@ class HostedRoomServerRPC:
     def resume(
         self, *, profile: str, session_id: str, source: str
     ) -> Mapping[str, Any]:
+        self._require_profile_available(profile)
         return self._call(
             "session.resume",
             {
@@ -123,6 +145,7 @@ class HostedRoomServerRPC:
         execution_generation: int,
         on_terminal: Callable[[Mapping[str, Any]], None],
     ) -> Mapping[str, Any]:
+        self._require_profile_available(profile)
         try:
             return self._call(
                 "prompt.submit",
@@ -151,6 +174,7 @@ class HostedRoomServerRPC:
     def history(
         self, *, profile: str, session_id: str, source: str
     ) -> Sequence[Mapping[str, Any]]:
+        self._require_profile_available(profile)
         del source
         result = self._call(
             "session.history",
@@ -222,6 +246,7 @@ class HostedRoomServerRPC:
         source: str,
         expected_task_id: str,
     ) -> Mapping[str, Any] | None:
+        self._require_profile_available(profile)
         del source
         return self._call(
             "session.interrupt",

@@ -51,12 +51,16 @@ class HostedRoomService:
         self._policy_lock = threading.RLock()
         self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
         self.policy_checkpoint = HostedRoomPolicyCheckpoint(self.db_path)
-        self.rpc = HostedRoomServerRPC(server)
+        self.rpc = HostedRoomServerRPC(
+            server,
+            profile_available=self._profile_available,
+        )
         self.runtime = HostedRoomRuntime(
             db_path=self.db_path,
             rooms=self.bindings,
             rpc=self.rpc,
             turn_lock=self._turn_lock,
+            profile_available=self._profile_available,
             prepare_room=self.prepare_room,
             publish_terminal=self.publish_terminal,
             pending_action=self._set_pending_action,
@@ -77,6 +81,9 @@ class HostedRoomService:
                 path.name for path in profiles_dir.iterdir() if path.is_dir()
             )
         return tuple(sorted(profiles))
+
+    def _profile_available(self, profile: str) -> bool:
+        return profile in self.local_profiles()
 
     def bindings(self) -> tuple[HostedRoomBinding, ...]:
         local_gateway_id = hosted_rooms.local_authority_gateway_id()

@@ -45,6 +45,10 @@ class RoomSessionIdentityUnavailableError(RuntimeError):
     """The durable room registry could not safely resolve a session title."""
 
 
+class HostedRoomProfileUnavailableError(RuntimeError):
+    """The target profile disappeared before a hosted turn could be admitted."""
+
+
 class InternalSessionRPC(Protocol):
     """Normalized in-process session operations required by the room driver."""
 
@@ -126,6 +130,7 @@ class HostedRoomRuntime:
         rooms: Iterable[HostedRoomBinding] | Callable[[], Iterable[HostedRoomBinding]],
         turn_lock: Callable[[str], ContextManager[Any]],
         rpc: InternalSessionRPC,
+        profile_available: Callable[[str], bool] | None = None,
         prepare_room: Callable[[HostedRoomBinding], None] | None = None,
         publish_terminal: Callable[[HostedRoomBinding, Mapping[str, Any]], None]
         | None = None,
@@ -159,6 +164,7 @@ class HostedRoomRuntime:
         self.db_path = Path(db_path)
         self.rpc = rpc
         self.turn_lock = turn_lock
+        self.profile_available = profile_available or (lambda _profile: True)
         self.prepare_room = prepare_room
         self.publish_terminal = publish_terminal
         self.pending_action = pending_action
@@ -730,6 +736,18 @@ class HostedRoomRuntime:
             self._leases[lease.room_id] = renewed
         return renewed
 
+    def _require_profile_available(self, profile: str) -> None:
+        try:
+            available = self.profile_available(profile)
+        except Exception as exc:
+            raise HostedRoomProfileUnavailableError(
+                "hosted room target profile availability could not be verified"
+            ) from exc
+        if not available:
+            raise HostedRoomProfileUnavailableError(
+                "hosted room target profile is unavailable"
+            )
+
     def _execute_attempt(
         self,
         binding: HostedRoomBinding,
@@ -750,10 +768,12 @@ class HostedRoomRuntime:
                 else self.turn_lock(profile)
             )
             with lock_context:
+                self._require_profile_available(profile)
                 session = self._resolve_or_create(transport, profile, binding.room_id)
                 # An in-process submit should fail before admission or return
                 # after it, but an unexpected exception at that boundary is
                 # still ambiguous. Never terminalize it as a proven failure.
+                self._require_profile_available(profile)
                 submit_attempted = True
 
                 def on_terminal(receipt: Mapping[str, Any]) -> None:
@@ -850,6 +870,20 @@ class HostedRoomRuntime:
                     status=receipt.status,
                     result=receipt.result,
                     clock=self.clock,
+                )
+        except HostedRoomProfileUnavailableError:
+            try:
+                deferred = state.defer_running_task(
+                    self.db_path,
+                    attempt,
+                    reason="member_unavailable",
+                    clock=self.clock,
+                )
+                if self.publish_terminal is not None:
+                    self.publish_terminal(binding, deferred)
+            except (state.StaleLeaseError, state.StaleTaskError) as exc:
+                self._record_error(
+                    f"task {attempt.identity.task_id} profile deferral fenced: {exc}"
                 )
         except (state.StaleLeaseError, state.StaleTaskError) as exc:
             self._drop_lease(binding.room_id)

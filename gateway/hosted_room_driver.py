@@ -1225,6 +1225,62 @@ def settle_task(
         return _task_from_row(_load_task(conn, attempt.identity))
 
 
+def defer_running_task(
+    db_path: Path | str,
+    attempt: TaskAttempt,
+    *,
+    reason: Any,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Fence a running attempt that cannot safely reach its target profile."""
+
+    reason = _identifier(reason, label="defer_reason")
+    result_json = _canonical_json({"reason": reason, "retryable": True})
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        _require_active_lease(conn, attempt.lease, now=now)
+        row = _load_task(conn, attempt.identity)
+        exact_attempt = (
+            int(row["execution_generation"]) == attempt.execution_generation
+            and int(row["cancel_generation"]) == attempt.cancel_generation
+            and row["run_gateway_id"] == attempt.lease.gateway_id
+            and row["run_process_generation"] == attempt.lease.process_generation
+            and int(row["run_lease_generation"] or 0)
+            == attempt.lease.lease_generation
+        )
+        if (
+            row["status"] == "deferred"
+            and exact_attempt
+            and row["result_json"] == result_json
+        ):
+            return _task_from_row(row, idempotent=True)
+        if row["status"] != "running" or not exact_attempt:
+            raise StaleTaskError("task attempt is stale or cancelled")
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='deferred', result_json=?, terminal_at=?, updated_at=?
+               WHERE room_id=? AND task_id=? AND status='running'
+                 AND execution_generation=? AND cancel_generation=?
+                 AND run_gateway_id=? AND run_process_generation=?
+                 AND run_lease_generation=?""",
+            (
+                result_json,
+                now,
+                now,
+                attempt.identity.room_id,
+                attempt.identity.task_id,
+                attempt.execution_generation,
+                attempt.cancel_generation,
+                attempt.lease.gateway_id,
+                attempt.lease.process_generation,
+                attempt.lease.lease_generation,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StaleTaskError("task changed during deferral")
+        return _task_from_row(_load_task(conn, attempt.identity))
+
+
 def settle_stopping_task(
     db_path: Path | str,
     identity: TaskIdentity,

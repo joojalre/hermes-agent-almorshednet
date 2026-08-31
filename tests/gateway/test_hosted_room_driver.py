@@ -810,6 +810,56 @@ def test_indeterminate_retry_is_explicit_and_advances_execution_generation(db):
     assert retried.execution_generation == original.execution_generation + 1
 
 
+def test_running_task_profile_deferral_preserves_attempt_fences(db):
+    clock = FakeClock()
+    identity = _identity()
+    lease = _lease(db, clock)
+    _admit(db, identity, clock)
+    attempt = driver.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+
+    deferred = driver.defer_running_task(
+        db,
+        attempt,
+        reason="member_unavailable",
+        clock=clock,
+    )
+    repeated = driver.defer_running_task(
+        db,
+        attempt,
+        reason="member_unavailable",
+        clock=clock,
+    )
+    requeued = driver.requeue_deferred_task(
+        db,
+        identity,
+        lease,
+        expected_execution_generation=attempt.execution_generation,
+        expected_cancel_generation=attempt.cancel_generation,
+        clock=clock,
+    )
+
+    assert deferred["status"] == "deferred"
+    assert deferred["result"] == {
+        "reason": "member_unavailable",
+        "retryable": True,
+    }
+    assert repeated["idempotent"] is True
+    assert requeued["status"] == "queued"
+    with pytest.raises(driver.StaleTaskError):
+        driver.defer_running_task(
+            db,
+            attempt,
+            reason="member_unavailable",
+            clock=clock,
+        )
+
+
 def test_indeterminate_task_can_be_deferred_retried_and_cancelled(db):
     clock = FakeClock()
     identity = _identity()

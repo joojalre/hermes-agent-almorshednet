@@ -475,6 +475,69 @@ def test_queued_task_routes_profile_and_credentials_without_overrides(db: Path):
     assert state.get_task(db, identity)["result"]["text"] == "Finished once."
 
 
+def test_profile_deleted_after_admission_defers_without_session_fallback(db: Path):
+    deleted_profile = "deleted"
+    unavailable = state.TaskIdentity(
+        room_id=ROOM_ID,
+        task_id="task-unavailable",
+        thread_id="thread-1",
+        turn_id="turn-unavailable",
+    )
+    healthy = state.TaskIdentity(
+        room_id=ROOM_ID,
+        task_id="task-healthy",
+        thread_id="thread-1",
+        turn_id="turn-healthy",
+    )
+    state.admit_task(
+        db,
+        unavailable,
+        payload={
+            "target_profile": deleted_profile,
+            "prompt": "Do not fall back to the launch profile.",
+            "source_event_seq": 1,
+        },
+        clock=time.time,
+    )
+    state.admit_task(
+        db,
+        healthy,
+        payload={
+            "target_profile": PROFILE,
+            "prompt": "Continue with the healthy member.",
+            "source_event_seq": 2,
+        },
+        clock=time.time,
+    )
+    available_profiles = {deleted_profile, PROFILE}
+    rpc = FakeSessionRPC()
+    published: list[dict[str, Any]] = []
+    runtime = _runtime(
+        db,
+        rpc,
+        profile_available=lambda profile: profile in available_profiles,
+        publish_terminal=lambda _binding, task: published.append(dict(task)),
+    )
+
+    available_profiles.remove(deleted_profile)
+    runtime._process_room(BINDING)
+
+    deferred = state.get_task(db, unavailable)
+    assert deferred["status"] == "deferred"
+    assert deferred["result"] == {
+        "reason": "member_unavailable",
+        "retryable": True,
+    }
+    assert state.get_task(db, healthy)["status"] == "settled"
+    profile_calls = [
+        params["profile"]
+        for method, params in rpc.calls
+        if method in {"resolve_exact", "create", "resume", "submit"}
+    ]
+    assert profile_calls == [PROFILE, PROFILE, PROFILE]
+    assert [task["status"] for task in published] == ["deferred", "settled"]
+
+
 def test_worker_settles_without_any_client_transport(db: Path):
     identity = _identity()
     _admit(db, identity)
@@ -1235,9 +1298,14 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     assert stopping["status"] == "stopping"
     assert state.get_task(db, identity)["status"] == "stopping"
     assert worker_failure_recorded.wait(1.0)
+    with runtime._status_lock:
+        room_worker = runtime._room_threads[ROOM_ID]
+    release_worker.set()
+    runtime.wakeup()
+    room_worker.join(1.0)
+    assert not room_worker.is_alive()
     cycles = runtime.status()["cycles"]
     runtime.wakeup()
-    release_worker.set()
     _wait_for(lambda: runtime.status()["cycles"] > cycles)
     _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
     assert attempts >= 3

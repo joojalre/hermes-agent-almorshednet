@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.hosted_room_driver import TaskIdentity
+from tui_gateway.hosted_room_driver import HostedRoomProfileUnavailableError
 from tui_gateway.hosted_room_server_rpc import (
     HostedRoomServerRPC,
     HostedRoomSessionError,
@@ -91,6 +92,19 @@ def test_routes_exact_hidden_session_and_internal_task_proof():
     rpc.resume(profile="ops", session_id="stored", source="bot_room")
     resume = next(params for method, params in calls if method == "session.resume")
     assert resume["source"] == "bot_room"
+
+
+def test_unavailable_profile_is_rejected_before_any_server_handler():
+    server, calls = _server()
+    rpc = HostedRoomServerRPC(
+        server,
+        profile_available=lambda profile: profile == "default",
+    )
+
+    with pytest.raises(HostedRoomProfileUnavailableError):
+        rpc.resolve_exact(profile="deleted", title="Group: room", source="bot_room")
+
+    assert calls == []
 
 
 def test_handler_calls_use_a_private_drop_transport_and_restore_the_caller():
