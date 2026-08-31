@@ -194,11 +194,18 @@ class HostedRoomService:
                 raise RuntimeError("hosted room replay cursor did not advance")
             cursor = next_cursor
 
-    def _append_plan(self, room_id: str, plan: discussion.PublicationPlan) -> None:
-        hosted_rooms.append_events(
+    def _append_plan(
+        self,
+        room_id: str,
+        plan: discussion.PublicationPlan,
+        *,
+        expected_latest_seq: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return hosted_rooms.append_events(
             self.db_path,
             events=[event.append_kwargs(room_id) for event in plan.events],
             allow_terminal_recovery=True,
+            expected_latest_seq=expected_latest_seq,
         )
 
     def _policy_snapshot(self, room: Mapping[str, Any]) -> PolicySnapshot:
@@ -213,6 +220,7 @@ class HostedRoomService:
     ) -> bool:
         changed = False
         local_profiles = self.local_profiles()
+        expected_latest_seq = int(room["latest_seq"])
         for status in ("deferred", "settled", "failed", "cancelled"):
             for task in driver.list_tasks(
                 self.db_path,
@@ -250,7 +258,15 @@ class HostedRoomService:
                     ),
                     local_profiles=local_profiles,
                 )
-                self._append_plan(str(room["room_id"]), publication)
+                appended = self._append_plan(
+                    str(room["room_id"]),
+                    publication,
+                    expected_latest_seq=expected_latest_seq,
+                )
+                expected_latest_seq = max(
+                    expected_latest_seq,
+                    *(int(event["seq"]) for event in appended),
+                )
                 changed = True
         return changed
 
@@ -414,13 +430,14 @@ class HostedRoomService:
         require_acknowledged: bool = False,
     ) -> int:
         room = self._owned_room(room_id)
-        hosted_rooms.request_room_stop(
+        stop_event = hosted_rooms.request_room_stop(
             self.db_path,
             room_id=room_id,
             cancel_id=cancel_id,
             expected_gateway_id=str(room["authority_gateway_id"]),
             expected_epoch=int(room["authority_epoch"]),
         )
+        stop_seq = int(stop_event["seq"])
         cancelled = 0
         pending = 0
         with self._policy_lock:
@@ -437,6 +454,8 @@ class HostedRoomService:
                     room_id=room_id,
                     status=status,
                 ):
+                    if int(task["payload"]["source_event_seq"]) > stop_seq:
+                        continue
                     identity = task["identity"]
                     tasks[(identity.room_id, identity.task_id)] = task
             for task in tasks.values():

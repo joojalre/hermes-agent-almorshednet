@@ -1352,7 +1352,11 @@ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
 
     assert cancelled["status"] == "stopping"
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
-    assert not [call for call in rpc.calls if call[0] == "interrupt_skipped"]
+    assert all(
+        call[1]["expected_task_id"] == identity.task_id
+        for call in rpc.calls
+        if call[0] == "interrupt_skipped"
+    )
     assert rpc.states[session_id]["active"] is True
     assert rpc.states[session_id]["task_id"] == "task-2"
     assert runtime.stop(timeout=1.0)
