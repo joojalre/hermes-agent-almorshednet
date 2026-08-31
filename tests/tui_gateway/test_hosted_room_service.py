@@ -89,6 +89,28 @@ class _PromptRecordingRPC(_FakeRPC):
         return {"accepted": True}
 
 
+class _ProfileRecordingRPC(_PromptRecordingRPC):
+    def __init__(self) -> None:
+        super().__init__()
+        self.profile_calls: list[tuple[str, str]] = []
+
+    def resolve_exact(self, *, profile, title, source):
+        self.profile_calls.append(("resolve_exact", profile))
+        return super().resolve_exact(profile=profile, title=title, source=source)
+
+    def create(self, *, profile, title, source):
+        self.profile_calls.append(("create", profile))
+        return super().create(profile=profile, title=title, source=source)
+
+    def resume(self, *, profile, session_id, source):
+        self.profile_calls.append(("resume", profile))
+        return super().resume(profile=profile, session_id=session_id, source=source)
+
+    def submit(self, **kwargs):
+        self.profile_calls.append(("submit", kwargs["profile"]))
+        return super().submit(**kwargs)
+
+
 class _BlockingFirstRPC(_PromptRecordingRPC):
     def __init__(self) -> None:
         super().__init__()
@@ -253,6 +275,60 @@ def test_profile_deleted_after_planning_is_deferred_before_admission(tmp_path: P
     )
     assert deferred["payload"]["reason"] == "member_unavailable"
     assert rpc.sessions == {}
+
+
+def test_deleted_frozen_member_is_deferred_before_session_resolution(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _ProfileRecordingRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("research", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Frozen roster",
+        members=[
+            {
+                "member_id": "research",
+                "profile": "research",
+                "handle": "research",
+            },
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+
+    # The persisted roster remains valid, but the deleted profile must never
+    # reach session resolution where it could fall back to the launch profile.
+    service.local_profiles = lambda: ("default", "ops")
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "Report.", "thread_id": "thread-1"},
+    )
+    for _ in range(3):
+        service.runtime._run_cycle()
+
+    events = service._events("room-1")
+    deferred = next(event for event in events if event["kind"] == "turn.deferred")
+    assert deferred["payload"]["member_id"] == "research"
+    assert deferred["payload"]["reason"] == "member_unavailable"
+    assert rpc.profile_calls == [
+        ("resolve_exact", "ops"),
+        ("create", "ops"),
+        ("submit", "ops"),
+    ]
+    assert [profile for profile, _prompt in rpc.prompts] == ["ops"]
+    assert any(
+        event["kind"] == "message.member"
+        and event["payload"]["member_id"] == "ops"
+        for event in events
+    )
+    assert {
+        task["payload"]["target_profile"]
+        for task in driver.list_tasks(db, room_id="room-1")
+    } == {"ops"}
 
 
 def test_demotion_interrupts_inflight_turn_before_authority_changes(tmp_path: Path):

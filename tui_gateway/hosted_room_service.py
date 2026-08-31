@@ -321,12 +321,41 @@ class HostedRoomService:
                 for status in ("queued", "running", "stopping")
             ):
                 return
+            local_profiles = self.local_profiles()
             decision = discussion.plan_next_task(
                 room,
                 events,
-                local_profiles=self.local_profiles(),
+                local_profiles=local_profiles,
                 initial_watermarks=snapshot.watermarks,
             )
+            while decision.status == "task" and decision.task is not None:
+                local_profiles = self.local_profiles()
+                unavailable = discussion.plan_unavailable_member_deferral(
+                    room,
+                    events,
+                    decision.task,
+                    local_profiles=local_profiles,
+                )
+                if unavailable is None:
+                    break
+                self._append_plan(
+                    binding.room_id,
+                    unavailable,
+                    expected_latest_seq=int(room["latest_seq"]),
+                )
+                room = hosted_rooms.room_state(
+                    self.db_path,
+                    room_id=binding.room_id,
+                )
+                snapshot = self._policy_snapshot(room)
+                events = list(snapshot.events)
+                local_profiles = self.local_profiles()
+                decision = discussion.plan_next_task(
+                    room,
+                    events,
+                    local_profiles=local_profiles,
+                    initial_watermarks=snapshot.watermarks,
+                )
             if decision.status == "task" and decision.task is not None:
                 current_profiles = self.local_profiles()
                 if decision.task.member.profile not in current_profiles:

@@ -1268,6 +1268,31 @@ def plan_next_task(
     raise AssertionError("bounded Discussion loop exhausted unexpectedly")
 
 
+def plan_unavailable_member_deferral(
+    room_value: Any,
+    events: Sequence[Mapping[str, Any]],
+    task: DiscussionTaskPlan,
+    *,
+    local_profiles: Iterable[str],
+) -> PublicationPlan | None:
+    """Defer a frozen member whose profile disappeared before admission."""
+
+    available_profiles = {
+        _identifier(profile, label="local profile") for profile in local_profiles
+    }
+    if task.member.profile in available_profiles:
+        return None
+    return plan_publication(
+        room_value,
+        events,
+        task,
+        status="deferred",
+        result={"reason": "member_unavailable"},
+        execution_generation=1,
+        local_profiles=available_profiles,
+    )
+
+
 def reconstruct_task_plan(
     room_value: Any,
     events: Sequence[Mapping[str, Any]],
