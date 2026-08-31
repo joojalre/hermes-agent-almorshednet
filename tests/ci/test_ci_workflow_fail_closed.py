@@ -118,6 +118,41 @@ def test_contributor_attribution_is_upstream_only():
 
 
 @pytest.mark.parametrize(
+    ("workflow_name", "job_name"),
+    [
+        ("js-tests.yml", "check"),
+        ("rust-tests.yml", "bootstrap-installer"),
+    ],
+)
+def test_fork_heavy_linux_jobs_use_standard_runners(
+    workflow_name: str, job_name: str
+):
+    """Fork jobs must not wait for runner labels owned by the upstream repo."""
+    runner = str(_workflow(workflow_name)["jobs"][job_name]["runs-on"])
+    normalized = re.sub(r"\s+", "", runner)
+
+    assert normalized == (
+        "${{github.repository=='NousResearch/hermes-agent'"
+        "&&'ubuntu-latest-32-core'||'ubuntu-latest'}}"
+    )
+
+
+def test_fork_os_jobs_use_standard_runners():
+    """OS lanes must retain coverage when upstream-only labels are unavailable."""
+    job = _workflow("tests-os.yml")["jobs"]["os-tests"]
+    normalized = re.sub(r"\s+", "", str(job["runs-on"]))
+    rows = {row["name"]: row for row in job["strategy"]["matrix"]["include"]}
+
+    assert normalized == (
+        "${{github.repository=='NousResearch/hermes-agent'"
+        "&&matrix.runner||matrix.fork_runner}}"
+    )
+    assert rows["macOS-only tests"]["fork_runner"] == "macos-latest"
+    assert rows["Windows-only tests"]["runner"] == "windows-latest-32-core"
+    assert rows["Windows-only tests"]["fork_runner"] == "windows-latest"
+
+
+@pytest.mark.parametrize(
     ("workflow_name", "job_name", "must_run_after_failed_needs"),
     [
         ("ci.yaml", "detect", False),
