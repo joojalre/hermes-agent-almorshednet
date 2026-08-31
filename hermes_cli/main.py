@@ -10067,6 +10067,18 @@ def _interpreter_scripts_dir() -> Path | None:
     return exe.parent if exe.parent.is_dir() else None
 
 
+_UPDATE_SECURITY_REQUIREMENTS = ("h2==4.4.1",)
+
+
+def _with_update_security_requirements(args: list[str]) -> list[str]:
+    """Return an install command that cannot bypass update security pins."""
+    command = [*args]
+    for requirement in _UPDATE_SECURITY_REQUIREMENTS:
+        if requirement not in command:
+            command.append(requirement)
+    return command
+
+
 def _install_python_dependencies_with_optional_fallback(
     install_cmd_prefix: list[str],
     *,
@@ -10092,6 +10104,10 @@ def _install_python_dependencies_with_optional_fallback(
     installs (#71510 fixed the ZIP path, #83335 fixed lazy-deps; this closes the
     shared helper for the remaining callers).
     """
+    # ``managed_python_env()`` deliberately sets UV_NO_CONFIG=1, and pip does
+    # not read ``[tool.uv].override-dependencies`` at all.  Keep this explicit
+    # request on every primary and fallback install so an existing vulnerable
+    # transitive h2 cannot satisfy a broad consumer range during an update.
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     # A pip / site-packages install has no PROJECT_ROOT/venv; the caller still
@@ -10122,6 +10138,7 @@ def _install_python_dependencies_with_optional_fallback(
             scripts_dir = _interpreter_scripts_dir()
 
     def _install(args: list[str]) -> None:
+        args = _with_update_security_requirements(args)
         if pin_python:
             args = _insert_python_pin(args)
         # strict_quarantine: this is the UPDATE dependency sync. A shim that
@@ -10245,7 +10262,9 @@ def _verify_console_scripts_installed(
 
     try:
         _run_quarantined_install(
-            install_cmd_prefix + ["install", "--reinstall", "-e", "."],
+            _with_update_security_requirements(
+                install_cmd_prefix + ["install", "--reinstall", "-e", "."]
+            ),
             env=env,
             scripts_dir=scripts_dir,
         )
@@ -10399,7 +10418,9 @@ def _verify_core_dependencies_installed(
     repair_args = ["install", "--reinstall", "-e", "."]
     try:
         _run_quarantined_install(
-            install_cmd_prefix + repair_args, env=env, scripts_dir=scripts_dir
+            _with_update_security_requirements(install_cmd_prefix + repair_args),
+            env=env,
+            scripts_dir=scripts_dir,
         )
     except subprocess.CalledProcessError as e:
         logger.warning("dep verification: repair install failed: %s", e)
@@ -10430,7 +10451,10 @@ def _verify_core_dependencies_installed(
     )
     try:
         _run_install_with_heartbeat(
-            install_cmd_prefix + ["install", "--reinstall", *specs], env=env
+            _with_update_security_requirements(
+                install_cmd_prefix + ["install", "--reinstall", *specs]
+            ),
+            env=env,
         )
     except subprocess.CalledProcessError as e:
         logger.warning("dep verification: per-package repair failed: %s", e)

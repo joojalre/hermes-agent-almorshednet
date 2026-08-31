@@ -178,6 +178,106 @@ def test_apply_and_verify_are_idempotent_and_do_not_touch_user(tmp_path, monkeyp
     assert knowledge._verify(verify) == 0
 
 
+def test_only_current_records_are_rendered_but_all_are_audited(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("existing", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manifest = _manifest(
+        tmp_path / "status-filter.json",
+        records=[
+            {
+                "id": "current",
+                "domain": "routing",
+                "statement": "Current routing fact.",
+                "source_id": "local-doc",
+                "status": "CURRENT",
+            },
+            {
+                "id": "pending",
+                "domain": "routing",
+                "statement": "Pending routing fact.",
+                "source_id": "local-doc",
+                "status": "PENDING",
+            },
+            {
+                "id": "archived",
+                "domain": "routing",
+                "statement": "Archived routing fact.",
+                "source_id": "local-doc",
+                "status": "ARCHIVED",
+            },
+            {
+                "id": "external",
+                "domain": "routing",
+                "statement": "External routing fact.",
+                "source_id": "local-doc",
+                "status": "EXTERNAL",
+            },
+        ],
+    )
+
+    args = SimpleNamespace(
+        manifest=str(manifest), dry_run=False, apply=True, json=True
+    )
+    assert knowledge._sync(args) == 0
+
+    rendered = (memories / "MEMORY.md").read_text(encoding="utf-8")
+    assert "Current routing fact." in rendered
+    assert "Pending routing fact." not in rendered
+    assert "Archived routing fact." not in rendered
+    assert "External routing fact." not in rendered
+
+    event = json.loads(
+        (home / "knowledge" / "knowledge-sync.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    assert {record["status"] for record in event["records"]} == {
+        "CURRENT",
+        "PENDING",
+        "ARCHIVED",
+        "EXTERNAL",
+    }
+
+
+def test_reused_run_id_with_changed_manifest_is_refused_before_write(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    memory_path = memories / "MEMORY.md"
+    memory_path.write_text("existing", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manifest = _manifest(tmp_path / "duplicate-run.json")
+    args = SimpleNamespace(
+        manifest=str(manifest), dry_run=False, apply=True, json=True
+    )
+
+    assert knowledge._sync(args) == 0
+    capsys.readouterr()
+    audit_path = home / "knowledge" / "knowledge-sync.jsonl"
+    backup_path = home / "knowledge" / "backups" / "test-run-001" / "MEMORY.md"
+    before_memory = memory_path.read_bytes()
+    before_audit = audit_path.read_bytes()
+    before_backup = backup_path.read_bytes()
+
+    changed = json.loads(manifest.read_text(encoding="utf-8"))
+    changed["records"][0]["statement"] = "Changed fact under a reused run id."
+    manifest.write_text(json.dumps(changed), encoding="utf-8")
+
+    assert knowledge._sync(args) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "run_id test-run-001 was already used for a different manifest" in error
+    assert memory_path.read_bytes() == before_memory
+    assert audit_path.read_bytes() == before_audit
+    assert backup_path.read_bytes() == before_backup
+
+
 def test_secrets_and_instructions_are_rejected(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     (home / "memories").mkdir(parents=True)

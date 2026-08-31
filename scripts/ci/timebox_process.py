@@ -114,7 +114,8 @@ class _DescendantTracker:
 
     def stop(self) -> list[psutil.Process]:
         self._stop_event.set()
-        self._thread.join(timeout=max(1.0, self._refresh_seconds * 2))
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(1.0, self._refresh_seconds * 2))
         self._refresh()
         with self._lock:
             return list(self._tracked.values())
@@ -200,53 +201,46 @@ def run_with_timebox(
     tracker_factory: Callable[[int], _ProcessTracker] = _DescendantTracker,
 ) -> int:
     """Run *command* and terminate its complete process tree on timeout."""
-    process = popen(list(command), start_new_session=os.name != "nt")
-    tracker = tracker_factory(process.pid)
-    tracker.start()
+    process: subprocess.Popen[bytes] | None = None
+    tracker: _ProcessTracker | None = None
+
+    def stop_tracker() -> list[psutil.Process]:
+        return tracker.stop() if tracker is not None else []
+
+    def terminate_process_tree(initial_signal: int) -> None:
+        if process is None:
+            return
+        _terminate_complete_tree(
+            process,
+            descendants=stop_tracker(),
+            initial_signal=initial_signal,
+            grace_seconds=grace_seconds,
+            terminate_group=terminate_group,
+        )
+
     try:
+        process = popen(list(command), start_new_session=os.name != "nt")
+        tracker = tracker_factory(process.pid)
+        tracker.start()
         result = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         print(
             f"::error::Fork test shard exceeded the {timeout_seconds}-second watchdog.",
             flush=True,
         )
-        _terminate_complete_tree(
-            process,
-            descendants=tracker.stop(),
-            initial_signal=signal.SIGTERM,
-            grace_seconds=grace_seconds,
-            terminate_group=terminate_group,
-        )
+        terminate_process_tree(signal.SIGTERM)
         return TIMEOUT_EXIT_CODE
     except _CancellationSignal as cancellation:
-        _terminate_complete_tree(
-            process,
-            descendants=tracker.stop(),
-            initial_signal=cancellation.signal_number,
-            grace_seconds=grace_seconds,
-            terminate_group=terminate_group,
-        )
+        terminate_process_tree(cancellation.signal_number)
         raise
     except KeyboardInterrupt:
-        _terminate_complete_tree(
-            process,
-            descendants=tracker.stop(),
-            initial_signal=signal.SIGINT,
-            grace_seconds=grace_seconds,
-            terminate_group=terminate_group,
-        )
+        terminate_process_tree(signal.SIGINT)
         raise
     except BaseException:
-        _terminate_complete_tree(
-            process,
-            descendants=tracker.stop(),
-            initial_signal=signal.SIGTERM,
-            grace_seconds=grace_seconds,
-            terminate_group=terminate_group,
-        )
+        terminate_process_tree(signal.SIGTERM)
         raise
     else:
-        tracker.stop()
+        stop_tracker()
         return result
 
 
