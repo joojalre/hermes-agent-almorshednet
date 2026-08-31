@@ -45,7 +45,7 @@ AUDIT_FILENAME = "knowledge-sync.jsonl"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
-_CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _SECRET_VALUE_RE = re.compile(
     r"(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|password|private[_ -]?key|cookie)\s*[:=]\s*[^\s,;]{8,}",
     re.IGNORECASE,
@@ -161,6 +161,10 @@ _ARABIC_UNVOCALIZED_PAST_RE = re.compile(
     rf"[.!؟]?\s*$",
     re.IGNORECASE,
 )
+_ARABIC_COURTESY_CONTEXT_RE = re.compile(
+    r"(?:يرجى|الرجاء|من\s+فضلك)",
+    re.IGNORECASE,
+)
 _PRESENTATION_PREFIX_RE = re.compile(
     r"^\s*(?:(?:[-*+>•]|\d{1,3}[.)])\s+|\[(?: |x|X)\]\s+|"
     r"[\"'`“”‘’]\s*){0,4}"
@@ -234,7 +238,10 @@ def _scan_text(value: str, *, field: str) -> str | None:
 def _is_instruction_like(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = _PRESENTATION_PREFIX_RE.sub("", normalized, count=1)
-    if _ARABIC_UNVOCALIZED_PAST_RE.search(normalized):
+    if (
+        _ARABIC_UNVOCALIZED_PAST_RE.search(normalized)
+        and not _ARABIC_COURTESY_CONTEXT_RE.search(normalized)
+    ):
         return False
     if _INSTRUCTION_RE.search(normalized):
         return True
@@ -849,6 +856,7 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
         raise KnowledgeError("knowledge audit is malformed")
 
     records = event["records"]
+    record_ids = [item["id"] for item in records]
     conflicting_records = {
         (item["id"], item["fact_key"])
         for item in records
@@ -859,6 +867,10 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
     ]
     if (
         len(records) > MAX_RECORD_COUNT
+        or (
+            event["schema_version"] >= AUDIT_SCHEMA_VERSION
+            and len(record_ids) != len(set(record_ids))
+        )
         or any(
             not _ID_RE.fullmatch(item["id"])
             or len(item["fact_key"]) > MAX_ID_CHARS
