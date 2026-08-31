@@ -108,6 +108,15 @@ def test_fork_python_suite_has_a_process_tree_watchdog():
     assert "HERMES_TEST_SLICE" not in run_tests.get("env", {})
 
 
+def test_contributor_attribution_is_upstream_only():
+    """Fork syncs must not republish upstream contributor email mappings."""
+    condition = str(_ci_workflow()["jobs"]["contributor-check"]["if"])
+    normalized = re.sub(r"\s+", "", condition)
+
+    assert "needs.detect.outputs.python=='true'" in normalized
+    assert "github.repository=='NousResearch/hermes-agent'" in normalized
+
+
 @pytest.mark.parametrize(
     ("workflow_name", "job_name", "must_run_after_failed_needs"),
     [
