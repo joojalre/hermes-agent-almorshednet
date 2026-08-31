@@ -2579,7 +2579,27 @@ def _run_single_child(
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
-    Returns a structured result dict.
+    Returns a structured result dict with a ``status`` and ``exit_reason``
+    that are derived honestly from the child's structured completion fields.
+
+    ``status`` ∈ {``"completed"``, ``"interrupted"``, ``"failed"``}:
+        * ``"completed"``  — the child reached a normal finish (may still have
+          hit its iteration budget; see ``exit_reason``).
+        * ``"interrupted"`` — the child was interrupted (``interrupted=True``).
+        * ``"failed"``    — a structured failure (``failed=True`` or a non-empty
+          ``error``) or a summary-less/invalid terminal state.
+
+    ``exit_reason`` ∈ {``"completed"``, ``"max_iterations"``, ``"interrupted"``,
+    ``"error"``}:
+        * ``"completed"``       — normal finish.
+        * ``"max_iterations"``  — genuine per-child iteration-budget exhaustion
+          (``completed=False`` with no failure fields).
+        * ``"interrupted"``     — interrupted by the parent.
+        * ``"error"``           — provider rejection / terminal failure; NOT
+          budget exhaustion (this is the case #97655 fixed).
+
+    ``truncated`` is derived as ``exit_reason == "max_iterations"`` only, so the
+    parent-visible truncation flag stays truthful for all of the above.
     """
     child_start = time.monotonic()
 
@@ -3164,13 +3184,14 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif result.get("failed"):
-            # The child's conversation loop aborted (non-retryable HTTP
-            # error, retries exhausted, billing wall). final_response holds
-            # the error summary in this shape, NOT usable output — without
-            # this branch a provider 404/400 was classified "completed" with
-            # the error text as its summary, so no surface ever saw a
-            # failure (community report, Aug 2026).
+        elif result.get("failed") or result.get("error"):
+            # A structured failure (provider rejection / terminal exception)
+            # must WIN over the summary-presence heuristic below. The child's
+            # conversation loop returns the error text as final_response, so an
+            # error-shaped summary would otherwise be labeled "completed" here
+            # despite completed=False. The heuristic is only a fallback for
+            # legacy/mock results that omit the structured failure fields.
+            # (Community report Aug 2026; #97655.)
             status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
@@ -3221,9 +3242,15 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif result.get("failed") or result.get("error"):
+            # Provider rejection / terminal failure. Do NOT report this as
+            # iteration-budget exhaustion — "max_iterations" is only truthful
+            # when the child actually hit its per-delegation iteration cap.
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
+            # Genuine budget exhaustion: completed=False with no failure.
             exit_reason = "max_iterations"
 
         # Extract token counts (safe for mock objects)
@@ -3231,6 +3258,10 @@ def _run_single_child(
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
 
+        # --- result entry contract (see _run_single_child docstring) ---
+        # status ∈ {completed, interrupted, failed}
+        # exit_reason ∈ {completed, max_iterations, interrupted, error}
+        # truncated is exactly (exit_reason == "max_iterations").
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "status": status,
