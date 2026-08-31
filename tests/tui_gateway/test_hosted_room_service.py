@@ -1403,8 +1403,8 @@ def test_demote_retry_stops_newer_turn_before_authority_transfer(
         for event in service._events("room-1")
         if event["kind"] == "room.stop_requested"
     ]
-    assert len(stop_ids) == 2
-    assert len(set(stop_ids)) == 2
+    assert len(stop_ids) == 3
+    assert len(set(stop_ids)) == 3
     assert any(
         event["kind"] == "authority.lost" for event in service._events("room-1")
     )
