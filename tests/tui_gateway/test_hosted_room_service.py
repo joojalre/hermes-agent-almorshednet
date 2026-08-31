@@ -1481,7 +1481,7 @@ def test_demote_retry_stops_newer_turn_before_authority_transfer(
         room_id="room-1",
         gateway_id=binding.gateway_id,
         authority_epoch=binding.authority_epoch,
-        process_generation="worker",
+        process_generation=service.runtime.process_generation,
         ttl_seconds=30,
         clock=time.time,
     )
