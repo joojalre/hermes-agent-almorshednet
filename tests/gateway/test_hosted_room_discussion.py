@@ -703,6 +703,48 @@ def test_malformed_or_remote_roster_is_rejected(members: list[dict], match: str)
         discussion.validate_roster(members, local_profiles=LOCAL_PROFILES)
 
 
+def test_frozen_roster_replay_survives_deleted_member_profile(room_db):
+    db, room = room_db
+    available_profiles = LOCAL_PROFILES[1:]
+    _append_user(db, event_id="user-1", text="Report.")
+
+    first = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=available_profiles,
+    )
+    assert first.status == "task"
+    assert first.task is not None
+    assert first.task.member.profile == LOCAL_PROFILES[0]
+
+    deferred = discussion.plan_publication(
+        room,
+        _events(db),
+        first.task,
+        status="deferred",
+        result={"reason": "member_unavailable"},
+        execution_generation=1,
+        local_profiles=available_profiles,
+    )
+    _append_publication(db, deferred)
+
+    second = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=available_profiles,
+    )
+    assert second.status == "task"
+    assert second.task is not None
+    assert second.task.member.profile == LOCAL_PROFILES[1]
+
+
+def test_validate_room_remains_strict_for_current_policy_inputs(room_db):
+    _db, room = room_db
+
+    with pytest.raises(discussion.DiscussionValidationError, match="is not local"):
+        discussion.validate_room(room, local_profiles=LOCAL_PROFILES[1:])
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -553,7 +553,7 @@ def test_cancellation_fences_late_success(db):
         )
 
 
-def test_stop_intent_fences_pending_approval_decision(db):
+def test_approval_requests_are_stale_once_task_is_stopping(db):
     clock = FakeClock()
     identity = _identity()
     lease = _lease(db, clock)
@@ -569,32 +569,43 @@ def test_stop_intent_fences_pending_approval_decision(db):
         db,
         identity,
         execution_generation=attempt.execution_generation,
-        member_id="ops",
+        member_id="member-ops",
         request_id="approval-1",
         session_id="session-1",
-        action={"command": "deploy --dry-run"},
+        action={"tool": "shell", "command": "inspect"},
         clock=clock,
     )
 
     driver.begin_task_cancel(
         db,
         identity,
-        cancel_id="cancel-approval",
-        expected_cancel_generation=attempt.cancel_generation,
+        cancel_id="cancel-before-approval",
+        expected_cancel_generation=0,
         clock=clock,
     )
 
-    with pytest.raises(driver.StaleTaskError, match="running task"):
+    assert driver.list_pending_approval_requests(db, room_id="room-1") == []
+    with pytest.raises(driver.StaleTaskError, match="no longer running"):
         driver.decide_approval_request(
             db,
             identity,
             execution_generation=attempt.execution_generation,
-            member_id="ops",
+            member_id="member-ops",
             request_id="approval-1",
             choice="once",
             clock=clock,
         )
-
+    with pytest.raises(driver.InvalidTaskTransitionError, match="running task"):
+        driver.publish_approval_request(
+            db,
+            identity,
+            execution_generation=attempt.execution_generation,
+            member_id="member-ops",
+            request_id="approval-2",
+            session_id="session-1",
+            action={"tool": "shell", "command": "inspect again"},
+            clock=clock,
+        )
     with sqlite3.connect(db) as conn:
         choice = conn.execute(
             """SELECT choice FROM hosted_room_approval_requests
@@ -604,7 +615,7 @@ def test_stop_intent_fences_pending_approval_decision(db):
                 identity.room_id,
                 identity.task_id,
                 attempt.execution_generation,
-                "ops",
+                "member-ops",
                 "approval-1",
             ),
         ).fetchone()[0]

@@ -480,52 +480,38 @@ class HostedRoomService:
 
     def demote_room(
         self,
-        room_id: str,
+        room_id: Any,
         *,
         observed_gateway_id: Any,
         observed_epoch: Any,
     ) -> dict[str, Any]:
-        """Fence local authority only after every accepted turn stops exactly."""
+        """Stop accepted local work before committing a newer authority."""
 
-        from gateway.hosted_room_replicas import demote_room as commit_demotion
-        from gateway.hosted_rooms import MAX_ACTOR_ID_CHARS, _validate_identifier
-
-        normalized_gateway_id = _validate_identifier(
-            observed_gateway_id,
-            label="observed_gateway_id",
-            max_chars=MAX_ACTOR_ID_CHARS,
+        from gateway.hosted_room_replicas import (
+            demote_room,
+            validate_demotion_observation,
         )
-        if (
-            isinstance(observed_epoch, bool)
-            or not isinstance(observed_epoch, int)
-            or observed_epoch < 1
-        ):
-            return commit_demotion(
-                self.db_path,
-                room_id=room_id,
-                observed_gateway_id=normalized_gateway_id,
-                observed_epoch=observed_epoch,
-            )
 
         with self._policy_lock:
+            room_id, observed_gateway_id, observed_epoch = (
+                validate_demotion_observation(
+                    room_id=room_id,
+                    observed_gateway_id=observed_gateway_id,
+                    observed_epoch=observed_epoch,
+                )
+            )
             room = hosted_rooms.room_state(self.db_path, room_id=room_id)
-            current_gateway_id = str(room["authority_gateway_id"])
+            current_gateway = str(room["authority_gateway_id"])
             current_epoch = int(room["authority_epoch"])
-            local_gateway_id = hosted_rooms.local_authority_gateway_id()
+            local_gateway = hosted_rooms.local_authority_gateway_id()
 
-            # Preserve the storage primitive's idempotency and validation
-            # behavior without stopping work for a rejected observation.
-            if (
-                current_gateway_id == normalized_gateway_id
-                and current_epoch == observed_epoch
-            ) or (
-                current_gateway_id != local_gateway_id
-                or observed_epoch <= current_epoch
-            ):
-                return commit_demotion(
+            # Preserve the primitive's idempotent/error semantics without
+            # stopping work for a rejected or already-applied observation.
+            if current_gateway != local_gateway or observed_epoch <= current_epoch:
+                return demote_room(
                     self.db_path,
                     room_id=room_id,
-                    observed_gateway_id=normalized_gateway_id,
+                    observed_gateway_id=observed_gateway_id,
                     observed_epoch=observed_epoch,
                 )
 
@@ -534,10 +520,10 @@ class HostedRoomService:
                 cancel_id=f"authority-demote:{observed_epoch}",
                 require_acknowledged=True,
             )
-            return commit_demotion(
+            return demote_room(
                 self.db_path,
                 room_id=room_id,
-                observed_gateway_id=normalized_gateway_id,
+                observed_gateway_id=observed_gateway_id,
                 observed_epoch=observed_epoch,
             )
 

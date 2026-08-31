@@ -31,8 +31,6 @@ from typing import Any, ContextManager, Protocol, cast
 from gateway import hosted_room_driver as state
 
 _CANCEL_ROUTE_RETRIES = 8
-
-
 ROOM_SESSION_SOURCE = "bot_room"
 MAX_TERMINAL_TEXT_BYTES = 64 * 1024
 _ROOM_SESSION_TITLE_PREFIX = "Group: "
@@ -853,6 +851,9 @@ class HostedRoomRuntime:
             self._record_error(f"task {attempt.identity.task_id} fenced: {exc}")
         except Exception as exc:
             if submit_attempted and getattr(exc, "not_admitted", False) is True:
+                # The in-process RPC marks error envelopes returned before
+                # prompt admission.  That proof is stronger than the generic
+                # submit-boundary ambiguity rule, so settle it immediately.
                 self._settle_failure_if_current(attempt, exc)
             elif submit_attempted:
                 self._drop_lease(binding.room_id)

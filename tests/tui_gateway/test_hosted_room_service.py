@@ -106,6 +106,35 @@ class _BlockingFirstRPC(_PromptRecordingRPC):
         return {"accepted": True}
 
 
+class _InterruptibleRPC(_FakeRPC):
+    def __init__(self, *, acknowledge_interrupt: bool = True) -> None:
+        super().__init__()
+        self.acknowledge_interrupt = acknowledge_interrupt
+        self.started = threading.Event()
+        self.interrupted = threading.Event()
+        self.active_task_id: str | None = None
+
+    def submit(self, **kwargs):
+        self.active_task_id = kwargs["task"].task_id
+        self.started.set()
+        return {"accepted": True}
+
+    def info(self, *, profile, session_id, source):
+        return {
+            "active": self.active_task_id is not None,
+            "task_id": self.active_task_id,
+        }
+
+    def interrupt(self, *, profile, session_id, source, expected_task_id):
+        if self.active_task_id != expected_task_id:
+            return {"interrupted": False}
+        if not self.acknowledge_interrupt:
+            return {"interrupted": False}
+        self.active_task_id = None
+        self.interrupted.set()
+        return {"interrupted": True}
+
+
 def _server():
     return SimpleNamespace(_methods={}, _sessions={}, _sessions_lock=threading.Lock())
 
@@ -184,6 +213,95 @@ def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path:
     ]
     assert events[1]["payload"]["text"] == "reply from ops"
     assert service.status("room-1")["working"] is False
+
+
+def test_demotion_interrupts_inflight_turn_before_authority_changes(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _InterruptibleRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+
+    service.start()
+    try:
+        service.send(
+            room_id="room-1",
+            event_id="user-1",
+            payload={"text": "@ops inspect", "thread_id": "thread-1"},
+        )
+        assert rpc.started.wait(timeout=1.0)
+
+        observed_gateway = "install:" + "b" * 32
+        result = service.demote_room(
+            "room-1",
+            observed_gateway_id=observed_gateway,
+            observed_epoch=2,
+        )
+
+        assert rpc.interrupted.is_set()
+        assert result["authority_gateway_id"] == observed_gateway
+        assert result["authority_epoch"] == 2
+        tasks = driver.list_tasks(db, room_id="room-1")
+        assert [task["status"] for task in tasks] == ["cancelled"]
+    finally:
+        service.stop(timeout=1.0)
+
+
+def test_demotion_keeps_local_authority_when_interrupt_is_not_acknowledged(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _InterruptibleRPC(acknowledge_interrupt=False)
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+
+    service.start()
+    try:
+        service.send(
+            room_id="room-1",
+            event_id="user-1",
+            payload={"text": "@ops inspect", "thread_id": "thread-1"},
+        )
+        assert rpc.started.wait(timeout=1.0)
+        original = hosted_rooms.room_state(db, room_id="room-1")
+
+        with pytest.raises(RuntimeError, match="still stopping"):
+            service.demote_room(
+                "room-1",
+                observed_gateway_id="install:" + "b" * 32,
+                observed_epoch=2,
+            )
+
+        current = hosted_rooms.room_state(db, room_id="room-1")
+        assert current["authority_gateway_id"] == original["authority_gateway_id"]
+        assert current["authority_epoch"] == original["authority_epoch"]
+        assert "authority.lost" not in {
+            event["kind"]
+            for event in hosted_rooms.read_events(
+                db, room_id="room-1", since_seq=0, limit=100
+            )["events"]
+        }
+    finally:
+        service.stop(timeout=1.0)
 
 
 def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path):

@@ -540,6 +540,7 @@ def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):
 def test_long_room_id_reuses_bounded_collision_resistant_session_title(
     tmp_path: Path,
 ):
+    assert room_session_title("room-1") == "Group: room-1"
     room_id = "r" * 127 + "a"
     sibling_room_id = "r" * 127 + "b"
     title = room_session_title(room_id)
@@ -1153,6 +1154,29 @@ def test_post_submit_observation_failure_preserves_recoverable_outcome(
     task = state.get_task(db, identity)
     assert task["result"]["text"] == "Recovered after a transient read."
     assert not [call for call in rpc.calls if call[0] == "submit"][1:]
+
+
+def test_proven_pre_admission_submit_rejection_fails_without_ambiguity_delay(
+    db: Path,
+):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+
+    def reject_before_admission(**_kwargs):
+        exc = RuntimeError("hosted room session is busy")
+        exc.not_admitted = True
+        raise exc
+
+    rpc.submit = reject_before_admission  # type: ignore[method-assign]
+    runtime = _runtime(db, rpc)
+
+    runtime._process_room(BINDING)
+
+    task = state.get_task(db, identity)
+    assert task["status"] == "failed"
+    assert task["result"] == {"error": "hosted room session is busy"}
+    assert ROOM_ID not in runtime.status()["blocked_rooms"]
 
 
 def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(

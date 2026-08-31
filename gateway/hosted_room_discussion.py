@@ -290,13 +290,14 @@ def validate_roster(
     value: Any,
     *,
     local_profiles: Iterable[str],
-    require_current_profiles: bool = True,
+    require_local_profiles: bool = True,
 ) -> tuple[DiscussionMember, ...]:
     """Validate a frozen 2-6 member roster of profiles on this gateway.
 
-    Room creation requires every profile to exist locally. Replay validates the
-    stored roster without reapplying that time-varying membership check so an
-    unavailable member can be deferred without invalidating the whole room.
+    Current-profile membership is a creation-time boundary. Persisted room
+    replay keeps the frozen roster valid when a profile is later renamed or
+    removed so the unavailable-member policy can defer it without disabling
+    the remaining members.
     """
 
     if not isinstance(value, list):
@@ -307,11 +308,9 @@ def validate_roster(
             f"{MAX_DISCUSSION_MEMBERS} entries"
         )
 
-    known_profiles = (
-        {_identifier(profile, label="local profile") for profile in local_profiles}
-        if require_current_profiles
-        else None
-    )
+    known_profiles = {
+        _identifier(profile, label="local profile") for profile in local_profiles
+    }
     members: list[DiscussionMember] = []
     profiles: set[str] = set()
     handles: set[str] = set()
@@ -335,7 +334,7 @@ def validate_roster(
         member_id = _identifier(member["member_id"], label=f"member {index} id")
         profile = _identifier(member["profile"], label=f"member {index} profile")
         handle = _identifier(member["handle"], label=f"member {index} handle")
-        if known_profiles is not None and profile not in known_profiles:
+        if require_local_profiles and profile not in known_profiles:
             raise DiscussionValidationError(
                 f"member {index} profile '{profile}' is not local to this gateway"
             )
@@ -377,6 +376,7 @@ def validate_room(
     value: Any,
     *,
     local_profiles: Iterable[str],
+    require_local_profiles: bool = True,
 ) -> DiscussionRoom:
     """Project a hosted-room row into the strict same-gateway policy shape."""
 
@@ -402,7 +402,7 @@ def validate_room(
     members = validate_roster(
         value.get("members"),
         local_profiles=local_profiles,
-        require_current_profiles=False,
+        require_local_profiles=require_local_profiles,
     )
     return DiscussionRoom(
         room_id=room_id,
@@ -864,7 +864,11 @@ def derive_member_watermarks(
 ) -> dict[tuple[str, str], int]:
     """Derive ``(thread_id, member_id)`` watermarks from terminal events."""
 
-    room = validate_room(room_value, local_profiles=local_profiles)
+    room = validate_room(
+        room_value,
+        local_profiles=local_profiles,
+        require_local_profiles=False,
+    )
     validated = _validated_events(events, room=room)
     return _derive_member_watermarks(validated)
 
@@ -1112,7 +1116,11 @@ def plan_next_task(
 ) -> DiscussionDecision:
     """Replay the complete room log and return at most one next member task."""
 
-    room = validate_room(room_value, local_profiles=local_profiles)
+    room = validate_room(
+        room_value,
+        local_profiles=local_profiles,
+        require_local_profiles=False,
+    )
     validated = _validated_events(events, room=room)
     user_events = _discussion_user_events(validated)
     stopped_through_seq = max(
@@ -1269,7 +1277,11 @@ def reconstruct_task_plan(
 ) -> DiscussionTaskPlan:
     """Reconstruct and verify one persisted driver task after a restart."""
 
-    room = validate_room(room_value, local_profiles=local_profiles)
+    room = validate_room(
+        room_value,
+        local_profiles=local_profiles,
+        require_local_profiles=False,
+    )
     validated = _validated_events(events, room=room)
     identity = task.get("identity")
     payload = task.get("payload")
@@ -1369,7 +1381,11 @@ def plan_publication(
     user message.
     """
 
-    room = validate_room(room_value, local_profiles=local_profiles)
+    room = validate_room(
+        room_value,
+        local_profiles=local_profiles,
+        require_local_profiles=False,
+    )
     validated = _validated_events(events, room=room)
     if task.identity.room_id != room.room_id:
         raise DiscussionValidationError("task belongs to a different room")
