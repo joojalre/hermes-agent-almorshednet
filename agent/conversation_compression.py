@@ -1544,8 +1544,21 @@ def run_compress_context_with_progress_timeout(
         # cancel() is a no-op for a running worker (fence handles that path).
         future.cancel()
 
+        waited_at_cancel = time.monotonic() - wait_started
+        since_progress_at_cancel = fence.seconds_since_progress()
+        # Classify whichever deadline was scheduled to expire first, not
+        # whichever condition happens to be true when this host thread is
+        # finally rescheduled. On a loaded runner an idle wait can wake after
+        # the total ceiling too; treating that scheduling overshoot as a real
+        # ceiling expiry retains the session lease and suppresses the
+        # configured stall fallback even though the idle deadline won first.
+        last_progress_offset = max(
+            0.0, waited_at_cancel - since_progress_at_cancel
+        )
+        idle_deadline_offset = last_progress_offset + idle
         total_exhausted = (
-            time.monotonic() - wait_started >= ceiling or fence.deadline_exceeded
+            (waited_at_cancel >= ceiling or fence.deadline_exceeded)
+            and ceiling <= idle_deadline_offset
         )
         if total_exhausted:
             # A total-ceiling candidate can still be unwinding a healthy
@@ -1657,10 +1670,8 @@ def run_compress_context_with_progress_timeout(
         # the fence poison + attempt-generation supersession already protect
         # state against its late unwind.
         if total_exhausted:
-            worker_exited = _join_cancelled_worker(
-                future,
-                min(_CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS, ceiling),
-            )
+            teardown_grace = _CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS
+            worker_exited = _join_cancelled_worker(future, teardown_grace)
             if worker_exited:
                 # The worker provably exited: no in-flight provider call can
                 # outlive this attempt, so the total-ceiling lease retention
@@ -1673,7 +1684,7 @@ def run_compress_context_with_progress_timeout(
                     "result will be discarded); retaining the session "
                     "compression lease until it exits so no new attempt "
                     "overlaps it",
-                    min(_CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS, ceiling),
+                    teardown_grace,
                 )
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
