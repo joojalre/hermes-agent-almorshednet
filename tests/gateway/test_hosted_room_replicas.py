@@ -2,6 +2,7 @@
 stale-authority demotion for hosted Group Chat rooms."""
 
 import json
+import sqlite3
 
 import pytest
 
@@ -363,6 +364,10 @@ def test_demote_fences_stale_local_authority(tmp_path, monkeypatch):
     adb = _authority_db(tmp_path)
     _seed_room(adb)
     monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_A)
+    with sqlite3.connect(adb) as conn:
+        bytes_before = conn.execute(
+            "SELECT event_bytes FROM hosted_rooms WHERE room_id='room-1'"
+        ).fetchone()[0]
 
     result = replicas.demote_room(
         adb, room_id="room-1", observed_gateway_id=AUTH_B, observed_epoch=2
@@ -376,6 +381,21 @@ def test_demote_fences_stale_local_authority(tmp_path, monkeypatch):
     assert lost["kind"] == "authority.lost"
     assert lost["payload"]["authority_gateway_id"] == AUTH_B
     assert replay["authority"] == {"gateway_id": AUTH_B, "epoch": 2}
+    lost_bytes = rooms._event_storage_bytes(
+        event_id=lost["event_id"],
+        kind=lost["kind"],
+        actor_json=rooms._canonical_json(
+            lost["actor"], label="actor", max_bytes=4 * 1024
+        ),
+        payload_json=rooms._canonical_json(
+            lost["payload"], label="payload", max_bytes=rooms.MAX_EVENT_JSON_BYTES
+        ),
+    )
+    with sqlite3.connect(adb) as conn:
+        bytes_after = conn.execute(
+            "SELECT event_bytes FROM hosted_rooms WHERE room_id='room-1'"
+        ).fetchone()[0]
+    assert bytes_after == bytes_before + lost_bytes
 
     # Local sends at the stale identity/epoch are now rejected.
     with pytest.raises(rooms.HostedRoomError):
@@ -395,6 +415,26 @@ def test_demote_fences_stale_local_authority(tmp_path, monkeypatch):
         adb, room_id="room-1", observed_gateway_id=AUTH_B, observed_epoch=2
     )
     assert again["idempotent"] is True
+
+
+def test_demote_preflights_authority_lost_control_capacity(tmp_path, monkeypatch):
+    adb = _authority_db(tmp_path)
+    _seed_room(adb, n_events=0)
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_A)
+    monkeypatch.setattr(rooms, "MAX_GATEWAY_EVENT_BYTES", 0)
+    monkeypatch.setattr(rooms, "CONTROL_EVENT_BYTE_RESERVE", 0)
+
+    with pytest.raises(rooms.HostedRoomError, match="storage is full"):
+        replicas.demote_room(
+            adb, room_id="room-1", observed_gateway_id=AUTH_B, observed_epoch=2
+        )
+
+    state = rooms.room_state(adb, room_id="room-1")
+    assert state["authority_gateway_id"] == AUTH_A
+    assert state["authority_epoch"] == 1
+    assert rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)[
+        "events"
+    ] == []
 
 
 def test_demote_rejects_non_superseding_epoch(tmp_path, monkeypatch):

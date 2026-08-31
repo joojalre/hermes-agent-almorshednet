@@ -597,7 +597,7 @@ def demote_room(
 
     with _replica_transaction(db_path) as conn:
         row = conn.execute(
-            """SELECT authority_gateway_id, authority_epoch, next_seq
+            """SELECT authority_gateway_id, authority_epoch, next_seq, event_bytes
                  FROM hosted_rooms WHERE room_id=? AND disbanded_at IS NULL""",
             (room_id,),
         ).fetchone()
@@ -638,6 +638,19 @@ def demote_room(
             label="payload",
             max_bytes=MAX_EVENT_JSON_BYTES,
         )
+        lost_event_id = f"system:authority-lost:{observed_epoch}"
+        lost_bytes = (
+            len(lost_event_id.encode("utf-8"))
+            + len(b"authority.lost")
+            + len(lost_actor_json.encode("utf-8"))
+            + len(lost_payload_json.encode("utf-8"))
+        )
+        _assert_event_capacity(
+            conn,
+            room=row,
+            additional_bytes=lost_bytes,
+            allow_control=True,
+        )
         conn.execute(
             """INSERT INTO hosted_room_events
                (room_id, seq, event_id, kind, actor_json, authority_epoch,
@@ -646,7 +659,7 @@ def demote_room(
             (
                 room_id,
                 seq,
-                f"system:authority-lost:{observed_epoch}",
+                lost_event_id,
                 lost_actor_json,
                 observed_epoch,
                 lost_payload_json,
@@ -656,9 +669,10 @@ def demote_room(
         conn.execute(
             """UPDATE hosted_rooms
                   SET authority_gateway_id=?, authority_epoch=?,
-                      next_seq=next_seq+1, revision=revision+1, updated_at=?
+                      next_seq=next_seq+1, event_bytes=event_bytes+?,
+                      revision=revision+1, updated_at=?
                 WHERE room_id=?""",
-            (observed_gateway_id, observed_epoch, now, room_id),
+            (observed_gateway_id, observed_epoch, lost_bytes, now, room_id),
         )
     return {
         "room_id": room_id,
