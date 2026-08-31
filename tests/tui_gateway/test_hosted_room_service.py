@@ -215,6 +215,46 @@ def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path:
     assert service.status("room-1")["working"] is False
 
 
+def test_profile_deleted_after_planning_is_deferred_before_admission(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = _FakeRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="user-1",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    profile_snapshots = iter(
+        (("default", "ops"), ("default", "ops"), ("default",))
+    )
+    service.local_profiles = lambda: next(profile_snapshots, ("default",))
+
+    service.prepare_room(service.bindings()[0])
+
+    assert driver.list_tasks(db, room_id="room-1") == []
+    deferred = next(
+        event
+        for event in service._events("room-1")
+        if event["kind"] == "turn.deferred"
+    )
+    assert deferred["payload"]["reason"] == "member_unavailable"
+    assert rpc.sessions == {}
+
+
 def test_demotion_interrupts_inflight_turn_before_authority_changes(tmp_path: Path):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)
@@ -1242,6 +1282,13 @@ def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
         task["identity"].task_id,
         task["identity"].task_id,
     ]
+    stop_ids = [
+        event["payload"]["cancel_id"]
+        for event in service._events("room-1")
+        if event["kind"] == "room.stop_requested"
+    ]
+    assert len(stop_ids) == 2
+    assert len(set(stop_ids)) == 2
     assert any(
         event["kind"] == "authority.lost" for event in service._events("room-1")
     )

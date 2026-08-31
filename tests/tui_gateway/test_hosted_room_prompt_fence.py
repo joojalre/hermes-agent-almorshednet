@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from contextlib import contextmanager
 
 import pytest
 
 from gateway import hosted_rooms
+from tui_gateway.hosted_room_driver import room_session_title
 import tui_gateway.server as server
 
 
-def _stub_session(monkeypatch, *, title):
+def _stub_session(monkeypatch, *, title, hosted_room_id=None, session_key=None):
+    session = {"id": "session-1", "title": title, "source": "bot_room"}
+    if hosted_room_id is not None:
+        session["hosted_room_id"] = hosted_room_id
+    if session_key is not None:
+        session["session_key"] = session_key
     monkeypatch.setattr(
         server,
         "_sess_nowait",
         lambda _params, _rid: (
-            {"id": "session-1", "title": title, "source": "bot_room"},
+            session,
             None,
         ),
     )
@@ -44,6 +51,72 @@ def test_direct_prompt_to_hosted_group_session_is_rejected(tmp_path, monkeypatch
 
     assert result["error"]["code"] == 4122
     assert "managed by its gateway" in result["error"]["message"]
+
+
+def test_direct_prompt_uses_bound_room_id_for_bounded_session_title(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    room_id = "room-" + "x" * 120
+    hosted_rooms.create_room(
+        hosted_rooms.default_db_path(),
+        room_id=room_id,
+        name="Long hosted room",
+        members=[],
+        authority_gateway_id=hosted_rooms.local_authority_gateway_id(),
+    )
+    _stub_session(
+        monkeypatch,
+        title=room_session_title(room_id),
+        hosted_room_id=room_id,
+    )
+
+    result = server._methods["prompt.submit"](
+        "request-long", {"session_id": "session-1", "text": "continue"}
+    )
+
+    assert result["error"]["code"] == 4122
+
+
+def test_direct_prompt_recovers_persisted_room_id_for_bounded_title(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    room_id = "room-" + "y" * 120
+    hosted_rooms.create_room(
+        hosted_rooms.default_db_path(),
+        room_id=room_id,
+        name="Persisted long room",
+        members=[],
+        authority_gateway_id=hosted_rooms.local_authority_gateway_id(),
+    )
+
+    class FakeSessionDB:
+        def get_session_model_config_value(self, session_id, key, default=None):
+            assert (session_id, key) == ("stored-room-session", "hosted_room_id")
+            return room_id
+
+    @contextmanager
+    def session_db(_session):
+        yield FakeSessionDB()
+
+    monkeypatch.setattr(server, "_session_db", session_db)
+    _stub_session(
+        monkeypatch,
+        title=room_session_title(room_id),
+        session_key="stored-room-session",
+    )
+
+    result = server._methods["prompt.submit"](
+        "request-persisted-long",
+        {"session_id": "session-1", "text": "continue"},
+    )
+
+    assert result["error"]["code"] == 4122
 
 
 def test_direct_prompt_to_non_hosted_group_reaches_normal_admission(

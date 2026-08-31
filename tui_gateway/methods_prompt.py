@@ -355,47 +355,65 @@ def _(rid, params: dict) -> dict:
             for field in required_hosted_fields - {"execution_generation"}
         ) or not isinstance(hosted_task.get("execution_generation"), int):
             return _err(rid, 4120, "invalid hosted room turn proof")
+        # Persist the authority identity independently from the bounded display
+        # title. Older Desktop clients can later submit directly into this
+        # session, so the compatibility fence must recover the real room id.
+        session["hosted_room_id"] = hosted_task["room_id"]
     else:
         # Older Desktop builds know the `Group: <room-id>` session title but
         # not the hosted authority marker. Once a gateway owns that room, a
         # direct prompt into its member session would start a second renderer
         # driver. Fence it server-side instead of trusting client awareness.
+        room_id = str(session.get("hosted_room_id") or "").strip()
+        session_key = str(session.get("session_key") or "").strip()
+        if not room_id and session_key:
+            try:
+                with _session_db(session) as db:
+                    if db is not None:
+                        room_id = str(
+                            db.get_session_model_config_value(
+                                session_key, "hosted_room_id", ""
+                            )
+                            or ""
+                        ).strip()
+            except Exception:
+                room_id = ""
         title = str(session.get("title") or "")
-        if title.startswith("Group: "):
+        if not room_id and title.startswith("Group: "):
             room_id = title.removeprefix("Group: ").strip()
-            if room_id:
-                try:
-                    from gateway.hosted_rooms import (
-                        HostedRoomError,
-                        RoomProbeUnavailableError,
-                        default_db_path,
-                        probe_hosted_room,
-                    )
+        if room_id:
+            try:
+                from gateway.hosted_rooms import (
+                    HostedRoomError,
+                    RoomProbeUnavailableError,
+                    default_db_path,
+                    probe_hosted_room,
+                )
 
-                    hosted = probe_hosted_room(default_db_path(), room_id=room_id)
-                except RoomProbeUnavailableError:
+                hosted = probe_hosted_room(default_db_path(), room_id=room_id)
+            except RoomProbeUnavailableError:
+                return _err(
+                    rid,
+                    5122,
+                    "Could not verify this group. Try again after the gateway recovers.",
+                )
+            except HostedRoomError:
+                # Legacy Desktop sessions used the display name after
+                # "Group: "; those names are not hosted room ids.
+                pass
+            except Exception:
+                return _err(
+                    rid,
+                    5122,
+                    "Could not verify this group. Try again after the gateway recovers.",
+                )
+            else:
+                if hosted:
                     return _err(
                         rid,
-                        5122,
-                        "Could not verify this group. Try again after the gateway recovers.",
+                        4122,
+                        "This room is managed by its gateway. Update Hermes Desktop to continue it.",
                     )
-                except HostedRoomError:
-                    # Legacy Desktop sessions used the display name after
-                    # "Group: "; those names are not hosted room ids.
-                    pass
-                except Exception:
-                    return _err(
-                        rid,
-                        5122,
-                        "Could not verify this group. Try again after the gateway recovers.",
-                    )
-                else:
-                    if hosted:
-                        return _err(
-                            rid,
-                            4122,
-                            "This room is managed by its gateway. Update Hermes Desktop to continue it.",
-                        )
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every

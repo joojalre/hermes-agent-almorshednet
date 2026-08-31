@@ -6,6 +6,7 @@ import contextlib
 import os
 import threading
 import time
+import uuid
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -327,6 +328,27 @@ class HostedRoomService:
                 initial_watermarks=snapshot.watermarks,
             )
             if decision.status == "task" and decision.task is not None:
+                current_profiles = self.local_profiles()
+                if decision.task.member.profile not in current_profiles:
+                    # A frozen roster member can disappear after policy replay
+                    # but before durable admission. Publish the same retryable
+                    # terminal result used by runtime recovery without ever
+                    # resolving the missing profile through the launch DB.
+                    publication = discussion.plan_publication(
+                        room,
+                        events,
+                        decision.task,
+                        status="deferred",
+                        result={"reason": "member_unavailable", "retryable": True},
+                        execution_generation=1,
+                        local_profiles=current_profiles,
+                    )
+                    self._append_plan(
+                        binding.room_id,
+                        publication,
+                        expected_latest_seq=int(room["latest_seq"]),
+                    )
+                    return
                 driver.admit_task(
                     self.db_path,
                     decision.task.identity,
@@ -517,7 +539,7 @@ class HostedRoomService:
 
             self.stop_room(
                 room_id,
-                cancel_id=f"authority-demote:{observed_epoch}",
+                cancel_id=f"authority-demote:{uuid.uuid4().hex}",
                 require_acknowledged=True,
             )
             return demote_room(

@@ -3898,6 +3898,8 @@ def _ensure_session_db_row(session: dict) -> None:
     # restored verbatim). See _stored_session_runtime_overrides.
     if session.get("room_plumbing"):
         model_config["room_plumbing"] = True
+    if hosted_room_id := str(session.get("hosted_room_id") or "").strip():
+        model_config["hosted_room_id"] = hosted_room_id
     # Bot-Mode canonical chats (the ONE forever DM per bot) and room plumbing
     # sessions are plugin-owned scratch conversations: their runtime must ALWAYS
     # follow the member profile's CURRENT config, never the model/provider that
