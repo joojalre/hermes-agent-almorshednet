@@ -1242,6 +1242,46 @@ def test_proven_pre_admission_submit_rejection_fails_without_ambiguity_delay(
     assert ROOM_ID not in runtime.status()["blocked_rooms"]
 
 
+def test_non_owner_runtime_leaves_stop_for_task_process_owner(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    owner_rpc = FakeSessionRPC(auto_complete=False)
+    owner_observed_active = threading.Event()
+    owner_rpc.on_info = owner_observed_active.set
+    owner = _runtime(
+        db,
+        owner_rpc,
+        process_generation="owner-process",
+        active_poll_interval_seconds=10.0,
+    )
+    non_owner_rpc = FakeSessionRPC(auto_complete=False)
+    non_owner_rpc.add_session(active=False, task_id=identity.task_id)
+    non_owner = _runtime(
+        db,
+        non_owner_rpc,
+        process_generation="non-owner-process",
+    )
+
+    owner.start()
+    try:
+        assert owner_rpc.submitted.wait(1.0)
+        assert owner_observed_active.wait(1.0)
+        running = state.get_task(db, identity)
+        assert running["run_process_generation"] == owner.process_generation
+
+        stopping = non_owner.cancel(identity, cancel_id="cancel-from-peer")
+
+        assert stopping["status"] == "stopping"
+        assert state.get_task(db, identity)["status"] == "stopping"
+        assert non_owner_rpc.calls == []
+
+        owner.wakeup()
+        _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
+        assert len([call for call in owner_rpc.calls if call[0] == "interrupt"]) == 1
+    finally:
+        assert owner.stop(timeout=1.0)
+
+
 def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
     db: Path,
 ):
@@ -1479,7 +1519,7 @@ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
 
 
-def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path):
+def test_restart_leaves_stop_owned_by_previous_process_generation(db: Path):
     identity = _identity()
     _admit(db, identity)
     now = [100.0]
@@ -1516,10 +1556,11 @@ def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path
         clock=clock,
     )
 
-    cancelled = runtime.cancel(identity, cancel_id="cancel-before-restart")
+    stopping = runtime.cancel(identity, cancel_id="cancel-before-restart")
 
-    assert cancelled["status"] == "cancelled"
-    assert not [call for call in rpc.calls if call[0] == "interrupt"]
+    assert stopping["status"] == "stopping"
+    assert state.get_task(db, identity)["status"] == "stopping"
+    assert rpc.calls == []
 
 
 def test_pending_local_approval_is_reported_with_safe_choices(db: Path):

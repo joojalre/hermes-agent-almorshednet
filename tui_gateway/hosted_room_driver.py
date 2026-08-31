@@ -440,6 +440,10 @@ class HostedRoomRuntime:
         binding: HostedRoomBinding,
         task: Mapping[str, Any],
     ) -> bool:
+        if task["run_process_generation"] != self.process_generation:
+            # Session activity is process-local; only the submitting process
+            # can treat local absence or inactivity as a Stop acknowledgement.
+            return False
         transport = self.rpc
         if transport is None:
             return False
@@ -468,9 +472,7 @@ class HostedRoomRuntime:
         active = bool(info.get("active", info.get("running", False)))
         if not active:
             # History was checked immediately before this probe. An exact
-            # local session that is no longer active cannot keep executing, and
-            # after a restart its process-local task marker is expected to be
-            # absent.
+            # same-process session that is no longer active cannot keep executing.
             return True
         if not _info_is_active_for(info, task["identity"], require_exact=True):
             return False
