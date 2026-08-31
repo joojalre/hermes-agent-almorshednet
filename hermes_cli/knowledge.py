@@ -45,12 +45,17 @@ AUDIT_FILENAME = "knowledge-sync.jsonl"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+_CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SECRET_VALUE_RE = re.compile(
     r"(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|password|private[_ -]?key|cookie)\s*[:=]\s*[^\s,;]{8,}",
     re.IGNORECASE,
 )
 _ENGLISH_INSTRUCTION_VERB_RE = (
     r"(?:run|execute|delete|remove|upload|send|click|open|install|deploy|merge|push|ignore|disregard)"
+)
+_ENGLISH_INSTRUCTION_GERUND_RE = (
+    r"(?:running|executing|deleting|removing|uploading|sending|clicking|opening|"
+    r"installing|deploying|merging|pushing|ignoring|disregarding)"
 )
 _ENGLISH_COURTESY_RE = r"(?:please|kindly)"
 _ENGLISH_COURTESY_SEPARATOR_RE = r"(?:\s*[,;:،؛]\s*|\s+)"
@@ -59,8 +64,10 @@ _ENGLISH_DO_ACTION_PREFIX_RE = r"do(?:\s+not|n['’]t)?\s+"
 _ENGLISH_MODAL_REQUEST_RE = (
     rf"{_ENGLISH_MODAL_RE}\s+you{_ENGLISH_COURTESY_SEPARATOR_RE}"
     rf"(?:{_ENGLISH_COURTESY_RE}{_ENGLISH_COURTESY_SEPARATOR_RE})?"
-    rf"(?:(?:not\s+)|{_ENGLISH_DO_ACTION_PREFIX_RE})?"
-    rf"{_ENGLISH_INSTRUCTION_VERB_RE}\b"
+    rf"(?:possibly{_ENGLISH_COURTESY_SEPARATOR_RE})?"
+    rf"(?:mind{_ENGLISH_COURTESY_SEPARATOR_RE}{_ENGLISH_INSTRUCTION_GERUND_RE}\b"
+    rf"|(?:(?:not\s+)|{_ENGLISH_DO_ACTION_PREFIX_RE})?"
+    rf"{_ENGLISH_INSTRUCTION_VERB_RE}\b)"
 )
 _ARABIC_ACTION_NOUN_RE = (
     r"(?:حذف|إزالة|ازالة|تنفيذ|تشغيل|رفع|إرسال|ارسال|فتح|تثبيت|نشر|دمج|دفع|تجاهل)"
@@ -123,6 +130,7 @@ _INSTRUCTION_RE = re.compile(
     rf"^\s*(?:"
     rf"(?:{_ENGLISH_COURTESY_RE}{_ENGLISH_COURTESY_SEPARATOR_RE})?"
     rf"(?:(?:do(?:\s+not|n['’]t)?\s+)?{_ENGLISH_INSTRUCTION_VERB_RE}\b"
+    rf"|proceed\s+to\s+{_ENGLISH_INSTRUCTION_VERB_RE}\b"
     rf"|{_ENGLISH_MODAL_REQUEST_RE}|you\s+must\b|must\b)"
     rf"|(?:يرجى|الرجاء|من\s+فضلك)(?:\s*[,;:،؛]\s*|\s+)"
     rf"(?:{_ARABIC_ACTION_NOUN_RE}|{_ARABIC_IMPERATIVE_RE})"
@@ -143,13 +151,12 @@ _ARABIC_NORMALIZED_INSTRUCTION_RE = re.compile(
     rf")",
     re.IGNORECASE,
 )
-_ARABIC_PAST_AGENT_RE = r"(?:النظام|الخادم|التطبيق|البرنامج|الوكيل|الروبوت|الاختبار)"
 _ARABIC_PAST_MARKER_RE = (
     r"(?:تلقائ(?:يا|ياً)|بنجاح|أمس|سابق(?:ا|اً)|مسبق(?:ا|اً)|دون\s+تدخل)"
 )
 _ARABIC_UNVOCALIZED_PAST_RE = re.compile(
     rf"^\s*(?:نفذ|شغل|ثبت|أرسل|ارسل|تجاهل)\s+"
-    rf"{_ARABIC_PAST_AGENT_RE}\s+\S+"
+    rf"\S+\s+\S+"
     rf"(?:\s+\S+){{0,3}}\s+{_ARABIC_PAST_MARKER_RE}(?!\w)"
     rf"[.!؟]?\s*$",
     re.IGNORECASE,
@@ -266,7 +273,7 @@ def _validate_metadata(value: Any, *, field: str, allow_empty: bool = True) -> s
 
 def _validate_rendered_metadata(value: Any, *, field: str, allow_empty: bool = True) -> str:
     normalized = _validate_metadata(value, field=field, allow_empty=allow_empty)
-    if "\r" in normalized or "\n" in normalized or ENTRY_DELIMITER in normalized:
+    if _CONTROL_CHARACTER_RE.search(normalized) or ENTRY_DELIMITER in normalized:
         raise UnsafeKnowledgeError(f"{field} must be a single-line value")
     findings = scan_for_threats(normalized, scope="strict")
     if findings:
@@ -439,6 +446,10 @@ def _record_from(
     fact_key = raw.get("fact_key", "")
     if not isinstance(fact_key, str) or len(fact_key) > MAX_ID_CHARS:
         raise KnowledgeError(f"record {record_id}: fact_key is invalid")
+    fact_key = _validate_rendered_metadata(
+        fact_key,
+        field=f"record {record_id} fact_key",
+    )
     if status == "CONFLICTING" and not fact_key:
         raise KnowledgeError(
             f"record {record_id}: CONFLICTING status requires fact_key"
@@ -496,6 +507,7 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
         source_results.append({**normalized, "accepted": True})
 
     records = []
+    record_ids = set()
     rejected = []
     for index, raw in enumerate(raw_records, start=1):
         try:
@@ -505,6 +517,12 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
         except KnowledgeError as exc:
             rejected.append({"index": index, "reason": str(exc)})
             continue
+        if record["id"] in record_ids:
+            rejected.append(
+                {"index": index, "reason": f"duplicate record id: {record['id']}"}
+            )
+            continue
+        record_ids.add(record["id"])
         records.append(record)
 
     deduped = []
@@ -512,6 +530,7 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
     duplicates = []
     for record in records:
         key = (
+            _comparison_text(record["fact_key"]),
             _comparison_text(record["domain"]),
             _comparison_text(record["statement"]),
         )
