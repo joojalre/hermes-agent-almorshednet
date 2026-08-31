@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import sys
+import unicodedata
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,7 +49,7 @@ _SECRET_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 _INSTRUCTION_RE = re.compile(
-    r"^\s*(?:run|execute|delete|remove|upload|send|click|open|install|deploy|merge|push|ignore|disregard|you\s+must|must\b)",
+    r"^\s*(?:(?:run|execute|delete|remove|upload|send|click|open|install|deploy|merge|push|ignore|disregard)\b|you\s+must\b|must\b)",
     re.IGNORECASE,
 )
 _SENSITIVE_FIELD_NAMES = {
@@ -115,6 +116,11 @@ def _scan_text(value: str, *, field: str) -> str | None:
     if findings:
         return f"{field} contains blocked threat pattern(s): {', '.join(findings)}"
     return None
+
+
+def _is_instruction_like(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", value)
+    return bool(_INSTRUCTION_RE.search(normalized))
 
 
 def _reject_sensitive_fields(value: Any, *, path: str = "$manifest") -> None:
@@ -303,12 +309,12 @@ def _record_from(
     reason = _scan_text(statement, field=f"record {record_id} statement")
     if reason:
         raise KnowledgeError(reason)
-    if _INSTRUCTION_RE.search(statement):
+    if _is_instruction_like(statement):
         raise KnowledgeError(f"record {record_id}: instruction-like text is not a fact")
     reason = _scan_text(domain, field=f"record {record_id} domain")
     if reason:
         raise UnsafeKnowledgeError(reason)
-    if _INSTRUCTION_RE.search(domain):
+    if _is_instruction_like(domain):
         raise UnsafeKnowledgeError(
             f"record {record_id}: instruction-like text is not a domain"
         )
