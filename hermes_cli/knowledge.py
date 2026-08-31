@@ -48,14 +48,46 @@ _SECRET_VALUE_RE = re.compile(
     r"(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|password|private[_ -]?key|cookie)\s*[:=]\s*[^\s,;]{8,}",
     re.IGNORECASE,
 )
+_ENGLISH_INSTRUCTION_VERB_RE = (
+    r"(?:run|execute|delete|remove|upload|send|click|open|install|deploy|merge|push|ignore|disregard)"
+)
+_ARABIC_ACTION_NOUN_RE = (
+    r"(?:حذف|إزالة|ازالة|تنفيذ|تشغيل|رفع|إرسال|ارسال|فتح|تثبيت|نشر|دمج|دفع|تجاهل)"
+)
+_ARABIC_IMPERATIVE_RE = (
+    r"(?:احذف|أزل|ازل|نفذ|نفّذ|شغّل|شغل|ارفع|أرسل|ارسل|افتح|ثبّت|ثبت|انشر|ادمج|ادفع|تجاهل)"
+)
+_ARABIC_UNAMBIGUOUS_IMPERATIVE_RE = (
+    r"(?:احذف|أزل|ازل|ارفع|افتح|انشر|ادمج|ادفع)"
+)
+_ARABIC_OBJECT_SUFFIX_RE = r"(?:هما|كما|ها|هم|هن|كم|كن|نا|ني|ه|ك)"
+_ARABIC_ACTION_ENDING_RE = (
+    rf"(?:{_ARABIC_OBJECT_SUFFIX_RE}|"
+    rf"ي(?:{_ARABIC_OBJECT_SUFFIX_RE})?|"
+    rf"وا|و{_ARABIC_OBJECT_SUFFIX_RE})?"
+)
+_ARABIC_DECORATION_RE = re.compile(r"[\u0640\u064B-\u065F\u0670]")
 _INSTRUCTION_RE = re.compile(
-    r"^\s*(?:"
-    r"(?:(?:please|kindly)(?:\s*[,;:،؛]\s*|\s+))?"
-    r"(?:(?:run|execute|delete|remove|upload|send|click|open|install|deploy|merge|push|ignore|disregard)\b|you\s+must\b|must\b)"
-    r"|(?:يرجى|الرجاء|من\s+فضلك)(?:\s*[,;:،؛]\s*|\s+)"
-    r"(?:حذف|إزالة|ازالة|تنفيذ|تشغيل|رفع|إرسال|ارسال|فتح|تثبيت|نشر|دمج|دفع|تجاهل|احذف|أزل|ازل|نفذ|نفّذ|شغّل|شغل|ارفع|أرسل|ارسل|افتح|ثبّت|ثبت|انشر|ادمج|ادفع)(?!\w)"
-    r"|(?:احذف|أزل|ازل|نفذ|نفّذ|شغّل|شغل|ارفع|أرسل|ارسل|افتح|ثبّت|ثبت|انشر|ادمج|ادفع|تجاهل)(?!\w)"
-    r")",
+    rf"^\s*(?:"
+    rf"(?:(?:please|kindly)(?:\s*[,;:،؛]\s*|\s+))?"
+    rf"(?:(?:do(?:\s+not|n['’]t)?\s+)?{_ENGLISH_INSTRUCTION_VERB_RE}\b|you\s+must\b|must\b)"
+    rf"|(?:يرجى|الرجاء|من\s+فضلك)(?:\s*[,;:،؛]\s*|\s+)"
+    rf"(?:{_ARABIC_ACTION_NOUN_RE}|{_ARABIC_IMPERATIVE_RE})"
+    rf"{_ARABIC_ACTION_ENDING_RE}(?!\w)"
+    rf"|{_ARABIC_IMPERATIVE_RE}(?!\w)"
+    rf"|{_ARABIC_UNAMBIGUOUS_IMPERATIVE_RE}"
+    rf"{_ARABIC_ACTION_ENDING_RE}(?!\w)"
+    rf")",
+    re.IGNORECASE,
+)
+_ARABIC_NORMALIZED_INSTRUCTION_RE = re.compile(
+    rf"^\s*(?:"
+    rf"(?:يرجى|الرجاء|من\s+فضلك)(?:\s*[,;:،؛]\s*|\s+)"
+    rf"(?:{_ARABIC_ACTION_NOUN_RE}|{_ARABIC_IMPERATIVE_RE})"
+    rf"{_ARABIC_ACTION_ENDING_RE}(?!\w)"
+    rf"|{_ARABIC_UNAMBIGUOUS_IMPERATIVE_RE}"
+    rf"{_ARABIC_ACTION_ENDING_RE}(?!\w)"
+    rf")",
     re.IGNORECASE,
 )
 _SENSITIVE_FIELD_NAMES = {
@@ -126,7 +158,10 @@ def _scan_text(value: str, *, field: str) -> str | None:
 
 def _is_instruction_like(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value)
-    return bool(_INSTRUCTION_RE.search(normalized))
+    if _INSTRUCTION_RE.search(normalized):
+        return True
+    arabic_normalized = _ARABIC_DECORATION_RE.sub("", normalized)
+    return bool(_ARABIC_NORMALIZED_INSTRUCTION_RE.search(arabic_normalized))
 
 
 def _reject_sensitive_fields(value: Any, *, path: str = "$manifest") -> None:
@@ -608,6 +643,84 @@ def _restore_memory(snapshot: dict[str, Any]) -> None:
         raise KnowledgeError(f"cannot restore MEMORY.md: {exc}") from exc
 
 
+def _object_has_typed_fields(
+    value: Any, fields: dict[str, Any]
+) -> bool:
+    return isinstance(value, dict) and all(
+        key in value and isinstance(value[key], expected_type)
+        for key, expected_type in fields.items()
+    )
+
+
+def _validate_audit_event(event: Any) -> dict[str, Any]:
+    top_level_fields = {
+        "run_id": str,
+        "manifest_sha256": str,
+        "created_at": str,
+        "mode": str,
+        "sources": list,
+        "records": list,
+        "rejected": list,
+        "duplicates": list,
+        "conflicts": list,
+        "memory": dict,
+    }
+    if (
+        not _object_has_typed_fields(event, top_level_fields)
+        or type(event.get("schema_version")) is not int
+        or event["schema_version"] != SCHEMA_VERSION
+        or not _RUN_ID_RE.fullmatch(event["run_id"])
+        or not re.fullmatch(r"[0-9a-f]{64}", event["manifest_sha256"])
+        or event["mode"] not in {"apply", "dry-run"}
+    ):
+        raise KnowledgeError("knowledge audit is malformed")
+
+    list_fields = (
+        "sources",
+        "records",
+        "rejected",
+        "duplicates",
+        "conflicts",
+    )
+    if any(
+        not all(isinstance(item, dict) for item in event[field])
+        for field in list_fields
+    ):
+        raise KnowledgeError("knowledge audit is malformed")
+
+    memory = event["memory"]
+    if event["mode"] == "apply":
+        memory_fields = {
+            "status": str,
+            "path": str,
+            "before_sha256": str,
+            "after_sha256": str,
+            "backup_path": str,
+            "effective_limit": int,
+        }
+        if (
+            not _object_has_typed_fields(memory, memory_fields)
+            or memory["status"] != "applied"
+            or type(memory["effective_limit"]) is not int
+            or memory["effective_limit"] <= 0
+            or not re.fullmatch(r"[0-9a-f]{64}", memory["before_sha256"])
+            or not re.fullmatch(r"[0-9a-f]{64}", memory["after_sha256"])
+        ):
+            raise KnowledgeError("knowledge audit is malformed")
+    elif memory.get("status") != "dry-run":
+        raise KnowledgeError("knowledge audit is malformed")
+
+    return event
+
+
+def _parse_audit_event(line: str) -> dict[str, Any]:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise KnowledgeError("knowledge audit is malformed") from exc
+    return _validate_audit_event(event)
+
+
 def _append_audit(event: dict[str, Any]) -> None:
     path = _audit_path()
     line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
@@ -637,12 +750,7 @@ def _assert_run_manifest_consistency(
 ) -> None:
     """Reject a run id already committed for any other manifest."""
     for line in audit_text.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise KnowledgeError("knowledge audit is malformed") from exc
-        if not isinstance(event, dict):
-            raise KnowledgeError("knowledge audit is malformed")
+        event = _parse_audit_event(line)
         if event.get("run_id") != run_id:
             continue
         if event.get("manifest_sha256") != manifest_sha:
@@ -796,12 +904,7 @@ def _verify(args: Any) -> int:
             raise KnowledgeError(f"cannot read knowledge audit: {exc}") from exc
         events = []
         for line in audit_text.splitlines():
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise KnowledgeError("knowledge audit is malformed") from exc
-            if not isinstance(item, dict):
-                raise KnowledgeError("knowledge audit is malformed")
+            item = _parse_audit_event(line)
             if item.get("run_id") == args.run_id:
                 events.append(item)
         if not events:
