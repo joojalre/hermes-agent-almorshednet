@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from contextlib import contextmanager
@@ -833,6 +834,53 @@ def test_existing_canonical_session_is_resumed_not_duplicated(db: Path):
         "session_id": session_id,
         "source": ROOM_SESSION_SOURCE,
     }
+
+
+def test_long_room_id_reuses_bounded_collision_resistant_session_title(
+    tmp_path: Path,
+):
+    room_id = "r" * 127 + "a"
+    sibling_room_id = "r" * 127 + "b"
+    title = room_session_title(room_id)
+
+    assert len(title) == 100
+    assert title.endswith(hashlib.sha256(room_id.encode("utf-8")).hexdigest())
+    assert title == room_session_title(room_id)
+    assert title != room_session_title(sibling_room_id)
+
+    db = tmp_path / "state.db"
+    binding = HostedRoomBinding(room_id, "gateway-a", 1)
+    hosted_rooms.create_room(
+        db,
+        room_id=room_id,
+        name="Long identity room",
+        members=[{"profile": PROFILE, "handle": PROFILE}],
+        authority_gateway_id=binding.gateway_id,
+        now=time.time(),
+    )
+    rpc = FakeSessionRPC()
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[binding],
+        rpc=rpc,
+        turn_lock=RecordingTurnLocks(),
+        lease_ttl_seconds=0.4,
+        poll_interval_seconds=0.01,
+    )
+
+    first = state.TaskIdentity(room_id, "task-1", "thread-1", "turn-1")
+    _admit(db, first, prompt="First turn.")
+    runtime._process_room(binding)
+
+    second = state.TaskIdentity(room_id, "task-2", "thread-1", "turn-2")
+    _admit(db, second, prompt="Second turn.")
+    runtime._process_room(binding)
+
+    creates = [params for method, params in rpc.calls if method == "create"]
+    resumes = [params for method, params in rpc.calls if method == "resume"]
+    assert [params["title"] for params in creates] == [title]
+    assert len(resumes) == 1
+    assert len(rpc.sessions) == 1
 
 
 def test_local_crash_recovery_keeps_ambiguous_history_explicit_without_resume(
@@ -2150,7 +2198,7 @@ def test_authority_loss_stops_terminal_commit(db: Path):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc, lease_ttl_seconds=0.1)
+    runtime = _runtime(db, rpc, lease_ttl_seconds=2.0)
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
@@ -2213,6 +2261,29 @@ def test_profile_lock_timeout_leaves_unsubmitted_task_queued(db: Path):
     runtime.turn_lock = RecordingTurnLocks()
     runtime._process_room(BINDING)
     assert state.get_task(db, identity)["status"] == "settled"
+
+
+def test_proven_not_admitted_submission_settles_without_ambiguity(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+
+    class ProvenNotAdmittedError(RuntimeError):
+        not_admitted = True
+
+    class RejectingSessionRPC(FakeSessionRPC):
+        def submit(self, **kwargs):
+            self.calls.append(("submit", dict(kwargs)))
+            raise ProvenNotAdmittedError("hosted room member session is busy")
+
+    runtime = _runtime(db, RejectingSessionRPC())
+
+    runtime._process_room(BINDING)
+
+    failed = state.get_task(db, identity)
+    assert failed["status"] == "failed"
+    assert failed["result"] == {"error": "hosted room member session is busy"}
+    assert runtime._ambiguous_rooms == {}
+    assert "observation failed after submit" not in str(runtime.status()["last_error"])
 
 
 def test_stop_is_bounded_and_does_not_interrupt_active_turn(db: Path):

@@ -177,6 +177,52 @@ def test_deferred_member_allows_next_mentioned_member_and_later_terminal_result(
     assert decision.task.member.member_id == second.member.member_id
 
 
+def test_replay_defers_missing_frozen_member_without_blocking_healthy_members(
+    room_db,
+):
+    db, room = room_db
+    remaining_profiles = tuple(
+        profile for profile in LOCAL_PROFILES if profile != "research"
+    )
+    with pytest.raises(discussion.DiscussionValidationError, match="not local"):
+        discussion.validate_roster(
+            room["members"],
+            local_profiles=remaining_profiles,
+        )
+    _append_user(db, event_id="user-1", text="Report.")
+
+    missing = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=remaining_profiles,
+    )
+    assert missing.status == "task"
+    assert missing.task is not None
+    assert missing.task.member.profile == "research"
+
+    deferred = discussion.plan_publication(
+        room,
+        _events(db),
+        missing.task,
+        status="deferred",
+        result={"reason": "member_unavailable"},
+        execution_generation=1,
+        local_profiles=remaining_profiles,
+    )
+    assert deferred.terminal_kind == "turn.deferred"
+    assert deferred.events[-1].payload["reason"] == "member_unavailable"
+    _append_publication(db, deferred)
+
+    healthy = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=remaining_profiles,
+    )
+    assert healthy.status == "task"
+    assert healthy.task is not None
+    assert healthy.task.member.profile == "build"
+
+
 def test_distinct_threads_are_planned_fifo_without_skipping(room_db):
     db, room = room_db
     _append_user(db, event_id="user-1", text="First", thread_id="thread-1")

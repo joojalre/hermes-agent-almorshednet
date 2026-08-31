@@ -844,6 +844,69 @@ class HostedRoomService:
         self.runtime.wakeup()
         return cancelled
 
+    def demote_room(
+        self,
+        room_id: str,
+        *,
+        observed_gateway_id: Any,
+        observed_epoch: Any,
+    ) -> dict[str, Any]:
+        """Fence local authority only after every accepted turn stops exactly."""
+
+        from gateway.hosted_room_replicas import demote_room as commit_demotion
+        from gateway.hosted_rooms import MAX_ACTOR_ID_CHARS, _validate_identifier
+
+        normalized_gateway_id = _validate_identifier(
+            observed_gateway_id,
+            label="observed_gateway_id",
+            max_chars=MAX_ACTOR_ID_CHARS,
+        )
+        if (
+            isinstance(observed_epoch, bool)
+            or not isinstance(observed_epoch, int)
+            or observed_epoch < 1
+        ):
+            return commit_demotion(
+                self.db_path,
+                room_id=room_id,
+                observed_gateway_id=normalized_gateway_id,
+                observed_epoch=observed_epoch,
+            )
+
+        with self._policy_lock:
+            room = hosted_rooms.room_state(self.db_path, room_id=room_id)
+            current_gateway_id = str(room["authority_gateway_id"])
+            current_epoch = int(room["authority_epoch"])
+            local_gateway_id = hosted_rooms.local_authority_gateway_id()
+
+            # Preserve the storage primitive's idempotency and validation
+            # behavior without stopping work for a rejected observation.
+            if (
+                current_gateway_id == normalized_gateway_id
+                and current_epoch == observed_epoch
+            ) or (
+                current_gateway_id != local_gateway_id
+                or observed_epoch <= current_epoch
+            ):
+                return commit_demotion(
+                    self.db_path,
+                    room_id=room_id,
+                    observed_gateway_id=normalized_gateway_id,
+                    observed_epoch=observed_epoch,
+                )
+
+            self.stop_room(
+                room_id,
+                cancel_id=f"authority-demote:{observed_epoch}",
+                require_acknowledged=True,
+            )
+            return commit_demotion(
+                self.db_path,
+                room_id=room_id,
+                observed_gateway_id=normalized_gateway_id,
+                observed_epoch=observed_epoch,
+            )
+
     def retry_room_task(self, room_id: str, *, task_id: str) -> dict[str, Any]:
         """Retry one uncertain or deferred task only after explicit user action."""
 

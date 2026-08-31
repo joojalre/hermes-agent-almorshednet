@@ -301,10 +301,11 @@ def _validate_member_target(
     *,
     profile: str,
     known_profiles: set[str],
+    require_current_profiles: bool,
     index: int,
 ) -> dict[str, Any]:
     if value is None:
-        if profile not in known_profiles:
+        if require_current_profiles and profile not in known_profiles:
             raise DiscussionValidationError(
                 f"member {index} profile '{profile}' is not local to this gateway"
             )
@@ -321,7 +322,9 @@ def _validate_member_target(
         target_profile = _identifier(
             target["profile"], label=f"member {index} target profile"
         )
-        if target_profile != profile or profile not in known_profiles:
+        if target_profile != profile or (
+            require_current_profiles and profile not in known_profiles
+        ):
             raise DiscussionValidationError(
                 f"member {index} local target does not match a local profile"
             )
@@ -368,8 +371,15 @@ def validate_roster(
     value: Any,
     *,
     local_profiles: Iterable[str],
+    require_current_profiles: bool = True,
 ) -> tuple[DiscussionMember, ...]:
-    """Validate a frozen 2-6 member roster of profiles on this gateway."""
+    """Validate a frozen 2-6 member roster of local or peer targets.
+
+    Room creation requires each local target to exist on this gateway. Replay
+    preserves the stored roster without reapplying that time-varying check, so
+    an unavailable local member can be deferred while healthy local and peer
+    members continue.
+    """
 
     if not isinstance(value, list):
         raise DiscussionValidationError("members must be a list")
@@ -409,6 +419,7 @@ def validate_roster(
             member.get("target"),
             profile=profile,
             known_profiles=known_profiles,
+            require_current_profiles=require_current_profiles,
             index=index,
         )
         display_name = member.get("display_name", "")
@@ -478,7 +489,11 @@ def validate_room(
         value.get("authority_epoch"),
         label="authority_epoch",
     )
-    members = validate_roster(value.get("members"), local_profiles=local_profiles)
+    members = validate_roster(
+        value.get("members"),
+        local_profiles=local_profiles,
+        require_current_profiles=False,
+    )
     return DiscussionRoom(
         room_id=room_id,
         name=name,

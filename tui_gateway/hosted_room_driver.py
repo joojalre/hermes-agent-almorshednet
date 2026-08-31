@@ -19,6 +19,7 @@ preserves the same canonical transcript instead of forking a second conversation
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import threading
 import time
 import uuid
@@ -34,6 +35,8 @@ _CANCEL_ROUTE_RETRIES = 8
 
 ROOM_SESSION_SOURCE = "bot_room"
 MAX_TERMINAL_TEXT_BYTES = 64 * 1024
+_ROOM_SESSION_TITLE_PREFIX = "Group: "
+_ROOM_SESSION_TITLE_MAX_CHARS = 100
 _TERMINAL_TRUNCATION_NOTICE = (
     "\n\n[Reply truncated. Ask the Bot to share the full result as a file.]"
 )
@@ -1563,8 +1566,19 @@ class HostedRoomRuntime:
 
 
 def room_session_title(room_id: str) -> str:
-    """Return the canonical hidden session title for one hosted room."""
-    return f"Group: {room_id}"
+    """Return the bounded canonical hidden-session title for one room."""
+    title = f"{_ROOM_SESSION_TITLE_PREFIX}{room_id}"
+    if len(title) <= _ROOM_SESSION_TITLE_MAX_CHARS:
+        return title
+
+    digest = hashlib.sha256(room_id.encode("utf-8")).hexdigest()
+    room_prefix_chars = (
+        _ROOM_SESSION_TITLE_MAX_CHARS
+        - len(_ROOM_SESSION_TITLE_PREFIX)
+        - 1
+        - len(digest)
+    )
+    return f"{_ROOM_SESSION_TITLE_PREFIX}{room_id[:room_prefix_chars]}~{digest}"
 
 
 def _session_id(session: Mapping[str, Any]) -> str:
