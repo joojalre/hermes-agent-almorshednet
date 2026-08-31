@@ -321,7 +321,9 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"tombstone": tombstone})
         service.stop_room(
             str(params.get("room_id") or ""),
-            cancel_id=str(params.get("cancel_id") or "room-disbanded"),
+            cancel_id=str(
+                params.get("cancel_id") or f"desktop-disband:{uuid.uuid4().hex}"
+            ),
             require_acknowledged=True,
         )
         tombstone = disband_with_state(existing)

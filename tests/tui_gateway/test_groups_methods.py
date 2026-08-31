@@ -170,6 +170,40 @@ def test_groups_stop_generates_fresh_fences_but_preserves_explicit_idempotency(h
     assert len(explicit) == 1
 
 
+def test_groups_disband_generates_a_fresh_fence_for_each_attempt(home, monkeypatch):
+    _create_room()
+    service = methods_groups.get_hosted_room_service()
+    assert service is not None
+    cancel_ids = []
+
+    def reject_pending_stop(_room_id, *, cancel_id, require_acknowledged):
+        cancel_ids.append(cancel_id)
+        assert require_acknowledged is True
+        raise RuntimeError("stop is still pending")
+
+    monkeypatch.setattr(service, "stop_room", reject_pending_stop)
+
+    first = srv._methods["groups.disband"](2, {"room_id": "room-1"})
+    second = srv._methods["groups.disband"](3, {"room_id": "room-1"})
+    explicit_first = srv._methods["groups.disband"](
+        4,
+        {"room_id": "room-1", "cancel_id": "explicit-disband"},
+    )
+    explicit_second = srv._methods["groups.disband"](
+        5,
+        {"room_id": "room-1", "cancel_id": "explicit-disband"},
+    )
+
+    assert all(
+        result["error"]["code"] == 5114
+        for result in (first, second, explicit_first, explicit_second)
+    )
+    assert cancel_ids[0].startswith("desktop-disband:")
+    assert cancel_ids[1].startswith("desktop-disband:")
+    assert cancel_ids[0] != cancel_ids[1]
+    assert cancel_ids[2:] == ["explicit-disband", "explicit-disband"]
+
+
 def test_groups_list_returns_bounded_pages(home):
     _create_room()
     _result(

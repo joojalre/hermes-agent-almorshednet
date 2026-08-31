@@ -574,8 +574,10 @@ def _assert_event_capacity(
         count_reserve = STOP_EVENT_COUNT_RESERVE
         byte_reserve = STOP_EVENT_BYTE_RESERVE
     elif allow_terminal_recovery:
-        count_reserve = TERMINAL_RECOVERY_COUNT_RESERVE
-        byte_reserve = TERMINAL_RECOVERY_BYTE_RESERVE
+        # Stop fences consume the first reserve tier. Terminal recovery owns
+        # the next tier so cancellation traffic cannot crowd out completion.
+        count_reserve = STOP_EVENT_COUNT_RESERVE + TERMINAL_RECOVERY_COUNT_RESERVE
+        byte_reserve = STOP_EVENT_BYTE_RESERVE + TERMINAL_RECOVERY_BYTE_RESERVE
     else:
         count_reserve = 0
         byte_reserve = 0

@@ -539,6 +539,25 @@ def _task_schema_supports_current_statuses(conn: sqlite3.Connection) -> bool:
     return "'stopping'" in sql and "'deferred'" in sql
 
 
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    if not _schema_objects_exist(conn) or not _task_schema_supports_current_statuses(conn):
+        return False
+    rows = conn.execute(
+        """SELECT name FROM sqlite_master
+           WHERE type='table' AND name IN (
+               'hosted_room_terminal_receipts',
+               'hosted_room_approval_requests'
+           )"""
+    ).fetchall()
+    if {str(row[0]) for row in rows} != {
+        "hosted_room_terminal_receipts",
+        "hosted_room_approval_requests",
+    }:
+        return False
+    _validate_schema(conn)
+    return True
+
+
 def _migrate_task_status_constraint(conn: sqlite3.Connection) -> None:
     """Expand the unpublished task-state CHECK without losing durable work."""
     dependent_rows: dict[str, list[tuple[Any, ...]]] = {}
@@ -602,8 +621,13 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
     try:
         apply_wal_with_fallback(conn, db_label="state.db (hosted_room_driver)")
         conn.execute("PRAGMA foreign_keys=ON")
+        if _schema_is_current(conn):
+            return conn
+        conn.execute("BEGIN IMMEDIATE")
+        if _schema_is_current(conn):
+            conn.commit()
+            return conn
         if _schema_objects_exist(conn):
-            conn.execute("BEGIN IMMEDIATE")
             if not _task_schema_supports_current_statuses(conn):
                 _migrate_task_status_constraint(conn)
             _create_terminal_receipt_table(conn)
@@ -614,7 +638,6 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
         # Schema creation is one database-wide transaction. The driver schema
         # has never shipped, so an incompatible draft schema fails closed
         # instead of attempting a partial in-place migration.
-        conn.execute("BEGIN IMMEDIATE")
         _initialize_schema(conn)
         conn.commit()
     except Exception:

@@ -1010,6 +1010,66 @@ def test_stop_reserve_cannot_exhaust_critical_control_capacity(tmp_path, monkeyp
     assert _disband(db, room_id="room-1")["event"]["kind"] == "room.disbanded"
 
 
+def test_stop_reserve_preserves_terminal_recovery_capacity(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    _create(db)
+    _append(
+        db,
+        room_id="room-1",
+        event_id="message-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "first"},
+    )
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 1)
+    monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 2)
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 1)
+    state = rooms.room_state(db, room_id="room-1")
+
+    for index in range(2):
+        rooms.request_room_stop(
+            db,
+            room_id="room-1",
+            cancel_id=f"stop-{index}",
+            expected_gateway_id=state["authority_gateway_id"],
+            expected_epoch=state["authority_epoch"],
+        )
+
+    terminal = rooms.append_events(
+        db,
+        events=[
+            {
+                "room_id": "room-1",
+                "event_id": "terminal-1",
+                "kind": "turn.cancelled",
+                "actor": GATEWAY_A,
+                "payload": {"task_id": "task-1"},
+                "authority_gateway_id": state["authority_gateway_id"],
+                "authority_epoch": state["authority_epoch"],
+            }
+        ],
+        allow_terminal_recovery=True,
+    )
+
+    assert terminal[0]["kind"] == "turn.cancelled"
+    with pytest.raises(rooms.HostedRoomError, match="history limit"):
+        rooms.append_events(
+            db,
+            events=[
+                {
+                    "room_id": "room-1",
+                    "event_id": "terminal-2",
+                    "kind": "turn.cancelled",
+                    "actor": GATEWAY_A,
+                    "payload": {"task_id": "task-2"},
+                    "authority_gateway_id": state["authority_gateway_id"],
+                    "authority_epoch": state["authority_epoch"],
+                }
+            ],
+            allow_terminal_recovery=True,
+        )
+
+
 def test_room_listing_is_paged_and_old_tombstones_are_pruned(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     monkeypatch.setattr(rooms, "MAX_DISBANDED_ROOM_TOMBSTONES", 1)

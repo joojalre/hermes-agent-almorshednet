@@ -91,6 +91,25 @@ def _open_driver_schema(path: str) -> int:
     return len(driver.list_tasks(path, room_id="room-1"))
 
 
+def test_read_does_not_require_sqlite_writer_lock(db, monkeypatch):
+    identity = _identity()
+    _admit(db, identity, FakeClock())
+    writer = sqlite3.connect(db)
+    real_connect = sqlite3.connect
+
+    def connect_with_short_timeout(*args, **kwargs):
+        kwargs["timeout"] = 0.05
+        return real_connect(*args, **kwargs)
+
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        monkeypatch.setattr(driver.sqlite3, "connect", connect_with_short_timeout)
+        assert driver.get_task(db, identity)["status"] == "queued"
+    finally:
+        writer.rollback()
+        writer.close()
+
+
 def test_two_contenders_have_one_winner(db):
     clock = FakeClock()
 

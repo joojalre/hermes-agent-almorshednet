@@ -166,6 +166,35 @@ def test_session_interrupt_uses_explicit_stop_compatibility(server, monkeypatch,
     assert calls == ["hard" if kind == "hard-only" else "legacy"]
 
 
+def test_hosted_session_interrupt_does_not_stop_unrelated_tts(server, monkeypatch):
+    calls = []
+    session = {
+        "history_lock": threading.Lock(),
+        "running": True,
+        "_hosted_room_task": {"task_id": "hosted-task"},
+    }
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda: calls.append("tts"))
+    monkeypatch.setattr(server, "_sess_nowait", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(
+        server,
+        "_interrupt_session_turn",
+        lambda _sid, _session: calls.append("interrupt"),
+    )
+
+    response = server._methods["session.interrupt"](
+        "stop",
+        {
+            "session_id": "room-session",
+            "expected_hosted_task_id": "hosted-task",
+        },
+    )
+
+    assert response["result"]["status"] == "interrupted"
+    assert calls == ["interrupt"]
+
+
 # ── write_json ────────────────────────────────────────────────
 
 

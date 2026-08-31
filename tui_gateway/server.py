@@ -12792,14 +12792,28 @@ def _run_prompt_submit(
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
+                    refusal_message = (
+                        "\n".join(ctx.warnings) or "Context injection refused."
+                    )
                     _emit(
                         "error",
                         sid,
-                        {
-                            "message": "\n".join(ctx.warnings)
-                            or "Context injection refused."
-                        },
+                        {"message": refusal_message},
                     )
+                    if terminal_callback is not None:
+                        terminal_receipt_attempted = True
+                        terminal_receipt, terminal_receipt_committed = (
+                            _persist_hosted_terminal_receipt(
+                                session,
+                                {
+                                    "status": "failed",
+                                    "text": "",
+                                    "error": refusal_message,
+                                },
+                            )
+                        )
+                        terminal_callback(terminal_receipt)
+                        terminal_receipt_committed = True
                     return
                 prompt = ctx.message
 

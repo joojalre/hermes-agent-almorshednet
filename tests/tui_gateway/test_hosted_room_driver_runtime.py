@@ -1194,6 +1194,34 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
     assert runtime.stop(timeout=1.0)
 
 
+def test_completion_wins_stop_race_after_attempt_lease_expires(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    now = [100.0]
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(
+        db,
+        rpc,
+        clock=lambda: now[0],
+        lease_ttl_seconds=0.4,
+    )
+
+    runtime.start()
+    assert rpc.submitted.wait(1.0)
+
+    def finish_after_stop_intent_and_lease_expiry():
+        if state.get_task(db, identity)["status"] == "stopping":
+            now[0] = 101.0
+            rpc.complete(identity.task_id, content="Already done after expiry.")
+
+    rpc.on_info = finish_after_stop_intent_and_lease_expiry
+    result = runtime.cancel(identity, cancel_id="cancel-raced-expired-lease")
+
+    assert result["status"] == "settled"
+    assert result["result"]["text"] == "Already done after expiry."
+    assert runtime.stop(timeout=1.0)
+
+
 def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
     identity = _identity()
     _admit(db, identity)
@@ -1436,6 +1464,31 @@ def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Pa
     assert methods.index("resolve_exact") < methods.index("submit")
     assert methods.index("submit") < methods.index("complete")
     assert "history" not in methods
+
+
+def test_profile_lock_timeout_leaves_unsubmitted_task_queued(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC()
+
+    @contextmanager
+    def busy_lock(_profile: str):
+        raise RuntimeError("target_busy")
+        yield
+
+    runtime = _runtime(db, rpc, locks=busy_lock)
+
+    with pytest.raises(RuntimeError, match="target_busy"):
+        runtime._process_room(BINDING)
+
+    task = state.get_task(db, identity)
+    assert task["status"] == "queued"
+    assert task["execution_generation"] == 0
+    assert not [call for call in rpc.calls if call[0] == "submit"]
+
+    runtime.turn_lock = RecordingTurnLocks()
+    runtime._process_room(BINDING)
+    assert state.get_task(db, identity)["status"] == "settled"
 
 
 def test_stop_is_bounded_and_does_not_interrupt_active_turn(db: Path):
