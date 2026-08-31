@@ -143,8 +143,20 @@ _ARABIC_NORMALIZED_INSTRUCTION_RE = re.compile(
     rf")",
     re.IGNORECASE,
 )
+_ARABIC_PAST_AGENT_RE = r"(?:النظام|الخادم|التطبيق|البرنامج|الوكيل|الروبوت|الاختبار)"
+_ARABIC_PAST_MARKER_RE = (
+    r"(?:تلقائ(?:يا|ياً)|بنجاح|أمس|سابق(?:ا|اً)|مسبق(?:ا|اً)|دون\s+تدخل)"
+)
+_ARABIC_UNVOCALIZED_PAST_RE = re.compile(
+    rf"^\s*(?:نفذ|شغل|ثبت|أرسل|ارسل|تجاهل)\s+"
+    rf"{_ARABIC_PAST_AGENT_RE}\s+\S+"
+    rf"(?:\s+\S+){{0,3}}\s+{_ARABIC_PAST_MARKER_RE}(?!\w)"
+    rf"[.!؟]?\s*$",
+    re.IGNORECASE,
+)
 _PRESENTATION_PREFIX_RE = re.compile(
-    r"^\s*(?:(?:[-*+>•]|\d{1,3}[.)])\s+|[\"'`“”‘’]\s*){0,4}"
+    r"^\s*(?:(?:[-*+>•]|\d{1,3}[.)])\s+|\[(?: |x|X)\]\s+|"
+    r"[\"'`“”‘’]\s*){0,4}"
 )
 _SENSITIVE_FIELD_NAMES = {
     "api_key", "apikey", "access_token", "refresh_token", "client_secret",
@@ -215,6 +227,8 @@ def _scan_text(value: str, *, field: str) -> str | None:
 def _is_instruction_like(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value)
     normalized = _PRESENTATION_PREFIX_RE.sub("", normalized, count=1)
+    if _ARABIC_UNVOCALIZED_PAST_RE.search(normalized):
+        return False
     if _INSTRUCTION_RE.search(normalized):
         return True
     if _ARABIC_VOCALIZED_IMPERATIVE_RE.search(normalized):
@@ -425,6 +439,10 @@ def _record_from(
     fact_key = raw.get("fact_key", "")
     if not isinstance(fact_key, str) or len(fact_key) > MAX_ID_CHARS:
         raise KnowledgeError(f"record {record_id}: fact_key is invalid")
+    if status == "CONFLICTING" and not fact_key:
+        raise KnowledgeError(
+            f"record {record_id}: CONFLICTING status requires fact_key"
+        )
     source = sources[source_id]
     revision = _validate_rendered_metadata(
         raw.get("revision") or source["revision"],
@@ -503,7 +521,15 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
         seen.add(key)
         deduped.append(record)
 
-    conflicts = []
+    conflicts = [
+        {"id": item["id"], "fact_key": item["fact_key"]}
+        for item in deduped
+        if item["status"] == "CONFLICTING"
+    ]
+    conflict_entries = {
+        (item["id"], item["fact_key"])
+        for item in conflicts
+    }
     by_key: dict[str, list[dict[str, Any]]] = {}
     for record in deduped:
         if record["fact_key"]:
@@ -513,9 +539,12 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
         if len({_comparison_text(item["statement"]) for item in group}) > 1:
             for item in group:
                 item["status"] = "CONFLICTING"
-                conflicts.append(
-                    {"id": item["id"], "fact_key": item["fact_key"]}
-                )
+                entry = (item["id"], item["fact_key"])
+                if entry not in conflict_entries:
+                    conflicts.append(
+                        {"id": item["id"], "fact_key": item["fact_key"]}
+                    )
+                    conflict_entries.add(entry)
 
     accepted = [item for item in deduped if item["status"] != "CONFLICTING"]
     return {
