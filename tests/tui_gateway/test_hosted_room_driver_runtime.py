@@ -1440,6 +1440,59 @@ def test_ambiguous_recovery_remains_indeterminate(db: Path):
     assert not [call for call in rpc.calls if call[0] == "submit"]
 
 
+def test_restart_harvests_private_durable_terminal_receipt(db: Path):
+    identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-process",
+        ttl_seconds=0.2,
+        clock=clock,
+    )
+    _admit(db, identity)
+    attempt = state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    state.record_terminal_receipt(
+        db,
+        identity,
+        execution_generation=attempt.execution_generation,
+        settlement_id="reply-task-1-1",
+        status="settled",
+        result={"message_id": "reply-task-1-1", "text": "durable answer"},
+        clock=clock,
+    )
+    rpc = FakeSessionRPC(auto_complete=False)
+    rpc.add_session(active=False, task_id=identity.task_id)
+    now[0] = 101.0
+    published = []
+    runtime = _runtime(
+        db,
+        rpc,
+        clock=clock,
+        publish_terminal=lambda _binding, task: published.append(task),
+    )
+
+    runtime._process_room(BINDING)
+
+    settled = state.get_task(db, identity)
+    assert settled["status"] == "settled"
+    assert settled["result"]["text"] == "durable answer"
+    assert [task["status"] for task in published] == ["settled"]
+    assert not [call for call in rpc.calls if call[0] == "submit"]
+
+
 def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
     db: Path,
 ):
@@ -1551,11 +1604,24 @@ def test_offline_member_defers_then_healthy_task_runs_and_retry_is_fenced(
     assert state.get_task(db, first)["result"]["text"] == "retry accepted"
 
 
-def test_post_submit_observation_failure_preserves_recoverable_outcome(db: Path):
+def test_post_submit_observation_failure_preserves_recoverable_outcome(
+    db: Path,
+    monkeypatch,
+):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    rpc.history_failures = 1
+    original_receipt = state.get_terminal_receipt
+    failures = 1
+
+    def fail_receipt_once(*args, **kwargs):
+        nonlocal failures
+        if failures:
+            failures -= 1
+            raise RuntimeError("transient durable receipt read failed")
+        return original_receipt(*args, **kwargs)
+
+    monkeypatch.setattr(state, "get_terminal_receipt", fail_receipt_once)
     runtime = _runtime(db, rpc)
 
     runtime.start()
@@ -1605,29 +1671,40 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc)
+    runtime = _runtime(db, rpc, active_poll_interval_seconds=10.0)
     original_interrupt = rpc.interrupt
+    original_record_error = runtime._record_error
     attempts = 0
-    retry_allowed = threading.Event()
+    worker_failure_recorded = threading.Event()
+    release_worker = threading.Event()
 
     def flaky_interrupt(**kwargs):
         nonlocal attempts
         attempts += 1
-        if attempts == 1:
+        if attempts <= 2:
             raise RuntimeError("temporary stop transport failure")
-        assert retry_allowed.wait(1.0)
         return original_interrupt(**kwargs)
 
+    def block_worker_after_retry_failure(message: str) -> None:
+        original_record_error(message)
+        if message.startswith("stop retry remains pending"):
+            worker_failure_recorded.set()
+            assert release_worker.wait(2.0)
+
     rpc.interrupt = flaky_interrupt
+    runtime._record_error = block_worker_after_retry_failure
     runtime.start()
     assert rpc.submitted.wait(1.0)
     stopping = runtime.cancel(identity, cancel_id="cancel-retry")
     assert stopping["status"] == "stopping"
     assert state.get_task(db, identity)["status"] == "stopping"
-    retry_allowed.set()
+    assert worker_failure_recorded.wait(1.0)
+    cycles = runtime.status()["cycles"]
     runtime.wakeup()
+    _wait_for(lambda: runtime.status()["cycles"] > cycles)
+    release_worker.set()
     _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
-    assert attempts >= 2
+    assert attempts >= 3
     assert runtime.stop(timeout=1.0)
     assert state.get_task(db, identity)["status"] == "cancelled"
 
@@ -1811,21 +1888,22 @@ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
         expected_cancel_generation=attempt.cancel_generation,
         clock=clock,
     )
+    state.record_terminal_receipt(
+        db,
+        identity,
+        execution_generation=attempt.execution_generation,
+        settlement_id="reply-after-stop",
+        status="settled",
+        result={"text": "Finished before Stop reached the session."},
+        clock=lambda: now[0],
+    )
     rpc = FakeSessionRPC(auto_complete=False)
     rpc.add_session(
         active=False,
         task_id=identity.task_id,
-        history=[
-            {
-                "role": "assistant",
-                "task_id": identity.task_id,
-                "execution_generation": attempt.execution_generation,
-                "status": "settled",
-                "message_id": "reply-after-stop",
-                "content": "Finished before Stop reached the session.",
-            }
-        ],
+        history=[],
     )
+    rpc.history_failures = 1
     now[0] = 102.0
     runtime = _runtime(
         db,
@@ -1852,6 +1930,8 @@ def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path
         return now[0]
 
     _admit(db, identity)
+    now = [100.0]
+    clock = lambda: now[0]
     old_lease = state.acquire_lease(
         db,
         room_id=ROOM_ID,

@@ -9,6 +9,7 @@ from .method_ctx import HandlerRegistry
 
 import os
 import threading
+import uuid
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -48,7 +49,7 @@ def bind_server(server) -> None:
     server._profile_execution_policy = _profile_execution_policy
 
 
-def start_hosted_room_service():
+def start_hosted_room_service(*, start_allowed: threading.Event | None = None):
     """Start one process-owned hosted room service idempotently."""
 
     global _service
@@ -59,6 +60,8 @@ def start_hosted_room_service():
 
     db_path = default_db_path()
     with _service_lock:
+        if start_allowed is not None and not start_allowed.is_set():
+            return None
         if _service is not None and _service.db_path != db_path:
             _service.stop(timeout=1.0)
             _service = None
@@ -691,7 +694,9 @@ def _(rid, params: dict) -> dict:
     try:
         count = service.stop_room(
             str(params.get("room_id") or ""),
-            cancel_id=str(params.get("cancel_id") or "desktop-stop"),
+            cancel_id=str(
+                params.get("cancel_id") or f"desktop-stop:{uuid.uuid4().hex}"
+            ),
         )
         return _ok(rid, {"cancelled": count})
     except Exception as exc:

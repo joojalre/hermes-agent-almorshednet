@@ -112,6 +112,67 @@ def test_two_contenders_have_one_winner(db):
     assert winners[0].lease_generation == 1
 
 
+def test_terminal_receipt_is_durable_idempotent_and_generation_fenced(db):
+    clock = FakeClock()
+    identity = _identity()
+    lease = _lease(db, clock)
+    _admit(db, identity, clock)
+    attempt = driver.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+
+    first = driver.record_terminal_receipt(
+        db,
+        identity,
+        execution_generation=attempt.execution_generation,
+        settlement_id="reply-task-1-1",
+        status="settled",
+        result={"message_id": "reply-task-1-1", "text": "done"},
+        clock=clock,
+    )
+    repeated = driver.record_terminal_receipt(
+        db,
+        identity,
+        execution_generation=attempt.execution_generation,
+        settlement_id="reply-task-1-1",
+        status="settled",
+        result={"message_id": "reply-task-1-1", "text": "done"},
+        clock=clock,
+    )
+
+    assert first["idempotent"] is False
+    assert repeated["idempotent"] is True
+    assert driver.get_terminal_receipt(
+        db,
+        identity,
+        execution_generation=attempt.execution_generation,
+    )["result"]["text"] == "done"
+    with pytest.raises(driver.TaskConflictError):
+        driver.record_terminal_receipt(
+            db,
+            identity,
+            execution_generation=attempt.execution_generation,
+            settlement_id="reply-task-1-1",
+            status="failed",
+            result={"message_id": "reply-task-1-1", "error": "different"},
+            clock=clock,
+        )
+    with pytest.raises(driver.StaleTaskError):
+        driver.record_terminal_receipt(
+            db,
+            identity,
+            execution_generation=attempt.execution_generation + 1,
+            settlement_id="reply-task-1-2",
+            status="settled",
+            result={"message_id": "reply-task-1-2", "text": "stale"},
+            clock=clock,
+        )
+
+
 def test_expiry_allows_reclaim_and_fences_stale_renew_and_release(db):
     clock = FakeClock()
     first = _lease(db, clock, ttl=5)

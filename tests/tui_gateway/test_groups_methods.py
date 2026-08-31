@@ -462,6 +462,56 @@ def test_create_list_send_and_log_roundtrip(home):
     }
 
 
+def test_groups_stop_generates_fresh_fences_but_preserves_explicit_idempotency(home):
+    from gateway import hosted_rooms
+
+    _create_room()
+    service = methods_groups.get_hosted_room_service()
+    assert service is not None
+
+    _result(srv._methods["groups.stop"](2, {"room_id": "room-1"}))
+    room = hosted_rooms.room_state(service.db_path, room_id="room-1")
+    hosted_rooms.append_event(
+        service.db_path,
+        room_id="room-1",
+        event_id="between-stops",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "new work", "thread_id": "thread-1"},
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+    )
+    _result(srv._methods["groups.stop"](4, {"room_id": "room-1"}))
+    _result(
+        srv._methods["groups.stop"](
+            5,
+            {"room_id": "room-1", "cancel_id": "explicit-stop"},
+        )
+    )
+    _result(
+        srv._methods["groups.stop"](
+            6,
+            {"room_id": "room-1", "cancel_id": "explicit-stop"},
+        )
+    )
+
+    events = hosted_rooms.read_events(service.db_path, room_id="room-1")["events"]
+    stops = [event for event in events if event["kind"] == "room.stop_requested"]
+    generated = [
+        event for event in stops if event["payload"]["cancel_id"].startswith("desktop-stop:")
+    ]
+    explicit = [
+        event for event in stops if event["payload"]["cancel_id"] == "explicit-stop"
+    ]
+    message = next(event for event in events if event["event_id"] == "between-stops")
+
+    assert len(generated) == 2
+    assert generated[0]["event_id"] != generated[1]["event_id"]
+    assert generated[0]["payload"]["cancel_id"] != generated[1]["payload"]["cancel_id"]
+    assert generated[0]["seq"] < message["seq"] < generated[1]["seq"]
+    assert len(explicit) == 1
+
+
 def test_groups_list_returns_bounded_pages(home):
     _create_room()
     _result(

@@ -4047,6 +4047,12 @@ def _ensure_session_db_row(session: dict) -> bool:
                 Path(profile_home).name if profile_home else _current_profile_name()
             ),
         )
+        # Hosted-room sessions are the durable per-room member context. They
+        # must never be mistaken for stale user chats by the automatic archive
+        # sweep, even before the room's next exact-title lookup can repair an
+        # older unpinned row.
+        if _session_source(session).casefold() == "bot_room":
+            db.set_session_pinned(key, True)
         # A session can be born hidden (session.create hidden=true, or a
         # session.set_hidden that arrived before the row existed): apply the
         # deferred intent now that the row exists, mirroring pending_title.
@@ -12728,6 +12734,42 @@ def _start_usage_ticker(
     return stop, thread
 
 
+def _persist_hosted_terminal_receipt(
+    session: dict,
+    receipt: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Commit private task proof before invoking the process-local callback."""
+
+    task = session.get("_hosted_room_task")
+    status = receipt.get("status")
+    if not isinstance(task, dict) or status == "cancelled":
+        return receipt, False
+    from gateway import hosted_room_driver as driver_state
+    from gateway.hosted_rooms import default_db_path
+    from tui_gateway.hosted_room_driver import _bounded_terminal_result
+
+    terminal_status = "settled" if status == "settled" else "failed"
+    identity = driver_state.TaskIdentity(
+        room_id=str(task.get("room_id") or ""),
+        task_id=str(task.get("task_id") or ""),
+        thread_id=str(task.get("thread_id") or ""),
+        turn_id=str(task.get("turn_id") or ""),
+    )
+    generation = int(task.get("execution_generation") or 0)
+    settlement_id = f"reply:{identity.task_id}:{generation}"
+    bounded = _bounded_terminal_result({**receipt, "message_id": settlement_id})
+    driver_state.record_terminal_receipt(
+        default_db_path(),
+        identity,
+        execution_generation=generation,
+        settlement_id=settlement_id,
+        status=terminal_status,
+        result=bounded,
+        clock=time.time,
+    )
+    return {**receipt, "settlement_id": settlement_id}, True
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -13332,21 +13374,25 @@ def _run_prompt_submit(
                     payload["error_surface"] = _error_surface
             if terminal_callback is not None:
                 terminal_receipt_attempted = True
-                terminal_callback(
-                    {
-                        "status": (
-                            "cancelled"
-                            if status == "interrupted"
-                            else "failed" if status == "error" else "settled"
-                        ),
-                        "text": raw if isinstance(raw, str) else str(raw),
-                        **(
-                            {"error": str(result.get("error") or raw)}
-                            if status == "error" and isinstance(result, dict)
-                            else {}
-                        ),
-                    }
+                terminal_receipt, terminal_receipt_committed = (
+                    _persist_hosted_terminal_receipt(
+                        session,
+                        {
+                            "status": (
+                                "cancelled"
+                                if status == "interrupted"
+                                else "failed" if status == "error" else "settled"
+                            ),
+                            "text": raw if isinstance(raw, str) else str(raw),
+                            **(
+                                {"error": str(result.get("error") or raw)}
+                                if status == "error" and isinstance(result, dict)
+                                else {}
+                            ),
+                        },
+                    )
                 )
+                terminal_callback(terminal_receipt)
                 terminal_receipt_committed = True
             if terminal_receipt_committed:
                 _retire_turn_marker(session, marker_key)
@@ -13532,9 +13578,13 @@ def _run_prompt_submit(
             if terminal_callback is not None and not terminal_receipt_attempted:
                 terminal_receipt_attempted = True
                 try:
-                    terminal_callback(
-                        {"status": "failed", "text": "", "error": str(e)}
+                    terminal_receipt, terminal_receipt_committed = (
+                        _persist_hosted_terminal_receipt(
+                            session,
+                            {"status": "failed", "text": "", "error": str(e)},
+                        )
                     )
+                    terminal_callback(terminal_receipt)
                     terminal_receipt_committed = True
                 except Exception:
                     logger.exception("hosted room terminal receipt commit failed")

@@ -13345,7 +13345,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return exact, fallback
 
     @staticmethod
-    def _start_hosted_room_worker_sync():
+    def _start_hosted_room_worker_sync(start_allowed: threading.Event):
         """Start the local Group Chat worker without importing the dashboard."""
 
         import tui_gateway.server  # noqa: F401
@@ -13353,8 +13353,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         service = methods_groups.get_hosted_room_service()
         if service is None:
-            service = methods_groups.start_hosted_room_service()
+            service = methods_groups.start_hosted_room_service(
+                start_allowed=start_allowed,
+            )
         if service is None:
+            if not start_allowed.is_set():
+                return None
             raise RuntimeError("Group Chat worker has no bound session backend")
         status = service.runtime.status()
         if not status.get("running") or status.get("stopping"):
@@ -13362,13 +13366,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return service
 
     async def _ensure_hosted_room_worker(self):
-        return await asyncio.to_thread(self._start_hosted_room_worker_sync)
+        start_allowed = getattr(self, "_hosted_room_start_allowed", None)
+        if start_allowed is None:
+            start_allowed = threading.Event()
+            if getattr(self, "_running", True):
+                start_allowed.set()
+            self._hosted_room_start_allowed = start_allowed
+        return await asyncio.to_thread(
+            self._start_hosted_room_worker_sync,
+            start_allowed,
+        )
 
     async def _hosted_room_worker_watcher(self, interval: float = 1.0) -> None:
         """Keep the room worker alive for the messaging gateway lifetime."""
 
         while self._running:
             await self._ensure_hosted_room_worker()
+            # ``to_thread`` recovery can finish after shutdown has already
+            # observed no active service and completed its first stop attempt.
+            # Stop that late-created runtime before leaving the watcher.
+            if not self._running:
+                await self._stop_hosted_room_worker()
+                return
             await asyncio.sleep(interval)
 
     async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
@@ -16060,6 +16079,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _phase_elapsed() -> float:
                 return time.monotonic() - _stop_started_at
 
+            start_allowed = getattr(self, "_hosted_room_start_allowed", None)
+            if start_allowed is not None:
+                start_allowed.clear()
             self._running = False
             self._clear_plugin_message_injector()
             self._draining = True
