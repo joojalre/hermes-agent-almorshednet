@@ -51,6 +51,16 @@ _SECRET_VALUE_RE = re.compile(
 _ENGLISH_INSTRUCTION_VERB_RE = (
     r"(?:run|execute|delete|remove|upload|send|click|open|install|deploy|merge|push|ignore|disregard)"
 )
+_ENGLISH_COURTESY_RE = r"(?:please|kindly)"
+_ENGLISH_COURTESY_SEPARATOR_RE = r"(?:\s*[,;:،؛]\s*|\s+)"
+_ENGLISH_MODAL_RE = r"(?:can|could|would|will)"
+_ENGLISH_DO_ACTION_PREFIX_RE = r"do(?:\s+not|n['’]t)?\s+"
+_ENGLISH_MODAL_REQUEST_RE = (
+    rf"{_ENGLISH_MODAL_RE}\s+you{_ENGLISH_COURTESY_SEPARATOR_RE}"
+    rf"(?:{_ENGLISH_COURTESY_RE}{_ENGLISH_COURTESY_SEPARATOR_RE})?"
+    rf"(?:(?:not\s+)|{_ENGLISH_DO_ACTION_PREFIX_RE})?"
+    rf"{_ENGLISH_INSTRUCTION_VERB_RE}\b"
+)
 _ARABIC_ACTION_NOUN_RE = (
     r"(?:حذف|إزالة|ازالة|تنفيذ|تشغيل|رفع|إرسال|ارسال|فتح|تثبيت|نشر|دمج|دفع|تجاهل)"
 )
@@ -67,10 +77,52 @@ _ARABIC_ACTION_ENDING_RE = (
     rf"وا|و{_ARABIC_OBJECT_SUFFIX_RE})?"
 )
 _ARABIC_DECORATION_RE = re.compile(r"[\u0640\u064B-\u065F\u0670]")
+_ARABIC_DECORATION_GAP_RE = r"[\u0640\u064B-\u065F\u0670]*"
+_ARABIC_PRE_SUKUN_DECORATION_RE = r"[\u0640\u064B-\u0651\u0653-\u065F\u0670]*"
+_ARABIC_PRE_FATHA_DECORATION_RE = r"[\u0640\u064B-\u064D\u064F-\u065F\u0670]*"
+_ARABIC_NO_DAMMA_GAP_RE = (
+    rf"(?!{_ARABIC_DECORATION_GAP_RE}\u064f)"
+    rf"{_ARABIC_DECORATION_GAP_RE}"
+)
+_ARABIC_NO_FATHA_GAP_RE = (
+    rf"(?!{_ARABIC_DECORATION_GAP_RE}\u064e)"
+    rf"{_ARABIC_DECORATION_GAP_RE}"
+)
+_ARABIC_KASRA_GAP_RE = (
+    rf"(?={_ARABIC_DECORATION_GAP_RE}\u0650)"
+    rf"{_ARABIC_DECORATION_GAP_RE}"
+)
+_ARABIC_KASRA_SHADDA_GAP_RE = (
+    rf"(?={_ARABIC_DECORATION_GAP_RE}\u0650)"
+    rf"(?={_ARABIC_DECORATION_GAP_RE}\u0651)"
+    rf"{_ARABIC_DECORATION_GAP_RE}"
+)
+_ARABIC_DUAL_ACTION_ENDING_RE = (
+    rf"{_ARABIC_PRE_FATHA_DECORATION_RE}\u064eا"
+    rf"(?:{_ARABIC_OBJECT_SUFFIX_RE})?"
+)
+_ARABIC_VOCALIZED_IMPERATIVE_RE = re.compile(
+    rf"^\s*(?:"
+    rf"(?:"
+    rf"ن{_ARABIC_NO_DAMMA_GAP_RE}ف{_ARABIC_KASRA_SHADDA_GAP_RE}ذ"
+    rf"|ش{_ARABIC_NO_DAMMA_GAP_RE}غ{_ARABIC_KASRA_SHADDA_GAP_RE}ل"
+    rf"|ث{_ARABIC_NO_DAMMA_GAP_RE}ب{_ARABIC_KASRA_SHADDA_GAP_RE}ت"
+    rf"|(?:أ|ا){_ARABIC_NO_DAMMA_GAP_RE}ر{_ARABIC_DECORATION_GAP_RE}"
+    rf"س{_ARABIC_KASRA_GAP_RE}ل"
+    rf")(?:{_ARABIC_NO_FATHA_GAP_RE}{_ARABIC_ACTION_ENDING_RE}"
+    rf"|{_ARABIC_DUAL_ACTION_ENDING_RE})"
+    rf"|ت{_ARABIC_DECORATION_GAP_RE}ج{_ARABIC_DECORATION_GAP_RE}"
+    rf"ا{_ARABIC_DECORATION_GAP_RE}ه{_ARABIC_DECORATION_GAP_RE}ل"
+    rf"{_ARABIC_PRE_SUKUN_DECORATION_RE}\u0652"
+    rf"{_ARABIC_ACTION_ENDING_RE}"
+    rf")(?!\w)",
+    re.IGNORECASE,
+)
 _INSTRUCTION_RE = re.compile(
     rf"^\s*(?:"
-    rf"(?:(?:please|kindly)(?:\s*[,;:،؛]\s*|\s+))?"
-    rf"(?:(?:do(?:\s+not|n['’]t)?\s+)?{_ENGLISH_INSTRUCTION_VERB_RE}\b|you\s+must\b|must\b)"
+    rf"(?:{_ENGLISH_COURTESY_RE}{_ENGLISH_COURTESY_SEPARATOR_RE})?"
+    rf"(?:(?:do(?:\s+not|n['’]t)?\s+)?{_ENGLISH_INSTRUCTION_VERB_RE}\b"
+    rf"|{_ENGLISH_MODAL_REQUEST_RE}|you\s+must\b|must\b)"
     rf"|(?:يرجى|الرجاء|من\s+فضلك)(?:\s*[,;:،؛]\s*|\s+)"
     rf"(?:{_ARABIC_ACTION_NOUN_RE}|{_ARABIC_IMPERATIVE_RE})"
     rf"{_ARABIC_ACTION_ENDING_RE}(?!\w)"
@@ -160,8 +212,14 @@ def _is_instruction_like(value: str) -> bool:
     normalized = unicodedata.normalize("NFKC", value)
     if _INSTRUCTION_RE.search(normalized):
         return True
+    if _ARABIC_VOCALIZED_IMPERATIVE_RE.search(normalized):
+        return True
     arabic_normalized = _ARABIC_DECORATION_RE.sub("", normalized)
     return bool(_ARABIC_NORMALIZED_INSTRUCTION_RE.search(arabic_normalized))
+
+
+def _comparison_text(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
 
 
 def _reject_sensitive_fields(value: Any, *, path: str = "$manifest") -> None:
@@ -430,7 +488,10 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
     seen = set()
     duplicates = []
     for record in records:
-        key = (record["domain"].casefold(), record["statement"].casefold())
+        key = (
+            _comparison_text(record["domain"]),
+            _comparison_text(record["statement"]),
+        )
         if key in seen:
             duplicates.append({"id": record["id"], "reason": "duplicate fact"})
             continue
@@ -441,12 +502,10 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
     by_key: dict[str, list[dict[str, Any]]] = {}
     for record in deduped:
         if record["fact_key"]:
-            comparison_key = unicodedata.normalize(
-                "NFKC", record["fact_key"]
-            ).casefold()
+            comparison_key = _comparison_text(record["fact_key"])
             by_key.setdefault(comparison_key, []).append(record)
     for group in by_key.values():
-        if len({item["statement"].casefold() for item in group}) > 1:
+        if len({_comparison_text(item["statement"]) for item in group}) > 1:
             for item in group:
                 item["status"] = "CONFLICTING"
                 conflicts.append(
@@ -652,6 +711,14 @@ def _object_has_typed_fields(
     )
 
 
+def _audit_timestamp_is_valid(value: str) -> bool:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (OverflowError, ValueError):
+        return False
+    return parsed.tzinfo is not None
+
+
 def _validate_audit_event(event: Any) -> dict[str, Any]:
     top_level_fields = {
         "run_id": str,
@@ -671,20 +738,111 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
         or event["schema_version"] != SCHEMA_VERSION
         or not _RUN_ID_RE.fullmatch(event["run_id"])
         or not re.fullmatch(r"[0-9a-f]{64}", event["manifest_sha256"])
+        or not _audit_timestamp_is_valid(event["created_at"])
         or event["mode"] not in {"apply", "dry-run"}
     ):
         raise KnowledgeError("knowledge audit is malformed")
 
-    list_fields = (
-        "sources",
-        "records",
-        "rejected",
-        "duplicates",
-        "conflicts",
-    )
+    nested_fields = {
+        "sources": {
+            "id": str,
+            "kind": str,
+            "locator": str,
+            "revision": str,
+            "sha": str,
+            "accepted": bool,
+        },
+        "records": {
+            "id": str,
+            "fact_key": str,
+            "statement": str,
+            "domain": str,
+            "source_id": str,
+            "revision": str,
+            "sha": str,
+            "verified_at": str,
+            "status": str,
+        },
+        "rejected": {"index": int, "reason": str},
+        "duplicates": {"id": str, "reason": str},
+        "conflicts": {"id": str, "fact_key": str},
+    }
     if any(
-        not all(isinstance(item, dict) for item in event[field])
-        for field in list_fields
+        not all(
+            _object_has_typed_fields(item, fields)
+            for item in event[field]
+        )
+        for field, fields in nested_fields.items()
+    ):
+        raise KnowledgeError("knowledge audit is malformed")
+
+    sources = event["sources"]
+    source_ids = {item["id"] for item in sources}
+    if (
+        not 1 <= len(sources) <= MAX_SOURCE_COUNT
+        or len(source_ids) != len(sources)
+        or any(
+            not _ID_RE.fullmatch(item["id"])
+            or item["kind"] not in VALID_KINDS
+            or not item["locator"]
+            or len(item["locator"]) > MAX_URI_CHARS
+            or len(item["revision"]) > MAX_URI_CHARS
+            or not (item["revision"] or item["sha"])
+            or bool(item["sha"] and not _HEX_SHA_RE.fullmatch(item["sha"]))
+            or item["accepted"] is not True
+            for item in sources
+        )
+    ):
+        raise KnowledgeError("knowledge audit is malformed")
+
+    records = event["records"]
+    conflicting_records = {
+        (item["id"], item["fact_key"])
+        for item in records
+        if item["status"] == "CONFLICTING"
+    }
+    if (
+        len(records) > MAX_RECORD_COUNT
+        or any(
+            not _ID_RE.fullmatch(item["id"])
+            or len(item["fact_key"]) > MAX_ID_CHARS
+            or not item["statement"].strip()
+            or len(item["statement"]) > MAX_STATEMENT_CHARS
+            or not item["domain"].strip()
+            or len(item["domain"]) > MAX_DOMAIN_CHARS
+            or item["source_id"] not in source_ids
+            or len(item["revision"]) > MAX_URI_CHARS
+            or not (item["revision"] or item["sha"])
+            or bool(item["sha"] and not _HEX_SHA_RE.fullmatch(item["sha"]))
+            or not _audit_timestamp_is_valid(item["verified_at"])
+            or item["status"] not in VALID_STATUSES
+            for item in records
+        )
+    ):
+        raise KnowledgeError("knowledge audit is malformed")
+
+    if (
+        len(event["rejected"]) > MAX_RECORD_COUNT
+        or any(
+            type(item["index"]) is not int
+            or not 1 <= item["index"] <= MAX_RECORD_COUNT
+            or not item["reason"]
+            for item in event["rejected"]
+        )
+        or len(event["duplicates"]) > MAX_RECORD_COUNT
+        or any(
+            not _ID_RE.fullmatch(item["id"])
+            or item["reason"] != "duplicate fact"
+            for item in event["duplicates"]
+        )
+        or len(event["conflicts"]) > MAX_RECORD_COUNT
+        or any(
+            not _ID_RE.fullmatch(item["id"])
+            or not item["fact_key"]
+            or len(item["fact_key"]) > MAX_ID_CHARS
+            or (item["id"], item["fact_key"]) not in conflicting_records
+            for item in event["conflicts"]
+        )
     ):
         raise KnowledgeError("knowledge audit is malformed")
 
@@ -701,6 +859,8 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
         if (
             not _object_has_typed_fields(memory, memory_fields)
             or memory["status"] != "applied"
+            or not memory["path"].strip()
+            or not memory["backup_path"].strip()
             or type(memory["effective_limit"]) is not int
             or memory["effective_limit"] <= 0
             or not re.fullmatch(r"[0-9a-f]{64}", memory["before_sha256"])
@@ -716,7 +876,7 @@ def _validate_audit_event(event: Any) -> dict[str, Any]:
 def _parse_audit_event(line: str) -> dict[str, Any]:
     try:
         event = json.loads(line)
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:
         raise KnowledgeError("knowledge audit is malformed") from exc
     return _validate_audit_event(event)
 
@@ -786,8 +946,15 @@ def _verified_memory_path(memory: Any) -> Path:
     raw_path = memory.get("path")
     if raw_path is not None and not isinstance(raw_path, str):
         raise KnowledgeError("audit memory path is invalid")
-    candidate = Path(raw_path).expanduser().resolve() if raw_path else _memory_path().resolve()
-    expected = _memory_path().resolve()
+    try:
+        candidate = (
+            Path(raw_path).expanduser().resolve()
+            if raw_path
+            else _memory_path().resolve()
+        )
+        expected = _memory_path().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise KnowledgeError("audit memory path is invalid") from exc
     if candidate != expected:
         raise KnowledgeError("audit memory path is outside the active Hermes profile")
     return candidate
