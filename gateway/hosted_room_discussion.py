@@ -290,8 +290,14 @@ def validate_roster(
     value: Any,
     *,
     local_profiles: Iterable[str],
+    require_current_profiles: bool = True,
 ) -> tuple[DiscussionMember, ...]:
-    """Validate a frozen 2-6 member roster of profiles on this gateway."""
+    """Validate a frozen 2-6 member roster of profiles on this gateway.
+
+    Room creation requires every profile to exist locally. Replay validates the
+    stored roster without reapplying that time-varying membership check so an
+    unavailable member can be deferred without invalidating the whole room.
+    """
 
     if not isinstance(value, list):
         raise DiscussionValidationError("members must be a list")
@@ -301,9 +307,11 @@ def validate_roster(
             f"{MAX_DISCUSSION_MEMBERS} entries"
         )
 
-    known_profiles = {
-        _identifier(profile, label="local profile") for profile in local_profiles
-    }
+    known_profiles = (
+        {_identifier(profile, label="local profile") for profile in local_profiles}
+        if require_current_profiles
+        else None
+    )
     members: list[DiscussionMember] = []
     profiles: set[str] = set()
     handles: set[str] = set()
@@ -327,7 +335,7 @@ def validate_roster(
         member_id = _identifier(member["member_id"], label=f"member {index} id")
         profile = _identifier(member["profile"], label=f"member {index} profile")
         handle = _identifier(member["handle"], label=f"member {index} handle")
-        if profile not in known_profiles:
+        if known_profiles is not None and profile not in known_profiles:
             raise DiscussionValidationError(
                 f"member {index} profile '{profile}' is not local to this gateway"
             )
@@ -391,7 +399,11 @@ def validate_room(
         value.get("authority_epoch"),
         label="authority_epoch",
     )
-    members = validate_roster(value.get("members"), local_profiles=local_profiles)
+    members = validate_roster(
+        value.get("members"),
+        local_profiles=local_profiles,
+        require_current_profiles=False,
+    )
     return DiscussionRoom(
         room_id=room_id,
         name=name,

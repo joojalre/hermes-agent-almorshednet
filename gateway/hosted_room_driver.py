@@ -1979,6 +1979,8 @@ def decide_approval_request(
         task = _load_task(conn, identity)
         if int(task["execution_generation"]) != execution_generation:
             raise StaleTaskError("approval decision belongs to a stale task generation")
+        if task["status"] != "running":
+            raise StaleTaskError("approval decision requires a running task")
         row = conn.execute(
             """SELECT * FROM hosted_room_approval_requests
                WHERE room_id=? AND task_id=? AND execution_generation=?

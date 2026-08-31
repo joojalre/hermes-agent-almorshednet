@@ -1012,6 +1012,123 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
     assert stopping["cancel_id"] == "stop-1"
 
 
+def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from gateway import hosted_room_replicas as replicas
+
+    class ControlledStopRPC(_FakeRPC):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_task_id = None
+            self.acknowledge = False
+            self.expected_task_ids: list[str] = []
+
+        def info(self, *, profile, session_id, source):
+            return {"active": True, "task_id": self.active_task_id}
+
+        def interrupt(self, *, profile, session_id, source, expected_task_id):
+            self.expected_task_ids.append(expected_task_id)
+            if not self.acknowledge:
+                return None
+            return {"interrupted": True}
+
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = ControlledStopRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    binding = service.bindings()[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="worker",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    rpc.sessions[("ops", "Group: room-1")] = {"session_id": "ops-session"}
+    rpc.active_task_id = task["identity"].task_id
+    observed_gateway = "install:" + "b" * 32
+    remote_db = tmp_path / "remote-state.db"
+    replicas.ingest_page(
+        remote_db,
+        room_id="room-1",
+        room_name=room["name"],
+        members=room["members"],
+        page=hosted_rooms.read_events(
+            db, room_id="room-1", since_seq=0, limit=100
+        ),
+    )
+    with monkeypatch.context() as remote_gateway:
+        remote_gateway.setattr(
+            replicas,
+            "local_authority_gateway_id",
+            lambda: observed_gateway,
+        )
+        observation = replicas.promote_replica(
+            remote_db,
+            room_id="room-1",
+            reason="old authority unreachable",
+        )
+    assert observation["authority_epoch"] == 2
+
+    with pytest.raises(RuntimeError, match="still stopping"):
+        service.demote_room(
+            "room-1",
+            observed_gateway_id=observation["authority_gateway_id"],
+            observed_epoch=observation["authority_epoch"],
+        )
+
+    fenced = hosted_rooms.room_state(db, room_id="room-1")
+    assert fenced["authority_gateway_id"] == room["authority_gateway_id"]
+    assert fenced["authority_epoch"] == room["authority_epoch"]
+    assert not any(
+        event["kind"] == "authority.lost" for event in service._events("room-1")
+    )
+
+    rpc.acknowledge = True
+    result = service.demote_room(
+        "room-1",
+        observed_gateway_id=observation["authority_gateway_id"],
+        observed_epoch=observation["authority_epoch"],
+    )
+
+    assert result["authority_gateway_id"] == observed_gateway
+    assert result["authority_epoch"] == 2
+    assert rpc.expected_task_ids == [
+        task["identity"].task_id,
+        task["identity"].task_id,
+    ]
+    assert any(
+        event["kind"] == "authority.lost" for event in service._events("room-1")
+    )
+
+
 def test_cross_process_pending_approval_requires_exact_generation_and_owner_consumes(
     tmp_path: Path,
 ):

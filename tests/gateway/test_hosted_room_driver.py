@@ -553,6 +553,64 @@ def test_cancellation_fences_late_success(db):
         )
 
 
+def test_stop_intent_fences_pending_approval_decision(db):
+    clock = FakeClock()
+    identity = _identity()
+    lease = _lease(db, clock)
+    _admit(db, identity, clock)
+    attempt = driver.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    driver.publish_approval_request(
+        db,
+        identity,
+        execution_generation=attempt.execution_generation,
+        member_id="ops",
+        request_id="approval-1",
+        session_id="session-1",
+        action={"command": "deploy --dry-run"},
+        clock=clock,
+    )
+
+    driver.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-approval",
+        expected_cancel_generation=attempt.cancel_generation,
+        clock=clock,
+    )
+
+    with pytest.raises(driver.StaleTaskError, match="running task"):
+        driver.decide_approval_request(
+            db,
+            identity,
+            execution_generation=attempt.execution_generation,
+            member_id="ops",
+            request_id="approval-1",
+            choice="once",
+            clock=clock,
+        )
+
+    with sqlite3.connect(db) as conn:
+        choice = conn.execute(
+            """SELECT choice FROM hosted_room_approval_requests
+               WHERE room_id=? AND task_id=? AND execution_generation=?
+                 AND member_id=? AND request_id=?""",
+            (
+                identity.room_id,
+                identity.task_id,
+                attempt.execution_generation,
+                "ops",
+                "approval-1",
+            ),
+        ).fetchone()[0]
+    assert choice is None
+
+
 def test_release_fails_closed_while_its_task_is_running(db):
     clock = FakeClock()
     identity = _identity()

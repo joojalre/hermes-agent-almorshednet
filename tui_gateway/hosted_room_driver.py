@@ -11,14 +11,15 @@ handlers while tests use deterministic fakes and no models or network.
 
 One bounded supervisor schedules independent room workers. Profile turn locks
 still serialize Bots that share one profile, while a room waiting for approval
-cannot stop unrelated rooms from progressing. Hosted member sessions
-intentionally reuse ``Group: <room_id>`` so a local-to-hosted migration
-preserves the same canonical transcript instead of forking a second conversation.
+cannot stop unrelated rooms from progressing. Hosted member sessions reuse a
+stable ``Group: <room_id>`` title, with a bounded digest form for long ids, so
+migration preserves the canonical transcript instead of forking a conversation.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import threading
 import time
 import uuid
@@ -34,6 +35,8 @@ _CANCEL_ROUTE_RETRIES = 8
 
 ROOM_SESSION_SOURCE = "bot_room"
 MAX_TERMINAL_TEXT_BYTES = 64 * 1024
+_ROOM_SESSION_TITLE_PREFIX = "Group: "
+_ROOM_SESSION_TITLE_MAX_CHARS = 100
 _TERMINAL_TRUNCATION_NOTICE = (
     "\n\n[Reply truncated. Ask the Bot to share the full result as a file.]"
 )
@@ -849,7 +852,9 @@ class HostedRoomRuntime:
             self._drop_lease(binding.room_id)
             self._record_error(f"task {attempt.identity.task_id} fenced: {exc}")
         except Exception as exc:
-            if submit_attempted:
+            if submit_attempted and getattr(exc, "not_admitted", False) is True:
+                self._settle_failure_if_current(attempt, exc)
+            elif submit_attempted:
                 self._drop_lease(binding.room_id)
                 self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
                 self._record_error(
@@ -1249,7 +1254,18 @@ class HostedRoomRuntime:
 
 def room_session_title(room_id: str) -> str:
     """Return the canonical hidden session title for one hosted room."""
-    return f"Group: {room_id}"
+    title = f"{_ROOM_SESSION_TITLE_PREFIX}{room_id}"
+    if len(title) <= _ROOM_SESSION_TITLE_MAX_CHARS:
+        return title
+
+    digest = hashlib.sha256(room_id.encode("utf-8")).hexdigest()
+    room_prefix_chars = (
+        _ROOM_SESSION_TITLE_MAX_CHARS
+        - len(_ROOM_SESSION_TITLE_PREFIX)
+        - 1
+        - len(digest)
+    )
+    return f"{_ROOM_SESSION_TITLE_PREFIX}{room_id[:room_prefix_chars]}~{digest}"
 
 
 def _session_id(session: Mapping[str, Any]) -> str:

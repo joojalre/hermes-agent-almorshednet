@@ -502,13 +502,14 @@ def _(rid, params: dict) -> dict:
 @method("groups.demote")
 def _(rid, params: dict) -> dict:
     """Fence this gateway's stale room authority against a proven newer epoch."""
-    from gateway.hosted_room_replicas import ReplicaError, demote_room
-    from gateway.hosted_rooms import default_db_path
+    from gateway.hosted_room_replicas import ReplicaError
 
     try:
-        result = demote_room(
-            default_db_path(),
-            room_id=params.get("room_id"),
+        service = get_hosted_room_service()
+        if service is None:
+            return _err(rid, 4123, _WORKER_UNAVAILABLE)
+        result = service.demote_room(
+            str(params.get("room_id") or ""),
             observed_gateway_id=params.get("observed_gateway_id"),
             observed_epoch=params.get("observed_epoch"),
         )
