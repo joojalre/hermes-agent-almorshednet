@@ -187,12 +187,14 @@ import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { registerFsIpc } from './fs-ipc'
 import {
   filenameFromContentDisposition,
+  fsPumpDeps,
   gatewayFilePath,
   gatewayFileRequestPaths,
   isNotFoundError,
   parseDataUrlToBuffer,
   pumpStreamToFile,
-  resolveGatewayFileBackend
+  resolveGatewayFileBackend,
+  writeBufferToFile
 } from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
@@ -244,6 +246,7 @@ import {
   waitForManagedSshBootstrapFence,
   waitForManagedUpdateOperations
 } from './managed-ssh-update'
+import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
@@ -345,7 +348,6 @@ import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
-import { installStdioEpipeGuard } from './stdio-epipe-guard'
 import { createStreamThrottle } from './stream-throttle'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
@@ -1654,7 +1656,6 @@ function rememberLog(chunk) {
 }
 
 installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
-installStdioEpipeGuard()
 
 // A rejected loadURL leaves a blank window and, unhandled, no trace anywhere
 // the user can send us. `label` names the surface so the log says which one.
@@ -7711,10 +7712,9 @@ async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) 
   }
 
   try {
-    await pumpStreamToFile(res, result.filePath, {
-      createWriteStream: (destPath: string) => fs.createWriteStream(destPath),
-      unlink: (destPath: string) => fs.promises.unlink(destPath)
-    })
+    // Failure-atomic: exclusive temp create beside the destination, rename into
+    // place only once the body is complete (#96597).
+    await pumpStreamToFile(res, result.filePath, fsPumpDeps())
   } catch (error) {
     ctx.abort?.()
     throw error
@@ -7866,7 +7866,9 @@ async function saveGatewayFileViaDataUrl(
     return { canceled: true, saved: false }
   }
 
-  await fs.promises.writeFile(result.filePath, buffer)
+  // Same failure-atomic contract as the streaming path: a direct writeFile
+  // truncates an existing destination before the write completes (#96597).
+  await writeBufferToFile(buffer, result.filePath, fsPumpDeps())
 
   return { path: result.filePath, saved: true }
 }
@@ -12018,10 +12020,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
-  // stdout is normally sufficient, but Windows can lose a child pipe during
-  // a packaged Desktop launch. The backend's atomic ready-file channel avoids
-  // turning a healthy local server into a 90-second startup timeout.
-  const readyFile = IS_WINDOWS || backend.readyFile ? makeDashboardReadyFile() : null
+  const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
 
   // Guard BEFORE the "Starting" line: a profile that only exists on a remote
   // backend (remote-primary desktop asked for a forced-local child) rejects
@@ -12412,9 +12411,7 @@ async function startHermes() {
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
-    // Keep the primary local backend on the same reliable Windows readiness
-    // channel as secondary profile backends.
-    const readyFile = IS_WINDOWS || backend.readyFile ? makeDashboardReadyFile() : null
+    const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
@@ -13540,6 +13537,11 @@ function spawnHudWindow(sessionId, profile) {
     // `hermes:hud:set-bounds`, which flips resizable on for the call — the
     // same pattern the pet overlay uses for its wheel-scale.
     resizable: false,
+    // macOS AppKit's constrainFrameRect clamps setBounds to the current
+    // display unless this is on. The HUD is moved by renderer-driven
+    // setBounds (not a native titlebar drag), so without it the bar cannot
+    // be dragged onto another monitor. No-op on Windows/Linux.
+    enableLargerThanScreen: true,
     movable: true,
     minimizable: false,
     maximizable: false,
@@ -16839,6 +16841,10 @@ registerFsIpc({
 
 // Git-driven features (worktrees, review pane, repo scan) — see git-ipc.ts.
 registerGitIpc({ resolveGitBinary, resolveGhBinary })
+
+// Client-side loopback callback for MCP OAuth against remote backends — see
+// mcp-oauth-callback-ipc.ts.
+registerMcpOauthCallbackIpc()
 
 // Embedded terminal PTY host (hermes:terminal:*) — see terminal-ipc.ts.
 const terminalIpc = registerTerminalIpc({

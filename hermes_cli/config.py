@@ -958,17 +958,13 @@ def ensure_hermes_home():
     home = get_hermes_home()
     key = str(home)
 
+    # Named profiles must be created explicitly (e.g. ``hermes profile create``).
+    # Check tombstones before the memo so a stale empty shell cannot skip
+    # the deleted-profile guard.
+    from hermes_constants import assert_named_profile_home_live
+    assert_named_profile_home_live(home)
     if key in _HERMES_HOME_ENSURED and home.is_dir():
         return
-    # Named profiles must be created explicitly (e.g. ``hermes profile create``).
-    # If a stale process keeps running after the profile was renamed/deleted,
-    # silently mkdir-ing the old HERMES_HOME would resurrect an empty skeleton
-    # and make the deleted profile reappear in Desktop/profile lists.
-    if home.parent.name == "profiles" and not home.exists():
-        raise FileNotFoundError(
-            f"Named profile home does not exist: {home}. "
-            "Create the profile explicitly before using it."
-        )
     if is_managed():
         old_umask = os.umask(0o007)
         try:
@@ -1484,7 +1480,7 @@ def _normalize_custom_provider_entry(
         "models_discovered",
         "context_length", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
-        "discover_models", "extra_body", "extra_headers",
+        "discover_models", "extra_body", "extra_headers", "capabilities",
         "ssl_ca_cert", "ssl_verify",
     }
     for camel, snake in _CAMEL_ALIASES.items():
@@ -1608,6 +1604,16 @@ def _normalize_custom_provider_entry(
 
     if models_discovered:
         normalized["models_discovered"] = True
+
+    capabilities = entry.get("capabilities")
+    if isinstance(capabilities, dict):
+        normalized_capabilities = {
+            key: value
+            for key, value in capabilities.items()
+            if isinstance(key, str) and isinstance(value, bool)
+        }
+        if normalized_capabilities:
+            normalized["capabilities"] = normalized_capabilities
 
     context_length = entry.get("context_length")
     if isinstance(context_length, int) and context_length > 0:
@@ -3644,6 +3650,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "modal_mode": "TERMINAL_MODAL_MODE",
     "degraded_mode": "TERMINAL_DEGRADED_MODE",
     "cwd": "TERMINAL_CWD",
+    "temp_dir": "TERMINAL_TEMP_DIR",
     "timeout": "TERMINAL_TIMEOUT",
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
     "docker_image": "TERMINAL_DOCKER_IMAGE",

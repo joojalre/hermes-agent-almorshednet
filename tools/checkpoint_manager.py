@@ -54,7 +54,6 @@ import logging
 import os
 import re
 import shutil
-import stat
 import subprocess
 import time
 from pathlib import Path
@@ -285,23 +284,6 @@ def _ref_name(dir_hash: str) -> str:
 
 def _project_meta_path(store: Path, dir_hash: str) -> Path:
     return store / _PROJECTS_DIRNAME / f"{dir_hash}.json"
-
-
-def _rmtree_writable(path: Path) -> None:
-    """Remove a checkpoint tree even when Git left read-only objects behind."""
-
-    def _on_error(func, target, exc_info):
-        for candidate in (os.path.dirname(target), target):
-            try:
-                os.chmod(candidate, stat.S_IRWXU)
-            except OSError:
-                pass
-        try:
-            func(target)
-        except OSError:
-            raise exc_info[1]
-
-    shutil.rmtree(path, onerror=_on_error)
 
 
 # ---------------------------------------------------------------------------
@@ -1864,7 +1846,7 @@ def prune_checkpoints(
                 continue
             try:
                 size = _dir_size_bytes(child)
-                _rmtree_writable(child)
+                shutil.rmtree(child)
                 result["bytes_freed"] += size
                 result["deleted_stale"] += 1
             except OSError as exc:
@@ -1910,7 +1892,7 @@ def prune_checkpoints(
             continue
         try:
             size = _dir_size_bytes(child)
-            _rmtree_writable(child)
+            shutil.rmtree(child)
             result["bytes_freed"] += size
             if reason == "orphan":
                 result["deleted_orphan"] += 1
@@ -2231,7 +2213,7 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
         return out
     size = _dir_size_bytes(base)
     try:
-        _rmtree_writable(base)
+        shutil.rmtree(base)
         out["bytes_freed"] = size
         out["deleted"] = True
     except OSError as exc:
@@ -2253,7 +2235,7 @@ def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
             continue
         try:
             size = _dir_size_bytes(child)
-            _rmtree_writable(child)
+            shutil.rmtree(child)
             out["bytes_freed"] += size
             out["deleted"] += 1
         except OSError as exc:

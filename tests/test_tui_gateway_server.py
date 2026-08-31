@@ -3887,7 +3887,7 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     assert "launch_update" not in captured
 
 
-def test_stored_session_runtime_overrides_skips_bare_billing_provider():
+def test_stored_session_runtime_overrides_skips_bare_billing_provider(monkeypatch):
     """A bare billing bucket ("custom"/"auto") must not be restored as the provider
     identity on resume. A custom endpoint that never used `/model` persists only
     `billing_provider="custom"`; restoring that broke `session.resume` with "No LLM provider
@@ -3909,7 +3909,23 @@ def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     assert ov["provider_override"] == "anthropic"
     assert ov["model_override"]["provider"] == "anthropic"
 
-    # An explicit routable provider in model_config wins over the bare billing bucket.
+    # An explicit ROUTABLE provider in model_config wins over the bare billing
+    # bucket. It must actually resolve in the registry — a stale/renamed
+    # provider is dropped (see TestStaleProviderNameFallsBack).
+    cfg = {
+        "custom_providers": [
+            {
+                "name": "myendpoint",
+                "base_url": "https://myendpoint.invalid/v1",
+                "api_key": "sk-test",
+                "model": "m",
+            }
+        ]
+    }
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(rp, "load_config", lambda: cfg)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
     ov = server._stored_session_runtime_overrides(
         {"model": "m", "billing_provider": "custom", "model_config": {"provider": "custom:myendpoint"}}
     )
@@ -4557,7 +4573,7 @@ def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
     thread.start()
     acquired = False
     try:
-        assert teardown_started.wait(timeout=1.0)
+        assert teardown_started.wait(timeout=2.0)
         assert "slow-close" not in server._sessions
         acquired = server._session_resume_lock.acquire(timeout=0.2)
         assert acquired, "slow teardown kept the global resume lock held"
@@ -4948,10 +4964,6 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
-    # This test exercises lock release around teardown, not delegation
-    # bookkeeping.  Keep it independent of the process-global delegation
-    # registry populated by neighbouring tests in this large module.
-    monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(server, "_teardown_session", _slow_teardown)
     server._sessions["slow-orphan"] = _session(
         transport=server._detached_ws_transport,
@@ -4963,10 +4975,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     thread.start()
     acquired = False
     try:
-        # Shared CI runners can delay a fresh Python thread beyond one second;
-        # the bounded wait preserves the lock-release assertion without a
-        # scheduler-timing flake.
-        assert teardown_started.wait(timeout=3.0)
+        assert teardown_started.wait(timeout=1.0)
         assert "slow-orphan" not in server._sessions
         acquired = server._session_resume_lock.acquire(timeout=0.2)
         assert acquired, "orphan teardown kept the global resume lock held"
@@ -9262,6 +9271,276 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
         server._sessions.pop("sid", None)
 
 
+@pytest.mark.parametrize(
+    ("provider_flag", "failure_text"),
+    [
+        (" --provider custom:new-provider", "Unknown provider 'removed-provider'"),
+        ("", ""),
+    ],
+)
+def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
+    monkeypatch, tmp_path, provider_flag, failure_text
+):
+    """Recovery waits for the real failed build and uses its owning profile.
+
+    Both the failed and replacement generations cross the real deferred-build
+    boundary. Provider resolution is the only model-switch leaf replaced.
+    """
+    from agent.secret_scope import current_secret_scope
+    from hermes_constants import get_hermes_home
+
+    launch_url = "https://launch.example/v1"
+    profile_url = "https://profile.example/v1"
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "work"
+    launch_home.mkdir()
+    profile_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: launch/model\n"
+        "  provider: custom:new-provider\n"
+        "providers:\n"
+        "  new-provider:\n"
+        f"    base_url: {launch_url}\n"
+        "    key_env: LAUNCH_API_KEY\n",
+        encoding="utf-8",
+    )
+    (launch_home / ".env").write_text(
+        "LAUNCH_API_KEY=launch-secret\n", encoding="utf-8"
+    )
+    (profile_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: old/model\n"
+        "  provider: custom:new-provider\n"
+        "providers:\n"
+        "  new-provider:\n"
+        f"    base_url: {profile_url}\n"
+        "    key_env: PROFILE_API_KEY\n",
+        encoding="utf-8",
+    )
+    (profile_home / ".env").write_text(
+        "PROFILE_API_KEY=profile-secret\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+
+    class ControlledReady:
+        def __init__(self):
+            self._event = threading.Event()
+            self.wait_entered = threading.Event()
+
+        def wait(self, timeout=None):
+            self.wait_entered.set()
+            return self._event.wait(timeout)
+
+        def is_set(self):
+            return self._event.is_set()
+
+        def set(self):
+            self._event.set()
+
+    old_ready = ControlledReady()
+    reasoning = {"effort": "high"}
+    old_override = {"model": "old/model", "provider": "removed-provider"}
+    session = _session(
+        agent_ready=old_ready,
+        agent_error=None,
+        model_override=old_override,
+        resume_runtime_overrides={
+            "model_override": old_override,
+            "provider_override": "removed-provider",
+            "reasoning_config_override": reasoning,
+        },
+        profile_home=str(profile_home),
+    )
+    session["agent"] = None
+    server._sessions["sid"] = session
+    old_finally_entered = threading.Event()
+    release_old_finally = threading.Event()
+    switch_called = threading.Event()
+    seen = {"switch": None, "build": None, "persisted": []}
+    make_calls = 0
+
+    def fake_switch_model(**kwargs):
+        provider = kwargs["user_providers"]["new-provider"]
+        secrets = dict(current_secret_scope() or {})
+        api_key = secrets[provider["key_env"]]
+        seen["switch"] = {
+            "home": get_hermes_home(),
+            "secrets": secrets,
+            "base_url": provider["base_url"],
+            "api_key": api_key,
+            "current_provider": kwargs["current_provider"],
+            "current_api_key": kwargs["current_api_key"],
+        }
+        switch_called.set()
+        return types.SimpleNamespace(
+            success=True,
+            new_model="new/model",
+            target_provider="custom:new-provider",
+            api_key=api_key,
+            base_url=provider["base_url"],
+            api_mode="chat_completions",
+            warning_message="",
+            model_info=None,
+            error_message="",
+        )
+
+    class FakeDb:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_session(self, _key):
+            return {"model_config": {}}
+
+        def update_session_meta(self, key, model_config, model):
+            seen["persisted"].append(
+                {
+                    "key": key,
+                    "model": model,
+                    "config": json.loads(model_config),
+                }
+            )
+
+        def close(self):
+            pass
+
+    def fake_make_agent(_sid, _key, **kwargs):
+        nonlocal make_calls
+        make_calls += 1
+        if make_calls == 1:
+            raise RuntimeError(failure_text)
+        override = kwargs["model_override"]
+        seen["build"] = {
+            "home": get_hermes_home(),
+            "secrets": dict(current_secret_scope() or {}),
+            "overrides": kwargs,
+        }
+        return types.SimpleNamespace(
+            model=override["model"],
+            provider="custom",
+            base_url=override["base_url"],
+            api_key=override["api_key"],
+            api_mode=override["api_mode"],
+            reasoning_config=kwargs.get("reasoning_config_override"),
+            service_tier=None,
+            _session_db=kwargs.get("session_db"),
+        )
+
+    real_transfer = server._transfer_db_to_agent
+
+    def barrier_transfer(agent, db):
+        if agent is None and not old_finally_entered.is_set():
+            old_finally_entered.set()
+            assert release_old_finally.wait(timeout=10)
+        return real_transfer(agent, db)
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+    monkeypatch.setattr(
+        "hermes_cli.model_selection_guards.combined_selection_warning",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr("hermes_state.SessionDB", FakeDb)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_transfer_db_to_agent", barrier_transfer)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+    response = {}
+
+    def run_request():
+        try:
+            response["value"] = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "config.set",
+                    "params": {
+                        "session_id": "sid",
+                        "key": "model",
+                        "value": f"new/model{provider_flag}",
+                    },
+                }
+            )
+        except BaseException as exc:
+            response["error"] = exc
+
+    request_thread = threading.Thread(target=run_request)
+    old_build_thread = None
+    try:
+        server._start_agent_build("sid", session)
+        old_build_thread = session["_agent_build_thread"]
+        assert old_finally_entered.wait(timeout=10)
+        assert session["agent_error"] == failure_text
+        assert not old_ready.is_set()
+
+        request_thread.start()
+        assert old_ready.wait_entered.wait(timeout=2), (
+            "model recovery did not wait for the failed build generation"
+        )
+        assert not switch_called.is_set()
+        release_old_finally.set()
+        request_thread.join(timeout=10)
+
+        assert not request_thread.is_alive()
+        assert "error" not in response
+        assert response["value"]["result"]["value"] == "new/model"
+        assert make_calls == 2
+        assert seen["switch"] == {
+            "home": profile_home,
+            "secrets": {"PROFILE_API_KEY": "profile-secret"},
+            "base_url": profile_url,
+            "api_key": "profile-secret",
+            "current_provider": (
+                "custom:new-provider" if provider_flag else "custom"
+            ),
+            "current_api_key": "profile-secret" if not provider_flag else "",
+        }
+        assert seen["build"]["home"] == profile_home
+        assert seen["build"]["secrets"] == {
+            "PROFILE_API_KEY": "profile-secret"
+        }
+        overrides = seen["build"]["overrides"]
+        assert overrides["model_override"] == session["model_override"]
+        assert overrides["provider_override"] == "custom:new-provider"
+        assert overrides["reasoning_config_override"] == reasoning
+        assert session["agent_error"] is None
+        assert session["agent"].model == "new/model"
+        assert session["agent"].base_url == profile_url
+        assert session["agent"].api_key == "profile-secret"
+        assert seen["persisted"] == [
+            {
+                "key": "session-key",
+                "model": "new/model",
+                "config": {
+                    "model": "new/model",
+                    "provider": "custom:new-provider",
+                    "base_url": profile_url,
+                    "api_mode": "chat_completions",
+                    "reasoning_config": reasoning,
+                },
+            }
+        ]
+    finally:
+        release_old_finally.set()
+        old_ready.set()
+        request_thread.join(timeout=10)
+        if old_build_thread is not None:
+            old_build_thread.join(timeout=10)
+        new_build_thread = session.get("_agent_build_thread")
+        if new_build_thread is not None:
+            new_build_thread.join(timeout=10)
+        server._sessions.pop("sid", None)
+
+
 def test_config_set_model_explicit_provider_surfaces_selected_provider_errors(monkeypatch):
     seen = {"build": 0, "wait": 0}
     session = _session()
@@ -10723,6 +11002,49 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
     assert "/approve" not in canon
     assert "/deny" not in canon
     assert "/set-home" not in canon
+
+
+def test_commands_catalog_includes_desktop_meta_without_skills():
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    commands = resp["result"]["commands"]
+    assert commands["/review"] == {"argument_mode": "text", "desktop": None}
+    assert commands["/clear"]["desktop"] == "terminal"
+    assert commands["/model"]["desktop"] == "hidden"
+    assert commands["/compact"]["argument_mode"] == commands["/compress"]["argument_mode"]
+
+    for skill in resp["result"]["skills"]:
+        assert skill not in commands
+
+
+def test_commands_catalog_includes_plugin_commands(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_commands",
+        lambda: {
+            "lcm": {
+                "description": "Latent consistency",
+                "args_hint": "<prompt>",
+                "argument_mode": "text",
+            }
+        },
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    assert resp["result"]["commands"]["/lcm"] == {
+        "argument_mode": "text",
+        "desktop": None,
+    }
+    pairs = dict(resp["result"]["pairs"])
+    assert "/lcm" in pairs
+    plugin_cat = next(
+        c for c in resp["result"]["categories"] if c["name"] == "Plugin commands"
+    )
+    assert "/lcm" in dict(plugin_cat["pairs"])
 
 
 def test_session_status_reads_live_gateway_agent(monkeypatch):
@@ -18482,6 +18804,51 @@ class _BareAgent:
     independent of the `if comp:` context-percent block."""
 
     model = "x"
+
+
+def test_get_usage_perf_readouts_present():
+    """cache_hit_pct / avg_latency_s / avg_tps mirror the classic CLI bar."""
+    from collections import deque
+
+    class _PerfAgent:
+        model = "x"
+        session_prompt_tokens = 27_873
+        session_cache_read_tokens = 24_369
+        _api_latency_history = deque([2.1, 4.3], maxlen=10)
+        _api_output_history = deque([130, 190], maxlen=10)
+
+    usage = server._get_usage(_PerfAgent())
+    assert usage["cache_hit_pct"] == 87
+    assert usage["avg_latency_s"] == 3.2
+    assert usage["avg_tps"] == 50.0  # true throughput sum(out)/sum(lat), not mean of ratios
+
+
+def test_get_usage_perf_readouts_omitted_without_data():
+    """Zero cache reads / empty history omit the keys — never fabricate 0s."""
+
+    class _ColdAgent:
+        model = "x"
+        session_prompt_tokens = 100
+        session_cache_read_tokens = 0
+
+    usage = server._get_usage(_ColdAgent())
+    assert "cache_hit_pct" not in usage
+    assert "avg_latency_s" not in usage
+    assert "avg_tps" not in usage
+
+
+def test_get_usage_perf_readouts_guard_negative_latency():
+    """Odd provider timings (negative durations seen in logs) are dropped."""
+    from collections import deque
+
+    class _WeirdAgent:
+        model = "x"
+        _api_latency_history = deque([-0.8], maxlen=10)
+        _api_output_history = deque([100], maxlen=10)
+
+    usage = server._get_usage(_WeirdAgent())
+    assert "avg_latency_s" not in usage
+    assert "avg_tps" not in usage
 
 
 def test_get_usage_includes_active_subagents(monkeypatch):

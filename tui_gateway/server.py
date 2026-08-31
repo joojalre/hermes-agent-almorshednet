@@ -3225,7 +3225,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
                 resume_overrides = current.get("resume_runtime_overrides")
-                if isinstance(resume_overrides, dict) and resume_overrides:
+                if (
+                    isinstance(resume_overrides, dict)
+                    and resume_overrides
+                    and _overrides_have_routable_provider(resume_overrides)
+                ):
                     # Cold deferred resume: restore the full persisted runtime
                     # identity (model/provider/base_url/api_mode/reasoning/tier)
                     # exactly as the eager resume path's _stored_session_runtime_
@@ -3233,9 +3237,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     # provider and fail with "No LLM provider configured".
                     kw.update(resume_overrides)
                 else:
-                    # Model/effort/fast the desktop picked for a brand-new chat
-                    # ride in as per-session overrides so the first build uses
-                    # them directly (no global config, no build-then-switch).
+                    # No stored runtime, or the stored provider no longer
+                    # resolves (renamed/removed since the row was written) —
+                    # never let that sink agent init with "Unknown provider".
+                    # Fall back to the model/effort/fast the desktop picked
+                    # for THIS session, else the configured default.
                     if override := current.get("model_override"):
                         kw["model_override"] = override
                     if (reasoning := current.get("create_reasoning_override")) is not None:
@@ -3257,6 +3263,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _session_todo_state(current)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -3883,6 +3890,23 @@ def _ensure_session_db_row(session: dict) -> None:
     parent_session_id = session.get("parent_session_id") or None
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
+    # Bot-Mode room plumbing sessions are per-member scratch conversations
+    # inside a group chat: their runtime must ALWAYS follow the member profile's
+    # CURRENT config, never the provider that was pinned when the row was first
+    # written. Persist that contract explicitly so resume can distinguish room
+    # plumbing from a normal user chat (whose stored model/provider must be
+    # restored verbatim). See _stored_session_runtime_overrides.
+    if session.get("room_plumbing"):
+        model_config["room_plumbing"] = True
+    # Bot-Mode canonical chats (the ONE forever DM per bot) and room plumbing
+    # sessions are plugin-owned scratch conversations: their runtime must ALWAYS
+    # follow the member profile's CURRENT config, never the model/provider that
+    # was pinned when the row was first written. Persist that contract explicitly
+    # so resume can distinguish them from a normal user chat (whose stored
+    # model/provider must be restored verbatim). See
+    # _stored_session_runtime_overrides.
+    if session.get("follow_profile_config"):
+        model_config["follow_profile_config"] = True
     try:
         db.create_session(
             key,
@@ -5202,6 +5226,30 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
 from hermes_state import _BARE_BILLING_PROVIDERS
 
 
+def _overrides_have_routable_provider(overrides: dict) -> bool:
+    """Whether persisted runtime overrides still name a routable provider.
+
+    A session row written under a provider that has since been renamed or
+    removed would otherwise fail agent init with "Unknown provider".
+    Empty provider counts as NOT routable here, so the caller falls back
+    to the model the user picked for this session / the configured
+    default instead of restoring a provider-less snapshot override.
+    """
+    provider = str(overrides.get("provider_override") or "").strip()
+    if not provider:
+        provider = str(
+            (overrides.get("model_override") or {}).get("provider") or ""
+        ).strip()
+    if not provider:
+        return False
+    try:
+        from hermes_cli.runtime_provider import is_routable_provider
+
+        return is_routable_provider(provider)
+    except Exception:
+        return False
+
+
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """Return runtime fields persisted with a stored session.
 
@@ -5212,6 +5260,74 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     ``billing_provider``, and richer runtime knobs in JSON ``model_config``.
     """
     if not row:
+        return {}
+
+    # Bot-Mode room plumbing sessions (hidden, titled "Group: <name>") are
+    # per-member scratch conversations inside a group chat. They must always
+    # rebuild from the member profile's CURRENT config: restoring the stored
+    # model/provider pin from an old row is what left room bots stuck on
+    # Nous (or any earlier provider) long after the profile was switched —
+    # every room message then failed with "out of Nous credits" while the
+    # same bots worked fine in DMs. 1:1 chats keep the stored-runtime
+    # restore (opening an older chat must show the model it actually used);
+    # only the room plumbing is exempt.
+    #
+    # The primary signal is the EXPLICIT ``room_plumbing`` contract persisted
+    # by session.create/room consumers (desktop Bot Mode) — a deliberate
+    # marker, not a presentation heuristic. The hidden + "Group:" title
+    # shape is kept as a legacy fallback so rows created by older desktop
+    # builds (which never sent the marker) still behave correctly until the
+    # client catches up.
+    raw_plumbing = row.get("model_config")
+    if isinstance(raw_plumbing, dict):
+        _plumbing_marker = raw_plumbing.get("room_plumbing")
+    elif isinstance(raw_plumbing, str) and raw_plumbing.strip():
+        try:
+            _plumbing_marker = json.loads(raw_plumbing).get("room_plumbing")
+        except Exception:
+            _plumbing_marker = None
+    else:
+        _plumbing_marker = None
+    if _plumbing_marker:
+        return {}
+    _row_title = str(row.get("title") or "").strip()
+    _row_hidden = row.get("hidden")
+    if _row_hidden and _row_title.startswith("Group:"):
+        return {}
+
+    # Bot-Mode canonical chats (the ONE forever DM per bot) and room plumbing
+    # sessions are plugin-owned scratch conversations. They must always rebuild
+    # from the member profile's CURRENT config: restoring the stored
+    # model/provider pin from an old row is what left bot DMs stuck on a stale
+    # provider (e.g. "out of Nous credits" after the profile was switched to
+    # ollama-cloud) while the same bot worked fine in rooms. 1:1 user chats
+    # keep the stored-runtime restore (opening an older chat must show the
+    # model it actually used); only the plugin-owned bot sessions are exempt.
+    #
+    # The primary signal is the EXPLICIT ``follow_profile_config`` contract
+    # persisted by session.create consumers (desktop Bot Mode) — a deliberate
+    # marker, not a presentation heuristic.
+    raw_follow = row.get("model_config")
+    if isinstance(raw_follow, dict):
+        _follow_marker = raw_follow.get("follow_profile_config")
+    elif isinstance(raw_follow, str) and raw_follow.strip():
+        try:
+            _follow_marker = json.loads(raw_follow).get("follow_profile_config")
+        except Exception:
+            _follow_marker = None
+    else:
+        _follow_marker = None
+    if _follow_marker:
+        return {}
+    # Legacy backfill: canonical Bot Chats created BEFORE the
+    # follow_profile_config contract existed carry no marker, yet they are
+    # still the plugin-owned forever-DM. The plugin's own identity rule is
+    # "the profile's session titled exactly 'Bot Chat'" (UNIQUE(title) makes
+    # that an exact registry, and pre-policy rows may be visible OR hidden),
+    # so mirror that rule here. Without this, every Bot Chat that already
+    # exists in the field stays pinned to its stale stored provider until
+    # the user deletes it — the exact live-report shape (#89497 / #94818).
+    if _row_title == "Bot Chat":
         return {}
 
     raw_config = row.get("model_config")
@@ -5245,30 +5361,46 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
 
-    # Heal a bare ``"custom"`` provider stored by an older build (or any leak
-    # site that bypassed _runtime_model_config's normalization). Bare custom is
-    # the resolved billing class, not a routable identity — restoring it as the
-    # session's provider override routes the resume to the OpenRouter default
-    # URL with no api_key, surfacing as "No LLM provider configured". Recover
-    # the durable ``custom:<name>`` menu key from the stored base_url, then
-    # from the entry that serves the stored model, falling back to the
-    # configured provider when the row has neither (the recurring Desktop/TUI
-    # regression vector). If none names a real entry,
-    # drop the bare provider entirely so resume falls back to the configured
-    # default rather than the broken OpenRouter route.
-    if provider.strip().lower() == "custom":
-        healed = None
+    # Heal a stale/expired provider name persisted by an older build — not
+    # just the bare ``"custom"`` billing class. A renamed or removed custom
+    # provider (e.g. ``oldone`` -> ``newone``) stored in the session row
+    # would otherwise fail agent init with "Unknown provider '<name>'".
+    # Recover the durable ``custom:<name>`` menu key from the stored
+    # base_url, then from the entry that serves the stored model, falling
+    # back to the configured provider when the row has neither. When
+    # nothing names a real entry, drop the provider entirely so resume
+    # falls back to the configured default rather than the broken route.
+    if provider:
+        routable = False
         try:
-            from hermes_cli.runtime_provider import canonical_custom_identity
+            from hermes_cli.runtime_provider import is_routable_provider
 
-            healed = canonical_custom_identity(
-                base_url=base_url or None, model=model or None
-            )
+            routable = is_routable_provider(provider)
         except Exception:
-            logger.debug(
-                "custom provider identity recovery failed", exc_info=True
-            )
-        provider = healed or ("" if not base_url else provider)
+            routable = False
+        if not routable:
+            healed = None
+            try:
+                from hermes_cli.runtime_provider import canonical_custom_identity
+
+                healed = canonical_custom_identity(
+                    base_url=base_url or None, model=model or None
+                )
+            except Exception:
+                logger.debug(
+                    "custom provider identity recovery failed", exc_info=True
+                )
+            if healed:
+                logger.info(
+                    "healed stale session provider %r to %r", provider, healed
+                )
+                provider = healed
+                # The healed identity owns a registered endpoint; drop the
+                # snapshot's base_url so it can't override the registry URL
+                # (e.g. a stale direct endpoint behind a renamed proxy).
+                base_url = ""
+            else:
+                provider = ""
 
     if model:
         # Use the same dict-shaped override that live /model switches use so a
@@ -5297,6 +5429,20 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
 
 
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+    """Merge the agent's CURRENT runtime identity onto an existing config.
+
+    ``existing`` is the row's previously-persisted ``model_config`` JSON (may
+    be absent on first write). The returned dict must mirror the agent's live
+    state: falsy agent attributes DELETE the corresponding key rather than
+    merely omit the write, so a stale value from an earlier session state can
+    never survive into the merged config. Keeping stale values here is what
+    desynced the ``sessions.model`` column (fresh) from ``model_config``
+    (stale provider/endpoint): ``_persist_live_session_runtime`` writes the
+    model column separately, and on resume ``_stored_session_runtime_overrides``
+    reads provider/endpoint from this JSON — so a stale provider would silently
+    route the resumed chat to the wrong endpoint while the model column claimed
+    the new one.
+    """
     config = dict(existing or {})
     model = str(getattr(agent, "model", "") or "").strip()
     provider = str(getattr(agent, "provider", "") or "").strip()
@@ -5307,6 +5453,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
 
     if model:
         config["model"] = model
+    else:
+        config.pop("model", None)
     if provider:
         if provider.strip().lower() == "custom":
             # ``agent.provider`` is the RESOLVED provider, and for any named
@@ -5337,6 +5485,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
                     "custom provider identity lookup failed", exc_info=True
                 )
         config["provider"] = provider
+    else:
+        config.pop("provider", None)
     if base_url:
         config["base_url"] = base_url
     else:
@@ -5985,7 +6135,57 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_key=snapshot.get("api_key", ""),
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
+            capabilities=snapshot.get("capabilities"),
         )
+
+
+@contextlib.contextmanager
+def _session_profile_runtime_scope(session: dict):
+    """Bind model resolution to the session's profile config and secrets."""
+    profile_home = session.get("profile_home")
+    if not profile_home:
+        yield
+        return
+    home_token = set_hermes_home_override(profile_home)
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _restart_completed_failed_agent_build(
+    sid: str, session: dict, failed_ready: threading.Event | None
+) -> bool:
+    """Replace one completed failed build generation and start its retry."""
+    if failed_ready is None:
+        return False
+    build_lock = session.setdefault("agent_build_lock", threading.Lock())
+    with build_lock:
+        if (
+            session.get("agent") is not None
+            or session.get("agent_error") is None
+            or session.get("agent_ready") is not failed_ready
+            or not failed_ready.is_set()
+        ):
+            return False
+        model_override = session.get("model_override")
+        resume_overrides = session.get("resume_runtime_overrides")
+        if isinstance(model_override, dict) and isinstance(resume_overrides, dict):
+            resume_overrides = dict(resume_overrides)
+            resume_overrides["model_override"] = model_override
+            if provider := model_override.get("provider"):
+                resume_overrides["provider_override"] = provider
+            else:
+                resume_overrides.pop("provider_override", None)
+            session["resume_runtime_overrides"] = resume_overrides
+        session["agent_error"] = None
+        session["agent_ready"] = threading.Event()
+        session.pop("agent_build_started", None)
+        session.pop("_agent_build_thread", None)
+    _start_agent_build(sid, session)
+    return True
 
 
 def _apply_model_switch(
@@ -6148,6 +6348,7 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
+                capabilities=getattr(result, "runtime_capabilities", None),
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -6447,7 +6648,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     acted only on PRESENT keys, leaving stale values active forever.
     """
     cfg = cfg if isinstance(cfg, dict) else {}
-    compression = cfg.get("compression") if isinstance(cfg.get("compression"), dict) else {}
+    compression_raw = cfg.get("compression")
+    compression = compression_raw if isinstance(compression_raw, dict) else {}
     model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
 
     enabled_raw = compression.get("enabled", True)
@@ -6455,6 +6657,27 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         agent.compression_enabled = enabled_raw
     else:
         agent.compression_enabled = str(enabled_raw).lower() in {"true", "1", "yes"}
+
+    agent.codex_responses_native_compaction = is_truthy_value(
+        compression.get("codex_responses_native", False)
+    )
+    native_threshold_raw = compression.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(native_threshold_raw, bool):
+            raise ValueError
+        native_threshold = int(native_threshold_raw)
+        if native_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid compression.codex_responses_compact_threshold=%r; "
+            "using 200000.",
+            native_threshold_raw,
+        )
+        native_threshold = 200_000
+    agent.codex_responses_compact_threshold = native_threshold
 
     # Absence restores the agent_init/config default (0 = disabled).
     idle_raw = compression.get("idle_compact_after_seconds", 0)
@@ -6957,6 +7180,39 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    # Cache-hit ratio + rolling latency/throughput for the TUI status bar.
+    # Mirrors the classic CLI bar (cli.py _get_status_bar_snapshot / PR #98250):
+    #   hit = session_cache_read_tokens / session_prompt_tokens
+    #   (CanonicalUsage.prompt_tokens = input + cache_read + cache_write)
+    # latency/tps read the deque(maxlen=10) history maintained per API call in
+    # agent/conversation_loop.py. Values are omitted (not fabricated) when no
+    # data exists — e.g. Codex app-server reports no latency, and a session
+    # with zero cache reads shows no hit% rather than an alarming 0.
+    try:
+        _prompt_total = int(getattr(agent, "session_prompt_tokens", 0) or 0)
+        _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
+        if _prompt_total > 0 and _cache_read > 0:
+            usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+    except Exception:
+        pass
+    try:
+        _lhist = list(getattr(agent, "_api_latency_history", []) or [])
+        _ohist = list(getattr(agent, "_api_output_history", []) or [])
+        _n = min(len(_lhist), len(_ohist))
+        if _n:
+            _lhist = _lhist[-_n:]
+            _ohist = _ohist[-_n:]
+            _avg_lat = sum(_lhist) / _n
+            _total_lat = sum(_lhist)
+            _avg_vel = (sum(_ohist) / _total_lat) if _total_lat > 0 else None
+            # Guard NaN/negative/absurd values from odd provider timings.
+            if _avg_lat == _avg_lat and 0 < _avg_lat < 1e6:
+                usage["avg_latency_s"] = round(float(_avg_lat), 1)
+            if _avg_vel is not None and _avg_vel == _avg_vel and 0 < _avg_vel < 1e6:
+                usage["avg_tps"] = round(float(_avg_vel), 1)
+    except Exception:
+        # A status-bar readout must never break usage reporting.
+        pass
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
     # bar's ⛓ indicator; sourced from the same async_delegation registry.
@@ -7405,6 +7661,101 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
     return f"{text}{suffix}" if text else None
 
 
+def _normalize_todo_state(value: object) -> dict | None:
+    """Return a client-safe full todo snapshot or ``None`` when malformed."""
+    if not isinstance(value, dict) or not isinstance(value.get("todos"), list):
+        return None
+    try:
+        revision = max(0, int(value.get("revision") or 0))
+    except (TypeError, ValueError):
+        return None
+    todos = list(value["todos"])
+    # Unused TodoStore snapshot() is {todos: [], revision: 0}. Attaching
+    # that on resume stamps a client watermark and blocks unversioned
+    # tool.start merges. An empty list at revision >= 1 is a real clear.
+    if not todos and revision == 0:
+        return None
+    return {"todos": todos, "revision": revision}
+
+
+def _session_todo_state(session: dict) -> dict | None:
+    """Return the newest live/cached todo snapshot for a runtime session."""
+    cached = _normalize_todo_state(session.get("todo_state"))
+    live = None
+    agent = session.get("agent")
+    store = getattr(agent, "_todo_store", None)
+    snapshot = getattr(store, "snapshot", None)
+    if callable(snapshot):
+        try:
+            live = _normalize_todo_state(snapshot())
+        except Exception:
+            logger.debug("failed to read live todo state", exc_info=True)
+
+    if live is not None and (
+        cached is None or live["revision"] >= cached["revision"]
+    ):
+        cached = live
+    if cached is not None:
+        session["todo_state"] = cached
+    return cached
+
+
+def _attach_todo_state(payload: dict, session: dict) -> dict:
+    """Attach the authoritative todo snapshot to a session response."""
+    state = _session_todo_state(session)
+    if state is not None:
+        payload["todo_state"] = state
+    return payload
+
+
+def _todo_state_from_history(history) -> dict | None:
+    """Derive the latest todo snapshot from an already-loaded transcript.
+
+    Used by resume paths that answer before an AIAgent (and its live
+    TodoStore) exists. The canonical todo tool results already persist in
+    conversation history as ordinary tool messages, so the latest one paired
+    with an assistant ``todo`` tool call IS the durable snapshot — no side
+    table and no extra transcript read (each resume path passes the history
+    it already loaded).
+    """
+    if not isinstance(history, list) or not history:
+        return None
+    try:
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
+        todo_call_ids: set[str] = set()
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            for call in msg.get("tool_calls") or []:
+                if (call.get("function") or {}).get("name") == "todo":
+                    cid = call.get("id")
+                    if cid:
+                        todo_call_ids.add(cid)
+        if not todo_call_ids:
+            return None
+        for msg in reversed(history):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            if msg.get("tool_call_id") not in todo_call_ids:
+                continue
+            content = msg.get("content", "")
+            if (
+                not isinstance(content, str)
+                or len(content) > MAX_TODO_RESULT_CHARS
+                or '"todos"' not in content
+            ):
+                continue
+            try:
+                return _normalize_todo_state(json.loads(content))
+            except Exception:
+                continue
+        return None
+    except Exception:
+        logger.debug("failed to derive todo state from history", exc_info=True)
+        return None
+
+
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     session = _sessions.get(sid)
     if session is not None:
@@ -7461,13 +7812,15 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         result_text = _tool_result_text(result)
         if result_text:
             payload["result_text"] = result_text
+    todo_state = None
     if name == "todo":
-        try:
-            data = json.loads(result)
-            if isinstance(data, dict) and isinstance(data.get("todos"), list):
-                payload["todos"] = data.get("todos")
-        except Exception:
-            pass
+        todo_state = _normalize_todo_state(payload.get("result"))
+        if todo_state is not None:
+            payload.update(todo_state)
+            if session is not None:
+                cached = _normalize_todo_state(session.get("todo_state"))
+                if cached is None or todo_state["revision"] >= cached["revision"]:
+                    session["todo_state"] = todo_state
     try:
         from agent.display import render_edit_diff_with_delta
 
@@ -7482,8 +7835,18 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["inline_diff"] = "\n".join(rendered)
     except Exception:
         pass
-    if _tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name):
+    if (
+        _tool_progress_enabled(sid)
+        or payload.get("inline_diff")
+        or _tool_lifecycle_required_for_ui(name)
+        or name == "todo"
+    ):
         _emit("tool.complete", sid, payload)
+    # Task state is application data, not optional tool-progress chrome. A
+    # dedicated full-snapshot event lets every client reconcile immediately
+    # without interpreting provider text or partial merge arguments.
+    if todo_state is not None:
+        _emit("todo.updated", sid, todo_state)
 
 
 def _on_tool_progress(
@@ -8674,6 +9037,7 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        _session_todo_state(_sessions[sid])
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -10046,6 +10410,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    todo_state: dict | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -10082,6 +10447,7 @@ def _deferred_session_record(
         "source": source,
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
+        "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
     }
 
@@ -10208,6 +10574,11 @@ def _schedule_resume_hydration(
                 session["display_history_prefix"] = prefix
                 session["resume_hydrating"] = False
                 session["resume_message_count"] = len(display_history)
+            # Deferred resumes answered before the transcript existed; cache
+            # the derived todo snapshot now so later payload attaches carry it.
+            todo_state = _todo_state_from_history(history)
+            if todo_state is not None and session.get("todo_state") is None:
+                session["todo_state"] = todo_state
             session["resume_history_ready"].set()
             _emit(
                 "session.resume_progress",
@@ -10511,7 +10882,7 @@ def _live_session_payload(
         payload["pending_approval"] = approval
     if clarify := _pending_clarify_request_payload(sid):
         payload["pending_clarify"] = clarify
-    return payload
+    return _attach_todo_state(payload, session)
 
 
 def _main_runtime_from_agent(agent) -> dict | None:
@@ -13590,7 +13961,33 @@ def _(rid, params: dict) -> dict:
                     )
                 parsed_flags = parse_model_switch_args(value)
                 explicit_provider = parsed_flags.explicit_provider
-                if session.get("agent") is None and not explicit_provider.strip():
+                failed_agent_init = (
+                    session.get("agent") is None
+                    and session.get("agent_error") is not None
+                )
+                failed_ready = session.get("agent_ready") if failed_agent_init else None
+                if failed_agent_init:
+                    if failed_ready is None:
+                        return _err(
+                            rid,
+                            5032,
+                            session.get("agent_error")
+                            or "agent initialization failed",
+                        )
+                    if not failed_ready.wait(timeout=30.0):
+                        return _err(rid, 5032, "agent initialization timed out")
+                failed_agent_init = (
+                    failed_agent_init
+                    and session.get("agent") is None
+                    and session.get("agent_error") is not None
+                    and session.get("agent_ready") is failed_ready
+                    and failed_ready.is_set()
+                )
+                if (
+                    session.get("agent") is None
+                    and not explicit_provider.strip()
+                    and not failed_agent_init
+                ):
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
                     init_err = _wait_agent(session, rid)
@@ -13598,15 +13995,27 @@ def _(rid, params: dict) -> dict:
                         return init_err
                     if session.get("agent") is None:
                         return _err(rid, 5032, "agent initialization failed")
-                result = _apply_model_switch(
-                    params.get("session_id", ""),
-                    session,
-                    value,
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                    parsed_flags=parsed_flags,
-                )
+                with _session_profile_runtime_scope(session):
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        value,
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        parsed_flags=parsed_flags,
+                    )
+                if failed_agent_init and not result.get("confirm_required"):
+                    _restart_completed_failed_agent_build(
+                        params.get("session_id", ""), session, failed_ready
+                    )
+                    init_err = _wait_agent(session, rid)
+                    if init_err:
+                        return init_err
+                    if session.get("agent") is None:
+                        return _err(rid, 5032, "agent initialization failed")
+                    with _session_profile_runtime_scope(session):
+                        _persist_live_session_runtime(session)
             else:
                 result = _apply_model_switch(
                     "",
