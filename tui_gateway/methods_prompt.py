@@ -972,13 +972,34 @@ def _(rid, params: dict) -> dict:
         # only errors when the build itself fails or the bounded cap expires.
         err = _wait_agent_for_prompt(session, rid, sid)
         if err:
+            error_message = (err.get("error") or {}).get(
+                "message", "agent initialization failed"
+            )
+            if hosted_terminal_callback is not None:
+                terminal_receipt_committed = False
+                try:
+                    terminal_receipt, terminal_receipt_committed = (
+                        _persist_hosted_terminal_receipt(
+                            session,
+                            {"status": "failed", "text": "", "error": error_message},
+                        )
+                    )
+                    hosted_terminal_callback(terminal_receipt)
+                except Exception:
+                    logger.exception(
+                        "hosted room agent initialization terminal receipt commit failed"
+                    )
+                finally:
+                    if terminal_receipt_committed:
+                        with session["history_lock"]:
+                            session.pop("_hosted_room_task", None)
             # Terminal frame + retained snapshot (not a bare "error" event +
             # cleared inflight): if the client is disconnected right now, the
             # retained snapshot is the only way resume can show this failure.
             _emit_terminal_turn_error(
                 sid,
                 session,
-                (err.get("error") or {}).get("message", "agent initialization failed"),
+                error_message,
                 # Agent construction never reached the provider: this is a
                 # local-runtime failure (env/config/venv), not an API error.
                 error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},

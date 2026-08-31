@@ -297,9 +297,10 @@ class HostedRoomRuntime:
             if before["status"] == "cancelled":
                 return before
             if before["status"] in state.TERMINAL_STATUSES:
-                raise state.InvalidTaskTransitionError(
-                    f"cannot cancel task in state '{before['status']}'"
-                )
+                # Completion already won before this Stop could establish a
+                # fence. Return the durable outcome idempotently rather than
+                # turning a harmless late Stop into a routing error.
+                return before
             if before["status"] in {"queued", "deferred"}:
                 try:
                     cancelled = state.cancel_task(
@@ -327,16 +328,54 @@ class HostedRoomRuntime:
                 continue
             binding = self._binding_for_room(identity.room_id)
             try:
-                if binding is not None and self._interrupt_stopping_task(
-                    binding, stopping
-                ):
-                    stopping = state.complete_task_cancel(
+                if binding is not None:
+                    receipt_exists = state.get_terminal_receipt(
                         self.db_path,
                         identity,
-                        cancel_id=cancel_id,
-                        expected_cancel_generation=stopping["cancel_generation"],
-                        clock=self.clock,
-                    )
+                        execution_generation=int(stopping["execution_generation"]),
+                    ) is not None
+                    if receipt_exists:
+                        lease = self._ensure_lease(binding)
+                    if receipt_exists and self._settle_stopping_completion(
+                        binding, stopping, lease
+                    ):
+                        stopping = state.get_task(self.db_path, identity)
+                    elif self._interrupt_stopping_task(binding, stopping):
+                        # A terminal callback can commit while Stop is in
+                        # flight. Harvest again after acknowledgement; the
+                        # state-layer cancellation commit also refuses to
+                        # overwrite a matching durable receipt transactionally.
+                        receipt_exists = state.get_terminal_receipt(
+                            self.db_path,
+                            identity,
+                            execution_generation=int(
+                                stopping["execution_generation"]
+                            ),
+                        ) is not None
+                        if receipt_exists:
+                            lease = self._ensure_lease(binding)
+                        if receipt_exists and self._settle_stopping_completion(
+                            binding, stopping, lease
+                        ):
+                            stopping = state.get_task(self.db_path, identity)
+                        else:
+                            try:
+                                stopping = state.complete_task_cancel(
+                                    self.db_path,
+                                    identity,
+                                    cancel_id=cancel_id,
+                                    expected_cancel_generation=stopping[
+                                        "cancel_generation"
+                                    ],
+                                    clock=self.clock,
+                                )
+                            except state.TaskConflictError:
+                                lease = self._ensure_lease(binding)
+                                if not self._settle_stopping_completion(
+                                    binding, stopping, lease
+                                ):
+                                    raise
+                                stopping = state.get_task(self.db_path, identity)
             except Exception as exc:
                 self._record_error(f"stop remains pending: {exc}")
             stopping = state.get_task(self.db_path, identity)

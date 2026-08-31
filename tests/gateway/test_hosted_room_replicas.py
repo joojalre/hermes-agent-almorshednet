@@ -73,6 +73,40 @@ def test_ingest_page_is_idempotent(tmp_path):
     assert again["stored_seq"] == 3
 
 
+def test_ingest_preserves_monotonic_latest_seq_from_delayed_page(
+    tmp_path, monkeypatch
+):
+    adb = _authority_db(tmp_path)
+    _seed_room(adb, n_events=2)
+    first_page = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=1)
+    assert first_page["latest_seq"] == 2
+
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb,
+        room_id="room-1",
+        room_name="Field Room",
+        members=MEMBERS,
+        page=first_page,
+    )
+    delayed_page = json.loads(json.dumps(first_page))
+    delayed_page["latest_seq"] = 1
+    replicas.ingest_page(
+        rdb,
+        room_id="room-1",
+        room_name="Field Room",
+        members=MEMBERS,
+        page=delayed_page,
+    )
+
+    state = replicas.replica_state(rdb, room_id="room-1")
+    assert state["last_seq"] == 1
+    assert state["latest_seq"] == 2
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+    with pytest.raises(replicas.ReplicaError, match="caught up"):
+        replicas.promote_replica(rdb, room_id="room-1")
+
+
 def test_ingest_rejects_sequence_gap(tmp_path):
     adb = _authority_db(tmp_path)
     _seed_room(adb, n_events=5)
@@ -172,6 +206,134 @@ def test_promote_replica_continues_room_at_next_epoch(tmp_path, monkeypatch):
     # Replica bookkeeping is consumed by promotion.
     with pytest.raises(replicas.ReplicaError):
         replicas.replica_state(rdb, room_id="room-1")
+
+
+def test_promote_refuses_replica_that_has_not_caught_up(tmp_path, monkeypatch):
+    adb = _authority_db(tmp_path)
+    _seed_room(adb, n_events=200)
+    first_page = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)
+    assert first_page["latest_seq"] == 200
+    assert first_page["has_more"] is True
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb,
+        room_id="room-1",
+        room_name="Field Room",
+        members=MEMBERS,
+        page=first_page,
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+
+    with pytest.raises(replicas.ReplicaError, match="caught up"):
+        replicas.promote_replica(rdb, room_id="room-1")
+
+    assert replicas.replica_state(rdb, room_id="room-1")["last_seq"] == 100
+
+
+def test_promote_preflights_authoritative_event_count(tmp_path, monkeypatch):
+    page = _seed_room(_authority_db(tmp_path), n_events=2)
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb, room_id="room-1", room_name="Field Room", members=MEMBERS, page=page
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 1)
+
+    with pytest.raises(rooms.HostedRoomError, match="history limit"):
+        replicas.promote_replica(rdb, room_id="room-1")
+
+    assert replicas.replica_state(rdb, room_id="room-1")["last_seq"] == 2
+
+
+def test_promote_preflights_authoritative_gateway_bytes(tmp_path, monkeypatch):
+    page = _seed_room(_authority_db(tmp_path), n_events=1)
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb, room_id="room-1", room_name="Field Room", members=MEMBERS, page=page
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+    monkeypatch.setattr(rooms, "MAX_GATEWAY_EVENT_BYTES", 1)
+
+    with pytest.raises(rooms.HostedRoomError, match="storage is full"):
+        replicas.promote_replica(rdb, room_id="room-1")
+
+    assert replicas.replica_state(rdb, room_id="room-1")["last_seq"] == 1
+
+
+def test_promote_preflights_authoritative_room_bytes(tmp_path, monkeypatch):
+    page = _seed_room(_authority_db(tmp_path), n_events=1)
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb, room_id="room-1", room_name="Field Room", members=MEMBERS, page=page
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+    monkeypatch.setattr(rooms, "MAX_ROOM_EVENT_BYTES", 1)
+
+    with pytest.raises(rooms.HostedRoomError, match="storage limit"):
+        replicas.promote_replica(rdb, room_id="room-1")
+
+    assert replicas.replica_state(rdb, room_id="room-1")["last_seq"] == 1
+
+
+def test_promote_replays_history_that_validly_used_stop_reserve(
+    tmp_path, monkeypatch
+):
+    adb = _authority_db(tmp_path)
+    rooms.create_room(
+        adb,
+        room_id="room-1",
+        name="Field Room",
+        members=MEMBERS,
+        authority_gateway_id=AUTH_A,
+    )
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 1)
+    rooms.append_event(
+        adb,
+        room_id="room-1",
+        event_id="ordinary-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "at the ordinary limit"},
+        authority_gateway_id=AUTH_A,
+        authority_epoch=1,
+    )
+    rooms.request_room_stop(
+        adb,
+        room_id="room-1",
+        cancel_id="stop-1",
+        expected_gateway_id=AUTH_A,
+        expected_epoch=1,
+    )
+    page = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb, room_id="room-1", room_name="Field Room", members=MEMBERS, page=page
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+
+    replicas.promote_replica(rdb, room_id="room-1")
+
+    replay = rooms.read_events(rdb, room_id="room-1", since_seq=0, limit=100)
+    assert [event["kind"] for event in replay["events"]] == [
+        "message.user",
+        "room.stop_requested",
+        "authority.claimed",
+    ]
+
+
+def test_promote_refuses_when_active_room_capacity_is_full(tmp_path, monkeypatch):
+    page = _seed_room(_authority_db(tmp_path), n_events=1)
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb, room_id="room-1", room_name="Field Room", members=MEMBERS, page=page
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+    monkeypatch.setattr(replicas, "MAX_ACTIVE_ROOMS", 0)
+
+    with pytest.raises(rooms.HostedRoomError, match="too many active"):
+        replicas.promote_replica(rdb, room_id="room-1")
+
+    assert replicas.replica_state(rdb, room_id="room-1")["last_seq"] == 1
 
 
 def test_promote_refuses_when_room_exists_locally(tmp_path, monkeypatch):

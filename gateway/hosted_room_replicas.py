@@ -30,10 +30,14 @@ from typing import Any
 
 from gateway.hosted_rooms import (
     MAX_ACTOR_ID_CHARS,
+    MAX_ACTIVE_ROOMS,
     MAX_EVENT_JSON_BYTES,
     MAX_ROOM_ID_CHARS,
     HostedRoomError,
     RoomConflictError,
+    _CRITICAL_CONTROL_EVENT_KINDS,
+    _TERMINAL_COMPLETION_EVENT_KINDS,
+    _assert_event_capacity,
     _canonical_json,
     _connect,
     _transaction,
@@ -196,10 +200,12 @@ def ingest_page(
                 raise ReplicaError("replica room capacity exhausted")
             stored_epoch = 0
             last_seq = 0
+            stored_latest_seq = 0
             stored_bytes = 0
         else:
             stored_epoch = int(row["authority_epoch"])
             last_seq = int(row["last_seq"])
+            stored_latest_seq = int(row["latest_seq"])
             stored_bytes = int(row["event_bytes"])
 
         if authority["epoch"] < stored_epoch:
@@ -245,6 +251,7 @@ def ingest_page(
         latest_seq = page.get("latest_seq")
         if isinstance(latest_seq, bool) or not isinstance(latest_seq, int):
             latest_seq = new_last
+        observed_latest_seq = max(stored_latest_seq, latest_seq, new_last)
         if row is None:
             conn.execute(
                 """INSERT INTO hosted_room_replicas
@@ -259,7 +266,7 @@ def ingest_page(
                     authority["gateway_id"],
                     authority["epoch"],
                     new_last,
-                    max(latest_seq, new_last),
+                    observed_latest_seq,
                     added_bytes,
                     now,
                     now,
@@ -278,7 +285,7 @@ def ingest_page(
                     authority["gateway_id"],
                     authority["epoch"],
                     new_last,
-                    max(latest_seq, new_last),
+                    observed_latest_seq,
                     added_bytes,
                     now,
                     room_id,
@@ -289,7 +296,7 @@ def ingest_page(
         "stored_seq": new_last,
         "ingested": len(new_events),
         "authority": authority,
-        "caught_up": new_last >= max(latest_seq, new_last),
+        "caught_up": new_last >= observed_latest_seq,
     }
 
 
@@ -356,7 +363,7 @@ def promote_replica(
         _initialize_replica_schema(conn)
         replica = conn.execute(
             """SELECT room_id, name, members_json, authority_gateway_id,
-                      authority_epoch, last_seq, event_bytes
+                      authority_epoch, last_seq, latest_seq, event_bytes
                  FROM hosted_room_replicas WHERE room_id=?""",
             (room_id,),
         ).fetchone()
@@ -375,11 +382,25 @@ def promote_replica(
             (room_id,),
         ).fetchone():
             raise RoomConflictError("room_id belongs to a disbanded room")
+        active_rooms = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM hosted_rooms WHERE disbanded_at IS NULL"
+            ).fetchone()[0]
+        )
+        if active_rooms >= MAX_ACTIVE_ROOMS:
+            raise HostedRoomError(
+                "This host has too many active Group Chats. Delete one and try again."
+            )
 
         previous_gateway = str(replica["authority_gateway_id"])
         previous_epoch = int(replica["authority_epoch"])
         target_epoch = previous_epoch + 1
         last_seq = int(replica["last_seq"])
+        latest_seq = int(replica["latest_seq"])
+        if last_seq < latest_seq:
+            raise ReplicaError(
+                "replica is not caught up; ingest every remaining log page before promotion"
+            )
         claim_seq = last_seq + 1
         claim_event_id = f"system:authority-claimed:{target_epoch}"
         claim_actor_json = _canonical_json(
@@ -405,6 +426,7 @@ def promote_replica(
             + len(claim_payload_json.encode("utf-8"))
         )
 
+        replica_bytes = int(replica["event_bytes"])
         conn.execute(
             """INSERT INTO hosted_rooms
                (room_id, name, members_json, authority_gateway_id,
@@ -417,20 +439,74 @@ def promote_replica(
                 replica["members_json"],
                 local_gateway,
                 target_epoch,
-                claim_seq + 1,
-                int(replica["event_bytes"]) + claim_bytes,
+                1,
+                0,
                 now,
                 now,
             ),
         )
-        conn.execute(
-            """INSERT INTO hosted_room_events
-               (room_id, seq, event_id, kind, actor_json, authority_epoch,
-                payload_json, created_at)
-               SELECT room_id, seq, event_id, kind, actor_json,
+        replica_events = conn.execute(
+            """SELECT room_id, seq, event_id, kind, actor_json,
                       authority_epoch, payload_json, created_at
-                 FROM hosted_room_replica_events WHERE room_id=?""",
+                 FROM hosted_room_replica_events
+                WHERE room_id=? ORDER BY seq""",
             (room_id,),
+        )
+        replay_bytes = 0
+        next_seq = 1
+        for event in replica_events:
+            if int(event["seq"]) != next_seq:
+                raise ReplicaGapError("replica history is not contiguous")
+            event_bytes = len(
+                (
+                    str(event["event_id"])
+                    + str(event["kind"])
+                    + str(event["actor_json"])
+                    + str(event["payload_json"])
+                ).encode("utf-8")
+            )
+            kind = str(event["kind"])
+            promoted_room = conn.execute(
+                "SELECT next_seq, event_bytes FROM hosted_rooms WHERE room_id=?",
+                (room_id,),
+            ).fetchone()
+            _assert_event_capacity(
+                conn,
+                room=promoted_room,
+                additional_bytes=event_bytes,
+                allow_control=kind in _CRITICAL_CONTROL_EVENT_KINDS,
+                allow_stop=kind == "room.stop_requested",
+                allow_terminal_recovery=(
+                    kind in _TERMINAL_COMPLETION_EVENT_KINDS
+                ),
+            )
+            conn.execute(
+                """INSERT INTO hosted_room_events
+                   (room_id, seq, event_id, kind, actor_json, authority_epoch,
+                    payload_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(event),
+            )
+            replay_bytes += event_bytes
+            next_seq += 1
+            conn.execute(
+                """UPDATE hosted_rooms
+                      SET next_seq=?, event_bytes=?, updated_at=?
+                    WHERE room_id=?""",
+                (next_seq, replay_bytes, now, room_id),
+            )
+        if next_seq != claim_seq or replay_bytes != replica_bytes:
+            raise ReplicaError("replica history metadata does not match stored events")
+        promoted_room = conn.execute(
+            "SELECT next_seq, event_bytes FROM hosted_rooms WHERE room_id=?",
+            (room_id,),
+        ).fetchone()
+        _assert_event_capacity(
+            conn,
+            room=promoted_room,
+            additional_bytes=claim_bytes,
+            additional_events=1,
+            allow_control=True,
         )
         conn.execute(
             """INSERT INTO hosted_room_events
@@ -446,6 +522,12 @@ def promote_replica(
                 claim_payload_json,
                 now,
             ),
+        )
+        conn.execute(
+            """UPDATE hosted_rooms
+               SET next_seq=?, event_bytes=?, updated_at=?
+               WHERE room_id=?""",
+            (claim_seq + 1, replica_bytes + claim_bytes, now, room_id),
         )
         conn.execute(
             "DELETE FROM hosted_room_replica_events WHERE room_id=?", (room_id,)

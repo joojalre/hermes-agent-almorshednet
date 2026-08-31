@@ -553,6 +553,47 @@ def test_cancellation_fences_late_success(db):
         )
 
 
+def test_stop_ack_refuses_exact_generation_terminal_receipt(db):
+    clock = FakeClock()
+    identity = _identity()
+    lease = _lease(db, clock)
+    _admit(db, identity, clock)
+    attempt = driver.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    driver.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-after-receipt",
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    driver.record_terminal_receipt(
+        db,
+        identity,
+        execution_generation=attempt.execution_generation,
+        settlement_id="reply-before-ack",
+        status="settled",
+        result={"text": "done"},
+        clock=clock,
+    )
+
+    with pytest.raises(driver.TaskConflictError, match="terminal receipt"):
+        driver.complete_task_cancel(
+            db,
+            identity,
+            cancel_id="cancel-after-receipt",
+            expected_cancel_generation=1,
+            clock=clock,
+        )
+
+    assert driver.get_task(db, identity)["status"] == "stopping"
+
+
 def test_approval_requests_are_stale_once_task_is_stopping(db):
     clock = FakeClock()
     identity = _identity()

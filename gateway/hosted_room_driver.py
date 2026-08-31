@@ -1707,6 +1707,15 @@ def complete_task_cancel(
             or int(row["cancel_generation"]) != expected_cancel_generation
         ):
             raise StaleTaskError("task stop acknowledgement is stale")
+        receipt = conn.execute(
+            """SELECT 1 FROM hosted_room_terminal_receipts
+               WHERE room_id=? AND task_id=? AND execution_generation=?""",
+            (identity.room_id, identity.task_id, int(row["execution_generation"])),
+        ).fetchone()
+        if receipt is not None:
+            raise TaskConflictError(
+                "task has a durable terminal receipt that must settle before cancellation"
+            )
         updated = conn.execute(
             """UPDATE hosted_room_driver_tasks
                SET status='cancelled', terminal_at=?, updated_at=?

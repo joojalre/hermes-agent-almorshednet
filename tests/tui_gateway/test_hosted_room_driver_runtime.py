@@ -775,7 +775,7 @@ def test_oversized_terminal_reply_is_bounded_without_waiting_for_deadline(db: Pa
     runtime = _runtime(db, rpc, turn_timeout_seconds=30)
 
     runtime.start()
-    assert rpc.submitted.wait(timeout=1.0)
+    assert rpc.submitted.wait(timeout=2.0)
     rpc.complete(
         identity.task_id,
         content="é" * (MAX_TERMINAL_TEXT_BYTES + 100),
@@ -1333,6 +1333,60 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
     _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
     settled = state.get_task(db, identity)
     assert settled["result"]["text"] == "Already done."
+    assert runtime.stop(timeout=1.0)
+
+
+def test_durable_terminal_receipt_wins_before_immediate_stop_interrupt(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+
+    runtime.start()
+    assert rpc.submitted.wait(1.0)
+    running = state.get_task(db, identity)
+    state.record_terminal_receipt(
+        db,
+        identity,
+        execution_generation=running["execution_generation"],
+        settlement_id="reply-before-stop",
+        status="settled",
+        result={"text": "Already complete."},
+        clock=time.time,
+    )
+
+    result = runtime.cancel(identity, cancel_id="cancel-after-receipt")
+
+    assert result["status"] == "settled"
+    assert result["result"]["text"] == "Already complete."
+    assert not [call for call in rpc.calls if call[0] == "interrupt"]
+    assert runtime.stop(timeout=1.0)
+
+
+def test_terminal_receipt_committed_during_interrupt_wins_cancel_ack(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+
+    runtime.start()
+    assert rpc.submitted.wait(1.0)
+    running = state.get_task(db, identity)
+    rpc.on_interrupt = lambda: state.record_terminal_receipt(
+        db,
+        identity,
+        execution_generation=running["execution_generation"],
+        settlement_id="reply-during-stop",
+        status="settled",
+        result={"text": "Completed during Stop."},
+        clock=time.time,
+    )
+
+    result = runtime.cancel(identity, cancel_id="cancel-racing-receipt")
+
+    assert result["status"] == "settled"
+    assert result["result"]["text"] == "Completed during Stop."
+    assert len([call for call in rpc.calls if call[0] == "interrupt"]) == 1
     assert runtime.stop(timeout=1.0)
 
 

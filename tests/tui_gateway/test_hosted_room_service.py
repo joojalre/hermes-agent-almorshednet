@@ -725,7 +725,6 @@ def test_terminal_publication_recovers_legacy_member_prefix_at_normal_limit(
             events=(member, terminal),
         ),
     )
-
     assert [event["event_id"] for event in service._events("room-1")] == [
         "member-1",
         "terminal-1",
@@ -773,12 +772,133 @@ def test_terminal_only_publication_uses_bounded_recovery_reserve(
             events=(terminal,),
         ),
     )
-
     assert [event["event_id"] for event in service._events("room-1")] == [
         "user-1",
         "cancelled-1",
     ]
 
+
+def test_room_activity_refuses_stale_snapshot_after_same_thread_followup(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Racing room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="user-old",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "first", "thread_id": "thread-1"},
+    )
+    stale_room = hosted_rooms.room_state(db, room_id="room-1")
+    _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="user-new",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "follow up", "thread_id": "thread-1"},
+    )
+    stale_decision = discussion.DiscussionDecision(
+        status="settled",
+        reason="silent_round",
+        discussion_event_id="user-old",
+        source_event_seq=1,
+        thread_id="thread-1",
+    )
+
+    with pytest.raises(hosted_rooms.HostedRoomError, match="changed"):
+        service._append_room_status(stale_room, stale_decision)
+
+    fresh_room = hosted_rooms.room_state(db, room_id="room-1")
+    hosted_rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="legacy-stale-activity",
+        kind="room.activity",
+        actor={"kind": "gateway", "id": str(fresh_room["authority_gateway_id"])},
+        payload={
+            "status": "settled",
+            "reason_code": "silent_round",
+            "thread_id": "thread-1",
+            "discussion_event_id": "user-old",
+        },
+        authority_gateway_id=str(fresh_room["authority_gateway_id"]),
+        authority_epoch=int(fresh_room["authority_epoch"]),
+    )
+    fresh_room = hosted_rooms.room_state(db, room_id="room-1")
+    snapshot = service._policy_snapshot(fresh_room)
+    assert any(event["event_id"] == "user-new" for event in snapshot.events)
+
+
+def test_send_returns_durable_user_event_when_room_status_publication_races(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Racing room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    monkeypatch.setattr(
+        discussion,
+        "plan_next_task",
+        lambda *args, **kwargs: discussion.DiscussionDecision(
+            status="settled",
+            reason="silent_round",
+            discussion_event_id="user-1",
+            source_event_seq=1,
+            thread_id="thread-1",
+        ),
+    )
+    original_append_events = hosted_rooms.append_events
+    injected = False
+
+    def append_after_newer_user(*args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            _append_room_event(
+                db,
+                room_id="room-1",
+                event_id="user-2",
+                kind="message.user",
+                actor={"kind": "user", "id": "desktop"},
+                payload={"text": "newer", "thread_id": "thread-1"},
+            )
+        return original_append_events(*args, **kwargs)
+
+    monkeypatch.setattr(hosted_rooms, "append_events", append_after_newer_user)
+    service.runtime._wake.clear()
+
+    event = service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "first", "thread_id": "thread-1"},
+    )
+
+    assert event["event_id"] == "user-1"
+    assert [event["event_id"] for event in service._events("room-1")] == [
+        "user-1",
+        "user-2",
+    ]
+    assert service.runtime._wake.is_set()
 
 def test_terminal_publication_rejects_existing_suffix_without_member_prefix(
     tmp_path: Path,

@@ -285,20 +285,30 @@ class HostedRoomService:
     ) -> None:
         if decision.discussion_event_id is None:
             return
-        hosted_rooms.append_event(
+        hosted_rooms.append_events(
             self.db_path,
-            room_id=str(room["room_id"]),
-            event_id=f"dactivity:{decision.discussion_event_id}:{decision.reason}",
-            kind="room.activity",
-            actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
-            payload={
-                "status": decision.status,
-                "reason_code": decision.reason,
-                "thread_id": decision.thread_id,
-                "discussion_event_id": decision.discussion_event_id,
-            },
-            authority_gateway_id=str(room["authority_gateway_id"]),
-            authority_epoch=int(room["authority_epoch"]),
+            events=[
+                {
+                    "room_id": str(room["room_id"]),
+                    "event_id": (
+                        f"dactivity:{decision.discussion_event_id}:{decision.reason}"
+                    ),
+                    "kind": "room.activity",
+                    "actor": {
+                        "kind": "gateway",
+                        "id": str(room["authority_gateway_id"]),
+                    },
+                    "payload": {
+                        "status": decision.status,
+                        "reason_code": decision.reason,
+                        "thread_id": decision.thread_id,
+                        "discussion_event_id": decision.discussion_event_id,
+                    },
+                    "authority_gateway_id": str(room["authority_gateway_id"]),
+                    "authority_epoch": int(room["authority_epoch"]),
+                }
+            ],
+            expected_latest_seq=int(room["latest_seq"]),
         )
 
     def prepare_room(self, binding: HostedRoomBinding) -> None:
@@ -476,7 +486,13 @@ class HostedRoomService:
         )
         if binding is None:
             raise hosted_rooms.RoomNotFoundError("hosted room not found")
-        self.prepare_room(binding)
+        try:
+            self.prepare_room(binding)
+        except hosted_rooms.RoomConflictError:
+            # The user event is already durable. A concurrent append only
+            # invalidates this policy snapshot, so reschedule from fresh state
+            # instead of reporting that the accepted send failed.
+            pass
         self.runtime.wakeup()
         return event
 
