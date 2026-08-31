@@ -49,7 +49,13 @@ _SECRET_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 _INSTRUCTION_RE = re.compile(
-    r"^\s*(?:(?:run|execute|delete|remove|upload|send|click|open|install|deploy|merge|push|ignore|disregard)\b|you\s+must\b|must\b)",
+    r"^\s*(?:"
+    r"(?:(?:please|kindly)(?:\s*[,;:،؛]\s*|\s+))?"
+    r"(?:(?:run|execute|delete|remove|upload|send|click|open|install|deploy|merge|push|ignore|disregard)\b|you\s+must\b|must\b)"
+    r"|(?:يرجى|الرجاء|من\s+فضلك)(?:\s*[,;:،؛]\s*|\s+)"
+    r"(?:حذف|إزالة|ازالة|تنفيذ|تشغيل|رفع|إرسال|ارسال|فتح|تثبيت|نشر|دمج|دفع|تجاهل|احذف|أزل|ازل|نفذ|نفّذ|شغّل|شغل|ارفع|أرسل|ارسل|افتح|ثبّت|ثبت|انشر|ادمج|ادفع)(?!\w)"
+    r"|(?:احذف|أزل|ازل|نفذ|نفّذ|شغّل|شغل|ارفع|أرسل|ارسل|افتح|ثبّت|ثبت|انشر|ادمج|ادفع|تجاهل)(?!\w)"
+    r")",
     re.IGNORECASE,
 )
 _SENSITIVE_FIELD_NAMES = {
@@ -400,12 +406,17 @@ def _prepare(manifest: dict[str, Any], manifest_sha: str) -> dict[str, Any]:
     by_key: dict[str, list[dict[str, Any]]] = {}
     for record in deduped:
         if record["fact_key"]:
-            by_key.setdefault(record["fact_key"], []).append(record)
-    for fact_key, group in by_key.items():
+            comparison_key = unicodedata.normalize(
+                "NFKC", record["fact_key"]
+            ).casefold()
+            by_key.setdefault(comparison_key, []).append(record)
+    for group in by_key.values():
         if len({item["statement"].casefold() for item in group}) > 1:
             for item in group:
                 item["status"] = "CONFLICTING"
-                conflicts.append({"id": item["id"], "fact_key": fact_key})
+                conflicts.append(
+                    {"id": item["id"], "fact_key": item["fact_key"]}
+                )
 
     accepted = [item for item in deduped if item["status"] != "CONFLICTING"]
     return {
@@ -787,8 +798,10 @@ def _verify(args: Any) -> int:
         for line in audit_text.splitlines():
             try:
                 item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise KnowledgeError("knowledge audit is malformed") from exc
+            if not isinstance(item, dict):
+                raise KnowledgeError("knowledge audit is malformed")
             if item.get("run_id") == args.run_id:
                 events.append(item)
         if not events:
