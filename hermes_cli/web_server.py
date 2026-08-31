@@ -499,8 +499,11 @@ async def _lifespan(app: "FastAPI"):
         yield
     finally:
         hosted_room_start_cancel.set()
-        _hosted_groups.stop_hosted_room_service(timeout=5.0)
-        hosted_room_start_thread.join(timeout=1.0)
+        await asyncio.to_thread(
+            _hosted_groups.stop_hosted_room_service,
+            timeout=5.0,
+        )
+        await asyncio.to_thread(hosted_room_start_thread.join, 1.0)
         if cron_stop is not None:
             cron_stop.set()
         pty_reaper_task.cancel()

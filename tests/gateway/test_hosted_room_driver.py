@@ -553,6 +553,61 @@ def test_cancellation_fences_late_success(db):
         )
 
 
+def test_approval_requests_are_stale_once_task_is_stopping(db):
+    clock = FakeClock()
+    identity = _identity()
+    lease = _lease(db, clock)
+    _admit(db, identity, clock)
+    attempt = driver.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    driver.publish_approval_request(
+        db,
+        identity,
+        execution_generation=attempt.execution_generation,
+        member_id="member-ops",
+        request_id="approval-1",
+        session_id="session-1",
+        action={"tool": "shell", "command": "inspect"},
+        clock=clock,
+    )
+
+    driver.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-before-approval",
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+
+    assert driver.list_pending_approval_requests(db, room_id="room-1") == []
+    with pytest.raises(driver.StaleTaskError, match="no longer running"):
+        driver.decide_approval_request(
+            db,
+            identity,
+            execution_generation=attempt.execution_generation,
+            member_id="member-ops",
+            request_id="approval-1",
+            choice="once",
+            clock=clock,
+        )
+    with pytest.raises(driver.InvalidTaskTransitionError, match="running task"):
+        driver.publish_approval_request(
+            db,
+            identity,
+            execution_generation=attempt.execution_generation,
+            member_id="member-ops",
+            request_id="approval-2",
+            session_id="session-1",
+            action={"tool": "shell", "command": "inspect again"},
+            clock=clock,
+        )
+
+
 def test_release_fails_closed_while_its_task_is_running(db):
     clock = FakeClock()
     identity = _identity()

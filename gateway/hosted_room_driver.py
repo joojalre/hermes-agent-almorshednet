@@ -1890,9 +1890,9 @@ def publish_approval_request(
         task = _load_task(conn, identity)
         if int(task["execution_generation"]) != execution_generation:
             raise StaleTaskError("approval request belongs to a stale task generation")
-        if task["status"] not in {"running", "stopping"}:
+        if task["status"] != "running":
             raise InvalidTaskTransitionError(
-                "approval request requires an active task generation"
+                "approval request requires a running task generation"
             )
         existing = conn.execute(
             """SELECT * FROM hosted_room_approval_requests
@@ -1979,6 +1979,8 @@ def decide_approval_request(
         task = _load_task(conn, identity)
         if int(task["execution_generation"]) != execution_generation:
             raise StaleTaskError("approval decision belongs to a stale task generation")
+        if task["status"] != "running":
+            raise StaleTaskError("approval request task is no longer running")
         row = conn.execute(
             """SELECT * FROM hosted_room_approval_requests
                WHERE room_id=? AND task_id=? AND execution_generation=?
@@ -2036,7 +2038,7 @@ def list_pending_approval_requests(
                 AND tasks.task_id=approvals.task_id
                 AND tasks.execution_generation=approvals.execution_generation
                WHERE approvals.room_id=? AND approvals.consumed_at IS NULL
-                 AND tasks.status IN ('running', 'stopping')
+                 AND tasks.status='running'
                ORDER BY approvals.created_at, approvals.task_id,
                         approvals.member_id, approvals.request_id""",
             (room_id,),

@@ -19,6 +19,7 @@ preserves the same canonical transcript instead of forking a second conversation
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import threading
 import time
 import uuid
@@ -30,6 +31,8 @@ from typing import Any, ContextManager, Protocol, cast
 from gateway import hosted_room_driver as state
 
 _CANCEL_ROUTE_RETRIES = 8
+_ROOM_SESSION_TITLE_LIMIT = 100
+_ROOM_SESSION_TITLE_DIGEST_CHARS = 32
 
 
 ROOM_SESSION_SOURCE = "bot_room"
@@ -849,7 +852,12 @@ class HostedRoomRuntime:
             self._drop_lease(binding.room_id)
             self._record_error(f"task {attempt.identity.task_id} fenced: {exc}")
         except Exception as exc:
-            if submit_attempted:
+            if submit_attempted and getattr(exc, "not_admitted", False):
+                # The in-process RPC marks error envelopes returned before
+                # prompt admission.  That proof is stronger than the generic
+                # submit-boundary ambiguity rule, so settle it immediately.
+                self._settle_failure_if_current(attempt, exc)
+            elif submit_attempted:
                 self._drop_lease(binding.room_id)
                 self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
                 self._record_error(
@@ -1249,7 +1257,16 @@ class HostedRoomRuntime:
 
 def room_session_title(room_id: str) -> str:
     """Return the canonical hidden session title for one hosted room."""
-    return f"Group: {room_id}"
+    prefix = "Group: "
+    title = f"{prefix}{room_id}"
+    if len(title) <= _ROOM_SESSION_TITLE_LIMIT:
+        return title
+    digest = hashlib.sha256(room_id.encode("utf-8")).hexdigest()[
+        :_ROOM_SESSION_TITLE_DIGEST_CHARS
+    ]
+    suffix = f"~{digest}"
+    room_prefix_length = _ROOM_SESSION_TITLE_LIMIT - len(prefix) - len(suffix)
+    return f"{prefix}{room_id[:room_prefix_length]}{suffix}"
 
 
 def _session_id(session: Mapping[str, Any]) -> str:

@@ -478,6 +478,52 @@ class HostedRoomService:
         self.runtime.wakeup()
         return cancelled
 
+    def demote_room(
+        self,
+        room_id: Any,
+        *,
+        observed_gateway_id: Any,
+        observed_epoch: Any,
+    ) -> dict[str, Any]:
+        """Stop accepted local work before committing a newer authority."""
+
+        from gateway.hosted_room_replicas import (
+            demote_room,
+            validate_demotion_observation,
+        )
+
+        room_id, observed_gateway_id, observed_epoch = validate_demotion_observation(
+            room_id=room_id,
+            observed_gateway_id=observed_gateway_id,
+            observed_epoch=observed_epoch,
+        )
+        room = hosted_rooms.room_state(self.db_path, room_id=room_id)
+        current_gateway = str(room["authority_gateway_id"])
+        current_epoch = int(room["authority_epoch"])
+        local_gateway = hosted_rooms.local_authority_gateway_id()
+
+        # Preserve demote_room's idempotent/error semantics without stopping
+        # work for a malformed, regressive, or already-demoted observation.
+        if current_gateway != local_gateway or observed_epoch <= current_epoch:
+            return demote_room(
+                self.db_path,
+                room_id=room_id,
+                observed_gateway_id=observed_gateway_id,
+                observed_epoch=observed_epoch,
+            )
+
+        self.stop_room(
+            room_id,
+            cancel_id=f"authority-demote:{observed_epoch}",
+            require_acknowledged=True,
+        )
+        return demote_room(
+            self.db_path,
+            room_id=room_id,
+            observed_gateway_id=observed_gateway_id,
+            observed_epoch=observed_epoch,
+        )
+
     def retry_room_task(self, room_id: str, *, task_id: str) -> dict[str, Any]:
         """Retry one uncertain or deferred task only after explicit user action."""
 
