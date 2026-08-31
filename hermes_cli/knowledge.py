@@ -965,7 +965,7 @@ def _parse_audit_event(line: str) -> dict[str, Any]:
 
 def _append_audit(event: dict[str, Any]) -> None:
     path = _audit_path()
-    line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+    line = json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with MemoryStore._file_lock(path):

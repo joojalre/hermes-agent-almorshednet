@@ -969,6 +969,34 @@ def test_unicode_line_separators_in_revisions_fail_closed(
     assert not (home / "knowledge" / "knowledge-sync.jsonl").exists()
 
 
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+def test_audit_jsonl_escapes_unicode_line_separators_in_locator(
+    tmp_path, monkeypatch, capsys, separator
+):
+    home = tmp_path / "hermes"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    manifest = _manifest(tmp_path / "unicode-locator.json")
+    manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+    locator = f"https://example.test/source{separator}segment"
+    manifest_data["sources"][0]["locator"] = locator
+    manifest.write_text(json.dumps(manifest_data), encoding="utf-8")
+    sync_args = SimpleNamespace(
+        manifest=str(manifest), dry_run=False, apply=True, json=True
+    )
+
+    assert knowledge._sync(sync_args) == 0
+    capsys.readouterr()
+    audit_path = home / "knowledge" / "knowledge-sync.jsonl"
+    raw_audit = audit_path.read_text(encoding="utf-8")
+    assert len(raw_audit.splitlines()) == 1
+    assert json.loads(raw_audit)["sources"][0]["locator"] == locator
+    assert knowledge._verify(
+        SimpleNamespace(run_id="test-run-001", json=True)
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
 @pytest.mark.parametrize(
     "domain",
     ["OpenAI APIs", "runtime configuration", "deployment", "installation"],
