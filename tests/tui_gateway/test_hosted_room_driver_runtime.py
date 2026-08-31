@@ -10,14 +10,17 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import psutil
 
 from gateway import hosted_room_driver as state
 from gateway import hosted_rooms
+from gateway import status as gateway_status
 from tui_gateway.hosted_room_driver import (
     MAX_TERMINAL_TEXT_BYTES,
     ROOM_SESSION_SOURCE,
     HostedRoomBinding,
     HostedRoomRuntime,
+    _owner_process_state,
     room_session_title,
 )
 
@@ -29,6 +32,102 @@ BINDING = HostedRoomBinding(
     gateway_id="gateway-a",
     authority_epoch=1,
 )
+
+
+@pytest.mark.parametrize("error_type", [psutil.NoSuchProcess, psutil.ZombieProcess])
+def test_owner_process_state_reports_confirmed_terminal_process_as_dead(
+    monkeypatch,
+    error_type,
+):
+    def process_probe(pid: int):
+        raise error_type(pid)
+
+    monkeypatch.setattr(psutil, "Process", process_probe)
+    monkeypatch.setattr(
+        gateway_status,
+        "get_process_start_time",
+        lambda _pid: pytest.fail("terminal process must not need a fingerprint"),
+    )
+
+    assert _owner_process_state(4242, 7001) == "dead"
+
+
+def test_owner_process_state_reports_zombie_status_as_dead(monkeypatch):
+    class ZombieProcess:
+        def status(self):
+            return psutil.STATUS_ZOMBIE
+
+    monkeypatch.setattr(psutil, "Process", lambda _pid: ZombieProcess())
+    monkeypatch.setattr(
+        gateway_status,
+        "get_process_start_time",
+        lambda _pid: pytest.fail("zombie process must not need a fingerprint"),
+    )
+
+    assert _owner_process_state(4242, 7001) == "dead"
+
+
+@pytest.mark.parametrize(
+    "probe_error",
+    [psutil.AccessDenied(4242), RuntimeError("process probe failed")],
+)
+def test_owner_process_state_keeps_process_probe_errors_unknown(
+    monkeypatch,
+    probe_error,
+):
+    def process_probe(_pid: int):
+        raise probe_error
+
+    monkeypatch.setattr(psutil, "Process", process_probe)
+    monkeypatch.setattr(
+        psutil,
+        "pid_exists",
+        lambda _pid: pytest.fail("pid_exists is not authoritative for owner death"),
+    )
+
+    assert _owner_process_state(4242, 7001) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("current_start", "expected"),
+    [(None, "unknown"), (7001, "alive"), (7002, "dead")],
+)
+def test_owner_process_state_uses_confirmed_start_fingerprint(
+    monkeypatch,
+    current_start,
+    expected,
+):
+    class RunningProcess:
+        def status(self):
+            return "running"
+
+    monkeypatch.setattr(psutil, "Process", lambda _pid: RunningProcess())
+    monkeypatch.setattr(
+        psutil,
+        "pid_exists",
+        lambda _pid: pytest.fail("pid_exists is not authoritative for owner death"),
+    )
+    monkeypatch.setattr(
+        gateway_status,
+        "get_process_start_time",
+        lambda _pid: current_start,
+    )
+
+    assert _owner_process_state(4242, 7001) == expected
+
+
+def test_owner_process_state_keeps_fingerprint_errors_unknown(monkeypatch):
+    class RunningProcess:
+        def status(self):
+            return "running"
+
+    def fingerprint_probe(_pid: int):
+        raise OSError("fingerprint unavailable")
+
+    monkeypatch.setattr(psutil, "Process", lambda _pid: RunningProcess())
+    monkeypatch.setattr(gateway_status, "get_process_start_time", fingerprint_probe)
+
+    assert _owner_process_state(4242, 7001) == "unknown"
 
 
 class RecordingTurnLocks:
@@ -94,6 +193,7 @@ class FakeSessionRPC:
             self.states[session_id] = {
                 "active": active,
                 "task_id": task_id,
+                "task": None,
                 "execution_generation": None,
                 "history": list(history or []),
                 "on_terminal": None,
@@ -187,6 +287,7 @@ class FakeSessionRPC:
         with self._lock:
             self.states[session_id]["active"] = True
             self.states[session_id]["task_id"] = task.task_id
+            self.states[session_id]["task"] = task
             self.states[session_id]["execution_generation"] = execution_generation
             self.states[session_id]["on_terminal"] = on_terminal
         self.submitted.set()
@@ -229,30 +330,41 @@ class FakeSessionRPC:
             self.on_info()
         return result
 
-    def interrupt(
+    def interrupt_admitted(
         self,
         *,
-        profile: str,
-        session_id: str,
+        task: state.TaskIdentity,
+        execution_generation: int,
         source: str,
-        expected_task_id: str,
     ):
         params = {
-            "profile": profile,
-            "session_id": session_id,
+            "task": task,
+            "execution_generation": execution_generation,
             "source": source,
-            "expected_task_id": expected_task_id,
+            "expected_task_id": task.task_id,
         }
         with self._lock:
-            current = self.states[session_id]
-            if not current["active"] or current["task_id"] != expected_task_id:
+            matches = [
+                (session_id, current)
+                for session_id, current in self.states.items()
+                if current.get("task") == task
+                and current.get("execution_generation") == execution_generation
+            ]
+            if len(matches) > 1:
+                raise RuntimeError("ambiguous admitted hosted room task")
+            if not matches:
+                self.calls.append(("interrupt_absent", params))
+                return {"found": False, "active": False, "interrupted": False}
+            session_id, current = matches[0]
+            params["session_id"] = session_id
+            if not current["active"] or current["task_id"] != task.task_id:
                 self.calls.append(("interrupt_skipped", params))
-                return {"interrupted": False}
+                return {"found": True, "active": False, "interrupted": False}
             current["active"] = False
         self.calls.append(("interrupt", params))
         if self.on_interrupt is not None:
             self.on_interrupt()
-        return {"interrupted": True}
+        return {"found": True, "active": True, "interrupted": True}
 
 
 class SelectiveCompletionRPC(FakeSessionRPC):
@@ -400,7 +512,10 @@ def test_waiting_room_does_not_block_an_independent_local_room(tmp_path: Path):
     _wait_for(lambda: state.get_task(db, identities[1])["status"] == "settled")
     _wait_for(lambda: state.get_task(db, identities[0])["status"] == "running")
     assert state.get_task(db, identities[0])["status"] == "running"
-    _wait_for(lambda: len(runtime.status()["current_tasks"]) == 1)
+    _wait_for(
+        lambda: len(runtime.status()["current_tasks"]) == 1,
+        timeout=5.0,
+    )
     assert len(runtime.status()["current_tasks"]) == 1
     assert runtime.stop(timeout=1.0)
 
@@ -1247,7 +1362,9 @@ def test_non_owner_runtime_leaves_stop_for_task_process_owner(db: Path):
     _admit(db, identity)
     owner_rpc = FakeSessionRPC(auto_complete=False)
     owner_observed_active = threading.Event()
+    owner_interrupted = threading.Event()
     owner_rpc.on_info = owner_observed_active.set
+    owner_rpc.on_interrupt = owner_interrupted.set
     owner = _runtime(
         db,
         owner_rpc,
@@ -1276,7 +1393,11 @@ def test_non_owner_runtime_leaves_stop_for_task_process_owner(db: Path):
         assert non_owner_rpc.calls == []
 
         owner.wakeup()
-        _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
+        assert owner_interrupted.wait(5.0)
+        _wait_for(
+            lambda: state.get_task(db, identity)["status"] == "cancelled",
+            timeout=5.0,
+        )
         assert len([call for call in owner_rpc.calls if call[0] == "interrupt"]) == 1
     finally:
         assert owner.stop(timeout=1.0)
@@ -1290,13 +1411,25 @@ def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
     rpc = FakeSessionRPC(auto_complete=False)
     runtime = _runtime(db, rpc)
     observed_status: list[str] = []
-    rpc.on_interrupt = lambda: observed_status.append(
-        state.get_task(db, identity)["status"]
-    )
+    interrupt_seen = threading.Event()
+
+    def observe_interrupt() -> None:
+        observed_status.append(state.get_task(db, identity)["status"])
+        interrupt_seen.set()
+
+    rpc.on_interrupt = observe_interrupt
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
     cancelled = runtime.cancel(identity, cancel_id="cancel-user")
+    if cancelled["status"] == "stopping":
+        runtime.wakeup()
+        assert interrupt_seen.wait(5.0)
+        _wait_for(
+            lambda: state.get_task(db, identity)["status"] == "cancelled",
+            timeout=5.0,
+        )
+        cancelled = state.get_task(db, identity)
     rpc.complete(identity.task_id, content="Too late.")
     runtime.wakeup()
     time.sleep(0.05)
@@ -1306,12 +1439,82 @@ def test_cancellation_is_persisted_before_interrupt_and_fences_late_result(
     assert observed_status == ["stopping"]
 
 
+def test_stop_before_prompt_admission_never_starts_the_cancelled_task(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+    resolve_started = threading.Event()
+    release_resolve = threading.Event()
+    original_resolve = rpc.resolve_exact
+
+    def blocked_resolve(**kwargs):
+        resolve_started.set()
+        assert release_resolve.wait(2.0)
+        return original_resolve(**kwargs)
+
+    rpc.resolve_exact = blocked_resolve
+    runtime.start()
+    try:
+        assert resolve_started.wait(1.0)
+        stopping = runtime.cancel(identity, cancel_id="cancel-before-admission")
+        assert stopping["status"] == "stopping"
+
+        release_resolve.set()
+        _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
+        assert not [call for call in rpc.calls if call[0] == "submit"]
+    finally:
+        release_resolve.set()
+        assert runtime.stop(timeout=1.0)
+
+
+def test_ambiguous_interrupt_result_keeps_stop_pending(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc, active_poll_interval_seconds=10.0)
+
+    runtime.start()
+    assert rpc.submitted.wait(1.0)
+    original_interrupt = rpc.interrupt_admitted
+    rpc.interrupt_admitted = lambda **_kwargs: None
+
+    stopping = runtime.cancel(identity, cancel_id="cancel-ambiguous")
+    assert stopping["status"] == "stopping"
+    assert state.get_task(db, identity)["status"] == "stopping"
+
+    rpc.interrupt_admitted = original_interrupt
+    runtime.wakeup()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
+    assert runtime.stop(timeout=1.0)
+
+
+def test_stop_uses_admitted_proof_after_target_profile_is_deleted(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    rpc = FakeSessionRPC(auto_complete=False)
+    runtime = _runtime(db, rpc)
+
+    runtime.start()
+    assert rpc.submitted.wait(1.0)
+    rpc.resolve_exact = lambda **_kwargs: pytest.fail(
+        "Stop must not query a deleted profile or the persisted session index"
+    )
+    runtime.profile_available = lambda _profile: False
+
+    cancelled = runtime.cancel(identity, cancel_id="cancel-after-profile-delete")
+
+    assert cancelled["status"] == "cancelled"
+    assert len([call for call in rpc.calls if call[0] == "interrupt"]) == 1
+    assert runtime.stop(timeout=1.0)
+
+
 def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
     runtime = _runtime(db, rpc, active_poll_interval_seconds=10.0)
-    original_interrupt = rpc.interrupt
+    original_interrupt = rpc.interrupt_admitted
     original_record_error = runtime._record_error
     attempts = 0
     worker_failure_recorded = threading.Event()
@@ -1330,7 +1533,7 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
             worker_failure_recorded.set()
             assert release_worker.wait(2.0)
 
-    rpc.interrupt = flaky_interrupt
+    rpc.interrupt_admitted = flaky_interrupt
     runtime._record_error = block_worker_after_retry_failure
     runtime.start()
     assert rpc.submitted.wait(1.0)
@@ -1361,16 +1564,17 @@ def test_completion_wins_a_race_with_unacknowledged_stop(db: Path):
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
+    original_interrupt = rpc.interrupt_admitted
 
-    def finish_only_after_stop_intent():
+    def finish_only_after_stop_intent(**kwargs):
         if state.get_task(db, identity)["status"] == "stopping":
             rpc.complete(identity.task_id, content="Already done.")
+        return original_interrupt(**kwargs)
 
-    rpc.on_info = finish_only_after_stop_intent
+    rpc.interrupt_admitted = finish_only_after_stop_intent
     result = runtime.cancel(identity, cancel_id="cancel-raced")
 
-    assert result["status"] in {"stopping", "settled"}
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    assert result["status"] == "settled"
     settled = state.get_task(db, identity)
     assert settled["result"]["text"] == "Already done."
     assert runtime.stop(timeout=1.0)
@@ -1444,13 +1648,15 @@ def test_completion_wins_stop_race_after_attempt_lease_expires(db: Path):
 
     runtime.start()
     assert rpc.submitted.wait(1.0)
+    original_interrupt = rpc.interrupt_admitted
 
-    def finish_after_stop_intent_and_lease_expiry():
+    def finish_after_stop_intent_and_lease_expiry(**kwargs):
         if state.get_task(db, identity)["status"] == "stopping":
             now[0] = 101.0
             rpc.complete(identity.task_id, content="Already done after expiry.")
+        return original_interrupt(**kwargs)
 
-    rpc.on_info = finish_after_stop_intent_and_lease_expiry
+    rpc.interrupt_admitted = finish_after_stop_intent_and_lease_expiry
     result = runtime.cancel(identity, cancel_id="cancel-raced-expired-lease")
 
     assert result["status"] == "settled"
@@ -1519,7 +1725,7 @@ def test_restart_harvests_completion_before_retrying_durable_stop(db: Path):
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
 
 
-def test_restart_leaves_stop_owned_by_previous_process_generation(db: Path):
+def test_restart_leaves_stop_pending_while_previous_process_is_live(db: Path):
     identity = _identity()
     _admit(db, identity)
     now = [100.0]
@@ -1530,6 +1736,8 @@ def test_restart_leaves_stop_owned_by_previous_process_generation(db: Path):
         gateway_id=BINDING.gateway_id,
         authority_epoch=BINDING.authority_epoch,
         process_generation="old-process",
+        process_pid=1111,
+        process_start_time=7001,
         ttl_seconds=1.0,
         clock=clock,
     )
@@ -1553,6 +1761,9 @@ def test_restart_leaves_stop_owned_by_previous_process_generation(db: Path):
         db,
         rpc,
         process_generation="new-process",
+        process_pid=2222,
+        process_start_time=8001,
+        owner_liveness=lambda _pid, _started: "alive",
         clock=clock,
     )
 
@@ -1561,6 +1772,101 @@ def test_restart_leaves_stop_owned_by_previous_process_generation(db: Path):
     assert stopping["status"] == "stopping"
     assert state.get_task(db, identity)["status"] == "stopping"
     assert rpc.calls == []
+
+
+def test_restart_reclaims_stop_only_after_previous_process_exit(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    now = [100.0]
+    clock = lambda: now[0]
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-process",
+        process_pid=1111,
+        process_start_time=7001,
+        ttl_seconds=1.0,
+        clock=clock,
+    )
+    attempt = state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    state.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-after-owner-exit",
+        expected_cancel_generation=attempt.cancel_generation,
+        clock=clock,
+    )
+    now[0] += 2.0
+    runtime = _runtime(
+        db,
+        FakeSessionRPC(auto_complete=False),
+        process_generation="new-process",
+        process_pid=2222,
+        process_start_time=8001,
+        owner_liveness=lambda pid, started: (
+            "dead" if (pid, started) == (1111, 7001) else "unknown"
+        ),
+        clock=clock,
+    )
+
+    cancelled = runtime.cancel(identity, cancel_id="cancel-after-owner-exit")
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["run_process_generation"] == "new-process"
+
+
+def test_same_process_runtime_replacement_can_finish_exact_stop(db: Path):
+    identity = _identity()
+    _admit(db, identity)
+    now = [100.0]
+    clock = lambda: now[0]
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-runtime",
+        process_pid=3333,
+        process_start_time=9001,
+        ttl_seconds=1.0,
+        clock=clock,
+    )
+    attempt = state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    state.begin_task_cancel(
+        db,
+        identity,
+        cancel_id="cancel-same-process",
+        expected_cancel_generation=attempt.cancel_generation,
+        clock=clock,
+    )
+    now[0] += 2.0
+    runtime = _runtime(
+        db,
+        FakeSessionRPC(auto_complete=False),
+        process_generation="new-runtime",
+        process_pid=3333,
+        process_start_time=9001,
+        owner_liveness=lambda _pid, _started: pytest.fail(
+            "same-process replacement must not require liveness probing"
+        ),
+        clock=clock,
+    )
+
+    assert runtime.cancel(identity, cancel_id="cancel-same-process")["status"] == "cancelled"
 
 
 def test_pending_local_approval_is_reported_with_safe_choices(db: Path):
@@ -1606,22 +1912,23 @@ def test_cancel_never_interrupts_a_newer_task_in_the_same_session(db: Path):
     runtime.start()
     assert rpc.submitted.wait(1.0)
     session_id = next(iter(rpc.states))
+    original_interrupt = rpc.interrupt_admitted
 
-    def switch_to_newer_task() -> None:
+    def switch_to_newer_task(**kwargs):
         with rpc._lock:
             rpc.states[session_id]["active"] = True
             rpc.states[session_id]["task_id"] = "task-2"
+            rpc.states[session_id]["task"] = state.TaskIdentity(
+                ROOM_ID, "task-2", "thread-2", "turn-2"
+            )
+        return original_interrupt(**kwargs)
 
-    rpc.on_info = switch_to_newer_task
+    rpc.interrupt_admitted = switch_to_newer_task
     cancelled = runtime.cancel(identity, cancel_id="cancel-old-task")
 
-    assert cancelled["status"] == "stopping"
+    assert cancelled["status"] == "cancelled"
     assert not [call for call in rpc.calls if call[0] == "interrupt"]
-    assert all(
-        call[1]["expected_task_id"] == identity.task_id
-        for call in rpc.calls
-        if call[0] == "interrupt_skipped"
-    )
+    assert len([call for call in rpc.calls if call[0] == "interrupt_absent"]) == 1
     assert rpc.states[session_id]["active"] is True
     assert rpc.states[session_id]["task_id"] == "task-2"
     assert runtime.stop(timeout=1.0)

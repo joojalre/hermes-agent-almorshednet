@@ -3371,6 +3371,25 @@ def _(rid, params: dict) -> dict:
     expected_hosted_task_id = str(
         params.get("expected_hosted_task_id") or ""
     ).strip()
+    expected_hosted_execution_generation = params.get(
+        "expected_hosted_execution_generation"
+    )
+    if expected_hosted_execution_generation is not None and (
+        isinstance(expected_hosted_execution_generation, bool)
+        or not isinstance(expected_hosted_execution_generation, int)
+        or expected_hosted_execution_generation <= 0
+    ):
+        return _err(
+            rid,
+            4000,
+            "expected_hosted_execution_generation must be a positive integer",
+        )
+    if expected_hosted_execution_generation is not None and not expected_hosted_task_id:
+        return _err(
+            rid,
+            4000,
+            "expected_hosted_task_id is required with execution generation",
+        )
     # Foreground keypress barge-in silences process-global TTS. Internal room
     # cancellation is task-scoped and must not affect unrelated voice output.
     if not expected_hosted_task_id:
@@ -3378,26 +3397,34 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    if expected_hosted_task_id:
-        with session["history_lock"]:
-            active_task = session.get("_hosted_room_task")
-            if (
-                not session.get("running")
-                or not isinstance(active_task, dict)
-                or active_task.get("task_id") != expected_hosted_task_id
-            ):
-                return _ok(rid, {"status": "not_interrupted", "interrupted": False})
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
         try:
-            _interrupt_session_turn(sid, session, request_id=f"interrupt-{rid}")
+            isolated = _interrupt_session_turn(
+                sid,
+                session,
+                request_id=f"interrupt-{rid}",
+                expected_hosted_task_id=expected_hosted_task_id or None,
+                expected_hosted_execution_generation=(
+                    expected_hosted_execution_generation
+                ),
+            )
         except Exception as exc:
             return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
-        return _ok(rid, {"status": "interrupted", "turn_isolation": True})
+        if isolated is None:
+            return _ok(rid, {"status": "not_interrupted", "interrupted": False})
+        return _ok(rid, {"status": "interrupted", "turn_isolation": isolated})
     session, err = _sess(params, rid)
     if err:
         return err
-    _interrupt_session_turn(str(params.get("session_id") or ""), session)
+    isolated = _interrupt_session_turn(
+        str(params.get("session_id") or ""),
+        session,
+        expected_hosted_task_id=expected_hosted_task_id or None,
+        expected_hosted_execution_generation=expected_hosted_execution_generation,
+    )
+    if isolated is None:
+        return _ok(rid, {"status": "not_interrupted", "interrupted": False})
     return _ok(rid, {"status": "interrupted"})
 
 

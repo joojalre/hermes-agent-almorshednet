@@ -604,22 +604,42 @@ class HostedRoomService:
     def retry_room_task(self, room_id: str, *, task_id: str) -> dict[str, Any]:
         """Retry one uncertain or deferred task only after explicit user action."""
 
-        task = next(
-            (
-                candidate
-                for status in ("indeterminate", "deferred")
-                for candidate in driver.list_tasks(
-                    self.db_path, room_id=room_id, status=status
-                )
-                if candidate["identity"].task_id == task_id
-            ),
-            None,
-        )
-        if task is None:
-            raise driver.InvalidTaskTransitionError(
-                "no retryable room task matches task_id"
+        with self._policy_lock:
+            task = next(
+                (
+                    candidate
+                    for status in ("indeterminate", "deferred")
+                    for candidate in driver.list_tasks(
+                        self.db_path, room_id=room_id, status=status
+                    )
+                    if candidate["identity"].task_id == task_id
+                ),
+                None,
             )
-        return self.runtime.retry_indeterminate(task["identity"])
+            if task is None:
+                raise driver.InvalidTaskTransitionError(
+                    "no retryable room task matches task_id"
+                )
+            source_event_seq = None
+            if task["status"] == "deferred":
+                room = hosted_rooms.room_state(self.db_path, room_id=room_id)
+                self.policy_checkpoint.sync(
+                    room_id=room_id,
+                    latest_seq=int(room["latest_seq"]),
+                )
+                source_event_seq = int(task["payload"]["source_event_seq"])
+                if not self.policy_checkpoint.events_for_task(
+                    room_id=room_id,
+                    source_event_seq=source_event_seq,
+                ):
+                    raise driver.InvalidTaskTransitionError(
+                        "cannot retry deferred task because its source discussion "
+                        "is no longer active"
+                    )
+            return self.runtime.retry_indeterminate(
+                task["identity"],
+                require_active_source_event_seq=source_event_seq,
+            )
 
     def approve_room_task(
         self,

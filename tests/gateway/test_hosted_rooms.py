@@ -1070,6 +1070,256 @@ def test_stop_reserve_preserves_terminal_recovery_capacity(tmp_path, monkeypatch
         )
 
 
+_TERMINAL_CORRELATION_FIELDS = (
+    "task_id",
+    "discussion_event_id",
+    "member_id",
+    "thread_id",
+    "turn_id",
+)
+
+
+def _terminal_recovery_events(state, *, suffix, member_payload, terminal_payload):
+    member_event_id = f"member-{suffix}"
+    terminal_payload = {
+        "message_event_id": member_event_id,
+        "passed": False,
+        **terminal_payload,
+    }
+    return [
+        {
+            "room_id": "room-1",
+            "event_id": member_event_id,
+            "kind": "message.member",
+            "actor": {"kind": "member", "id": "ops"},
+            "payload": member_payload,
+            "authority_gateway_id": state["authority_gateway_id"],
+            "authority_epoch": state["authority_epoch"],
+        },
+        {
+            "room_id": "room-1",
+            "event_id": f"terminal-{suffix}",
+            "kind": "turn.settled",
+            "actor": GATEWAY_A,
+            "payload": terminal_payload,
+            "authority_gateway_id": state["authority_gateway_id"],
+            "authority_epoch": state["authority_epoch"],
+        },
+    ]
+
+
+def _terminal_recovery_capacity_fixture(db, monkeypatch):
+    _create(db)
+    _append(
+        db,
+        room_id="room-1",
+        event_id="message-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "first"},
+    )
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 1)
+    monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 0)
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
+    return rooms.room_state(db, room_id="room-1")
+
+
+def _valid_terminal_correlation():
+    return {
+        "task_id": "task-1",
+        "discussion_event_id": "discussion-1",
+        "member_id": "member-1",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+    }
+
+
+def test_terminal_recovery_plan_accepts_complete_correlation(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    state = _terminal_recovery_capacity_fixture(db, monkeypatch)
+    correlation = _valid_terminal_correlation()
+
+    published = rooms.append_events(
+        db,
+        events=_terminal_recovery_events(
+            state,
+            suffix="valid",
+            member_payload=correlation,
+            terminal_payload=correlation,
+        ),
+        allow_terminal_recovery=True,
+    )
+
+    assert [event["kind"] for event in published] == [
+        "message.member",
+        "turn.settled",
+    ]
+
+
+def test_terminal_recovery_validates_an_idempotent_member_prefix(
+    tmp_path, monkeypatch
+):
+    db = tmp_path / "state.db"
+    _create(db)
+    _append(
+        db,
+        room_id="room-1",
+        event_id="message-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "first"},
+    )
+    state = rooms.room_state(db, room_id="room-1")
+    correlation = _valid_terminal_correlation()
+    events = _terminal_recovery_events(
+        state,
+        suffix="prefix",
+        member_payload=correlation,
+        terminal_payload=correlation,
+    )
+    rooms.append_events(db, events=[events[0]])
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 2)
+    monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 0)
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 1)
+
+    mismatched = [dict(events[0]), dict(events[1])]
+    mismatched[1] = {
+        **mismatched[1],
+        "payload": {
+            **mismatched[1]["payload"],
+            "turn_id": "different-turn",
+        },
+    }
+    with pytest.raises(rooms.HostedRoomError, match="history limit"):
+        rooms.append_events(
+            db,
+            events=mismatched,
+            allow_terminal_recovery=True,
+        )
+    assert rooms.room_state(db, room_id="room-1")["latest_seq"] == 2
+
+    published = rooms.append_events(
+        db,
+        events=events,
+        allow_terminal_recovery=True,
+    )
+    assert published[0]["idempotent"] is True
+    assert published[1]["kind"] == "turn.settled"
+
+
+@pytest.mark.parametrize("field", _TERMINAL_CORRELATION_FIELDS)
+@pytest.mark.parametrize(
+    "malformation", ["missing", "empty", "non-string", "mismatch"]
+)
+def test_malformed_terminal_correlation_does_not_consume_reserve(
+    tmp_path, monkeypatch, field, malformation
+):
+    db = tmp_path / "state.db"
+    state = _terminal_recovery_capacity_fixture(db, monkeypatch)
+    member_payload = _valid_terminal_correlation()
+    terminal_payload = _valid_terminal_correlation()
+    if malformation == "missing":
+        member_payload.pop(field)
+        terminal_payload.pop(field)
+    elif malformation == "empty":
+        member_payload[field] = ""
+    elif malformation == "non-string":
+        terminal_payload[field] = 7
+    else:
+        terminal_payload[field] = f"different-{field}"
+
+    with pytest.raises(rooms.HostedRoomError, match="history limit"):
+        rooms.append_events(
+            db,
+            events=_terminal_recovery_events(
+                state,
+                suffix="invalid",
+                member_payload=member_payload,
+                terminal_payload=terminal_payload,
+            ),
+            allow_terminal_recovery=True,
+        )
+    assert rooms.room_state(db, room_id="room-1")["latest_seq"] == 1
+
+    correlation = _valid_terminal_correlation()
+    published = rooms.append_events(
+        db,
+        events=_terminal_recovery_events(
+            state,
+            suffix="valid",
+            member_payload=correlation,
+            terminal_payload=correlation,
+        ),
+        allow_terminal_recovery=True,
+    )
+    assert len(published) == 2
+
+
+@pytest.mark.parametrize("message_event_id", [None, "", 7, "member-other"])
+def test_invalid_terminal_message_reference_does_not_consume_reserve(
+    tmp_path, monkeypatch, message_event_id
+):
+    db = tmp_path / "state.db"
+    state = _terminal_recovery_capacity_fixture(db, monkeypatch)
+    correlation = _valid_terminal_correlation()
+    events = _terminal_recovery_events(
+        state,
+        suffix="invalid",
+        member_payload=correlation,
+        terminal_payload=correlation,
+    )
+    events[1]["payload"]["message_event_id"] = message_event_id
+
+    with pytest.raises(rooms.HostedRoomError, match="history limit"):
+        rooms.append_events(
+            db,
+            events=events,
+            allow_terminal_recovery=True,
+        )
+    assert rooms.room_state(db, room_id="room-1")["latest_seq"] == 1
+
+    published = rooms.append_events(
+        db,
+        events=_terminal_recovery_events(
+            state,
+            suffix="valid",
+            member_payload=correlation,
+            terminal_payload=correlation,
+        ),
+        allow_terminal_recovery=True,
+    )
+    assert len(published) == 2
+
+
+@pytest.mark.parametrize(
+    ("member_payload", "terminal_payload"),
+    [([], {}), ({}, []), ("member", {}), ({}, "terminal")],
+)
+def test_terminal_recovery_plan_rejects_non_object_payloads(
+    member_payload, terminal_payload
+):
+    pending = [
+        (
+            0,
+            {
+                "event_id": "member-1",
+                "kind": "message.member",
+                "payload_json": json.dumps(member_payload),
+            },
+        ),
+        (
+            1,
+            {
+                "event_id": "terminal-1",
+                "kind": "turn.settled",
+                "payload_json": json.dumps(terminal_payload),
+            },
+        ),
+    ]
+
+    assert rooms._is_terminal_recovery_plan(pending) is False
+
+
 def test_room_listing_is_paged_and_old_tombstones_are_pruned(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     monkeypatch.setattr(rooms, "MAX_DISBANDED_ROOM_TOMBSTONES", 1)

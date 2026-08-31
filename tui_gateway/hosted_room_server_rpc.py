@@ -238,6 +238,162 @@ class HostedRoomServerRPC:
             },
         )
 
+    def _find_admitted_session(
+        self,
+        *,
+        task: state.TaskIdentity,
+        execution_generation: int,
+        source: str,
+    ) -> tuple[str, bool] | None:
+        method = "session.interrupt_admitted"
+        if source != "bot_room":
+            raise HostedRoomSessionError(method, 4000, "source must be bot_room")
+        if (
+            isinstance(execution_generation, bool)
+            or not isinstance(execution_generation, int)
+            or execution_generation <= 0
+        ):
+            raise HostedRoomSessionError(
+                method,
+                4000,
+                "execution_generation must be a positive integer",
+            )
+
+        expected_identity = (
+            task.room_id,
+            task.task_id,
+            task.thread_id,
+            task.turn_id,
+        )
+        matches: list[tuple[str, bool]] = []
+        generation_conflicts: list[str] = []
+        lock_type = type(threading.Lock())
+
+        # Admission proof is process-local. Lock membership first, then each
+        # session record, so deleted profiles and the persisted session index
+        # are not involved in cancellation ownership.
+        with self.server._sessions_lock:
+            candidates = tuple(self.server._sessions.items())
+        for session_id, record in candidates:
+            if not isinstance(record, dict):
+                continue
+            if (
+                record.get("room_plumbing") is not True
+                or record.get("source") != source
+            ):
+                continue
+            lock = record.get("history_lock")
+            if not isinstance(lock, lock_type):
+                raise HostedRoomSessionError(
+                    method,
+                    4090,
+                    "admitted hosted room session has no usable history lock",
+                )
+            with lock:
+                if (
+                    record.get("room_plumbing") is not True
+                    or record.get("source") != source
+                ):
+                    continue
+                proof = record.get("_hosted_room_task")
+                if not isinstance(proof, Mapping):
+                    continue
+                observed_identity = (
+                    proof.get("room_id"),
+                    proof.get("task_id"),
+                    proof.get("thread_id"),
+                    proof.get("turn_id"),
+                )
+                if observed_identity != expected_identity:
+                    continue
+                observed_generation = proof.get("execution_generation")
+                if (
+                    isinstance(observed_generation, bool)
+                    or not isinstance(observed_generation, int)
+                    or observed_generation != execution_generation
+                ):
+                    generation_conflicts.append(str(session_id))
+                    continue
+                matches.append((str(session_id), bool(record.get("running"))))
+
+        if generation_conflicts:
+            raise HostedRoomSessionError(
+                method,
+                4092,
+                "admitted hosted room task has a conflicting execution generation",
+            )
+        if len(matches) > 1:
+            raise HostedRoomSessionError(
+                method,
+                4091,
+                "admitted hosted room task is ambiguous across local sessions",
+            )
+        return matches[0] if matches else None
+
+    def interrupt_admitted(
+        self,
+        *,
+        task: state.TaskIdentity,
+        execution_generation: int,
+        source: str,
+    ) -> Mapping[str, Any]:
+        """Interrupt one exact process-local admission without profile lookup."""
+        match = self._find_admitted_session(
+            task=task,
+            execution_generation=execution_generation,
+            source=source,
+        )
+        if match is None:
+            return {
+                "status": "absent",
+                # Absence is only an observation. The driver combines it with
+                # its process-local submit lifecycle before acknowledging the
+                # durable Stop, so a concurrent admission cannot be cancelled
+                # and then start afterwards.
+                "acknowledged": False,
+                "active": False,
+                "interrupted": False,
+                "session_id": None,
+            }
+
+        session_id, active = match
+        if not active:
+            return {
+                "status": "inactive",
+                "acknowledged": True,
+                "active": False,
+                "interrupted": False,
+                "session_id": session_id,
+            }
+
+        result = self._call(
+            "session.interrupt",
+            {
+                "session_id": session_id,
+                "expected_hosted_task_id": task.task_id,
+                "expected_hosted_execution_generation": execution_generation,
+            },
+        )
+        interrupted = bool(result.get("interrupted")) or (
+            result.get("status") == "interrupted"
+        )
+        if not interrupted:
+            return {
+                "status": "inactive",
+                "acknowledged": True,
+                "active": False,
+                "interrupted": False,
+                "session_id": session_id,
+            }
+        return {
+            **result,
+            "status": "interrupted",
+            "acknowledged": True,
+            "active": True,
+            "interrupted": True,
+            "session_id": session_id,
+        }
+
     def interrupt(
         self,
         *,

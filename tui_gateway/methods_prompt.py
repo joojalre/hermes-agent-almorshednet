@@ -461,6 +461,8 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
+            if session.get("_hosted_interrupt_claim") is not None:
+                return _err(rid, 4091, "hosted room member session is stopping")
             if session.get("running"):
                 if internal_hosted_submit:
                     return _err(rid, 4091, "hosted room member session is busy")
@@ -497,6 +499,8 @@ def _(rid, params: dict) -> dict:
         else None
     )
     with session["history_lock"]:
+        if session.get("_hosted_interrupt_claim") is not None:
+            return _err(rid, 4091, "hosted room member session is stopping")
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved

@@ -1231,27 +1231,55 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
 
 
 def _interrupt_session_turn(
-    sid: str, session: dict, *, request_id: str | None = None
-) -> bool:
+    sid: str,
+    session: dict,
+    *,
+    request_id: str | None = None,
+    expected_hosted_task_id: str | None = None,
+    expected_hosted_execution_generation: int | None = None,
+) -> bool | None:
     """Apply the shared ``session.interrupt`` contract to one claimed session.
 
-    Returns whether the interrupt used the compute-host control channel. The WS
-    orphan reaper calls this same helper after its reconnect grace expires, so a
-    dead client gets the same partial-history and queued-prompt semantics as an
-    explicit user interrupt.
+    Returns whether the interrupt used the compute-host control channel, or
+    ``None`` when an exact hosted-task proof was stale. The proof check and the
+    cancellation claim are one ``history_lock`` transaction. A short-lived
+    claim then prevents a replacement turn from starting until the external
+    interrupt has been sent, closing the check/signal TOCTOU window.
+
+    The WS orphan reaper calls this same helper without a hosted-task proof
+    after its reconnect grace expires, so a dead client gets the same
+    partial-history and queued-prompt semantics as an explicit user interrupt.
     """
     use_compute_host = _session_uses_compute_host(session)
-    should_interrupt = bool(session.get("running"))
-    run_thread_alive = False
-
-    if use_compute_host:
-        if should_interrupt:
-            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
-    else:
-        run_thread = session.get("_run_thread")
-        run_thread_alive = run_thread is not None and run_thread.is_alive()
-
+    hosted_claim = None
     with session["history_lock"]:
+        if expected_hosted_task_id is not None:
+            active_task = session.get("_hosted_room_task")
+            if (
+                not session.get("running")
+                or not isinstance(active_task, dict)
+                or active_task.get("task_id") != expected_hosted_task_id
+                or (
+                    expected_hosted_execution_generation is not None
+                    and active_task.get("execution_generation")
+                    != expected_hosted_execution_generation
+                )
+                or session.get("_hosted_interrupt_claim") is not None
+            ):
+                return None
+            hosted_claim = {
+                "task_id": expected_hosted_task_id,
+                "execution_generation": active_task.get("execution_generation"),
+            }
+            session["_hosted_interrupt_claim"] = hosted_claim
+
+        should_interrupt = bool(session.get("running"))
+        run_thread = session.get("_run_thread")
+        run_thread_alive = (
+            not use_compute_host
+            and run_thread is not None
+            and run_thread.is_alive()
+        )
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
@@ -1259,25 +1287,47 @@ def _interrupt_session_turn(
             session.get("_queued_prompt_generation", 0)
         ) + 1
 
-    if not use_compute_host:
-        if should_interrupt:
-            from agent.interrupt_compat import request_hard_interrupt
-
-            request_hard_interrupt(session.get("agent"))
-        if not run_thread_alive:
-            with session["history_lock"]:
-                if session.get("running"):
-                    session["running"] = False
-                    _clear_inflight_turn(session)
-
-    _clear_pending(sid)
     try:
-        from tools.approval import resolve_gateway_approval
+        if use_compute_host:
+            if should_interrupt:
+                _get_compute_host_supervisor().interrupt(
+                    sid, request_id=request_id
+                )
+        else:
+            if should_interrupt:
+                from agent.interrupt_compat import request_hard_interrupt
 
-        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
-    except Exception:
-        pass
-    return use_compute_host
+                request_hard_interrupt(session.get("agent"))
+            if not run_thread_alive:
+                with session["history_lock"]:
+                    if session.get("running"):
+                        session["running"] = False
+                        _clear_inflight_turn(session)
+
+        _clear_pending(sid)
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolve_gateway_approval(
+                session["session_key"], "deny", resolve_all=True
+            )
+        except Exception:
+            pass
+        return use_compute_host
+    finally:
+        if hosted_claim is not None:
+            with session["history_lock"]:
+                if session.get("_hosted_interrupt_claim") is hosted_claim:
+                    session.pop("_hosted_interrupt_claim", None)
+
+
+def _session_turn_admission_blocked(session: dict) -> bool:
+    """Keep every internal turn behind the same hosted Stop barrier."""
+
+    return bool(
+        session.get("running")
+        or session.get("_hosted_interrupt_claim") is not None
+    )
 
 
 def _session_owns_durable_lifecycle(session_id: str | None) -> bool:
@@ -9845,7 +9895,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             session["_auto_continue_scheduled"] = False
             return
         with session["history_lock"]:
-            if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
+            if (
+                _session_turn_admission_blocked(session)
+                or session.get("_turn_cancel_requested")
+                or session.get("_finalized")
+            ):
                 # A real user prompt beat us to it — their turn wins, and its
                 # own conclusion clears the marker.
                 session["_auto_continue_scheduled"] = False
@@ -10158,7 +10212,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if session.get("_closing"):
             return False
         queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
+        if not queued or _session_turn_admission_blocked(session):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         queued_prompts = session.get("queued_prompts") or []
@@ -11793,7 +11847,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         return
 
     with session["history_lock"]:
-        if session.get("running"):
+        if _session_turn_admission_blocked(session):
             return  # busy — stays due, next poll retries
         session["running"] = True
 
@@ -11835,7 +11889,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                     # run it as a normal turn; the post-turn hook completes
                     # the tick.
                     with session["history_lock"]:
-                        if session.get("running"):
+                        if _session_turn_admission_blocked(session):
                             mgr.abandon_tick()
                             return
                         session["running"] = True
@@ -12079,7 +12133,7 @@ def _notification_poller_loop(
             if _pending:
                 _batch: list = []
                 with session["history_lock"]:
-                    if not session.get("running"):
+                    if not _session_turn_admission_blocked(session):
                         session["running"] = True
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
@@ -12152,7 +12206,7 @@ def _notification_poller_loop(
 
         _requeued = False
         with session["history_lock"]:
-            if session.get("running"):
+            if _session_turn_admission_blocked(session):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
             else:
@@ -12237,7 +12291,7 @@ def _notification_poller_loop(
             _emitted.add(_dedup_key)
 
         with session["history_lock"]:
-            if session.get("running"):
+            if _session_turn_admission_blocked(session):
                 process_registry.completion_queue.put(evt)
                 break
             session["running"] = True
@@ -13592,7 +13646,7 @@ def _run_prompt_submit(
         # we check that guard before re-firing.
         if goal_followup:
             with session["history_lock"]:
-                if session.get("running"):
+                if _session_turn_admission_blocked(session):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
@@ -13632,7 +13686,7 @@ def _run_prompt_submit(
             )
             for index, (_evt, synth) in enumerate(drained):
                 with session["history_lock"]:
-                    if session.get("running"):
+                    if _session_turn_admission_blocked(session):
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break

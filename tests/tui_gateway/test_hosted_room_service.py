@@ -64,8 +64,8 @@ class _FakeRPC:
     def info(self, *, profile, session_id, source):
         return {"active": False, "task_id": None}
 
-    def interrupt(self, *, profile, session_id, source, expected_task_id):
-        return {"interrupted": True}
+    def interrupt_admitted(self, *, task, execution_generation, source):
+        return {"found": False, "active": False, "interrupted": False}
 
 
 class _PromptRecordingRPC(_FakeRPC):
@@ -135,9 +135,13 @@ class _InterruptibleRPC(_FakeRPC):
         self.started = threading.Event()
         self.interrupted = threading.Event()
         self.active_task_id: str | None = None
+        self.active_task = None
+        self.execution_generation = None
 
     def submit(self, **kwargs):
         self.active_task_id = kwargs["task"].task_id
+        self.active_task = kwargs["task"]
+        self.execution_generation = kwargs["execution_generation"]
         self.started.set()
         return {"accepted": True}
 
@@ -147,14 +151,18 @@ class _InterruptibleRPC(_FakeRPC):
             "task_id": self.active_task_id,
         }
 
-    def interrupt(self, *, profile, session_id, source, expected_task_id):
-        if self.active_task_id != expected_task_id:
-            return {"interrupted": False}
+    def interrupt_admitted(self, *, task, execution_generation, source):
+        if (
+            self.active_task != task
+            or self.execution_generation != execution_generation
+        ):
+            return {"found": False, "active": False, "interrupted": False}
         if not self.acknowledge_interrupt:
-            return {"interrupted": False}
+            return {"found": True, "active": True, "interrupted": False}
         self.active_task_id = None
+        self.active_task = None
         self.interrupted.set()
-        return {"interrupted": True}
+        return {"found": True, "active": True, "interrupted": True}
 
 
 def _server():
@@ -659,8 +667,17 @@ def test_terminal_publication_reserves_the_whole_plan_before_append(
             discussion.EventPlan(
                 event_id="member-1",
                 kind="message.member",
-                actor={"kind": "member", "id": "ops"},
-                payload={"text": "done"},
+                actor={"kind": "member", "id": "ops", "profile": "ops"},
+                payload={
+                    "discussion_event_id": "user-1",
+                    "member_id": "ops",
+                    "member_index": 1,
+                    "round_index": 0,
+                    "task_id": "task-1",
+                    "text": "done",
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                },
                 authority_gateway_id=str(room["authority_gateway_id"]),
                 authority_epoch=int(room["authority_epoch"]),
             ),
@@ -668,22 +685,54 @@ def test_terminal_publication_reserves_the_whole_plan_before_append(
                 event_id="terminal-1",
                 kind="turn.settled",
                 actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
-                payload={"task_id": "task-1"},
+                payload={
+                    "discussion_event_id": "user-1",
+                    "member_id": "ops",
+                    "member_index": 1,
+                    "message_event_id": "member-1",
+                    "passed": False,
+                    "round_index": 0,
+                    "seen_through_seq": 1,
+                    "task_id": "task-1",
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                },
                 authority_gateway_id=str(room["authority_gateway_id"]),
                 authority_epoch=int(room["authority_epoch"]),
             ),
         ),
     )
 
-    with pytest.raises(hosted_rooms.HostedRoomError, match="history limit"):
-        service._append_plan("room-1", plan)
+    appended = service._append_plan("room-1", plan)
 
     assert [event["event_id"] for event in service._events("room-1")] == [
-        "user-1"
+        "user-1",
+        "member-1",
+        "terminal-1",
     ]
+    assert [event["event_id"] for event in appended] == [
+        "member-1",
+        "terminal-1",
+    ]
+    with pytest.raises(hosted_rooms.HostedRoomError, match="history limit"):
+        hosted_rooms.append_events(
+            db,
+            events=[
+                {
+                    "room_id": "room-1",
+                    "event_id": "ordinary-1",
+                    "kind": "message.user",
+                    "actor": {"kind": "user", "id": "desktop"},
+                    "payload": {"text": "ordinary"},
+                    "authority_gateway_id": str(room["authority_gateway_id"]),
+                    "authority_epoch": int(room["authority_epoch"]),
+                }
+            ],
+            allow_terminal_recovery=True,
+        )
 
 
-def test_terminal_publication_recovers_legacy_member_prefix_at_normal_limit(
+def test_terminal_publication_recovers_correlated_member_prefix_at_normal_limit(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -702,7 +751,14 @@ def test_terminal_publication_recovers_legacy_member_prefix_at_normal_limit(
         event_id="member-1",
         kind="message.member",
         actor={"kind": "member", "id": "ops"},
-        payload={"text": "done"},
+        payload={
+            "text": "done",
+            "task_id": "task-1",
+            "discussion_event_id": "discussion-1",
+            "member_id": "ops",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+        },
         authority_gateway_id=str(room["authority_gateway_id"]),
         authority_epoch=int(room["authority_epoch"]),
     )
@@ -710,7 +766,15 @@ def test_terminal_publication_recovers_legacy_member_prefix_at_normal_limit(
         event_id="terminal-1",
         kind="turn.settled",
         actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
-        payload={"task_id": "task-1"},
+        payload={
+            "task_id": "task-1",
+            "discussion_event_id": "discussion-1",
+            "member_id": "ops",
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+            "message_event_id": "member-1",
+            "passed": False,
+        },
         authority_gateway_id=str(room["authority_gateway_id"]),
         authority_epoch=int(room["authority_epoch"]),
     )
@@ -1222,7 +1286,7 @@ def test_service_derives_room_deadline_from_agent_timeout(tmp_path: Path, monkey
     assert service.runtime.turn_timeout_seconds == 120.0
 
 
-def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
+def test_service_publishes_deferred_turn_and_retries_active_discussion(
     tmp_path: Path,
 ):
     now = [100.0]
@@ -1273,15 +1337,31 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
     binding = service.bindings()[0]
     service.runtime._process_room(binding)
     now[0] = 108.0
-    service.runtime._process_room(binding)
+    indeterminate = driver.list_tasks(
+        db,
+        room_id="room-1",
+        status="indeterminate",
+    )[0]
+    lease = service.runtime._leases["room-1"]
+    driver.defer_indeterminate_task(
+        db,
+        first["identity"],
+        lease,
+        expected_execution_generation=indeterminate["execution_generation"],
+        expected_cancel_generation=indeterminate["cancel_generation"],
+        reason="member_unavailable",
+        clock=clock,
+    )
+    room = hosted_rooms.room_state(db, room_id="room-1")
+    assert service._publish_terminal_tasks(room)
 
     events = service._events("room-1")
     deferred = next(event for event in events if event["kind"] == "turn.deferred")
     assert deferred["payload"]["task_id"] == first["identity"].task_id
     assert deferred["payload"]["execution_generation"] == 1
-    assert any(
-        event["kind"] == "message.member" and event["payload"]["member_id"] == "ops"
-        for event in events
+    assert service.policy_checkpoint.events_for_task(
+        room_id="room-1",
+        source_event_seq=int(first["payload"]["source_event_seq"]),
     )
 
     requeued = service.retry_room_task(
@@ -1289,7 +1369,6 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
         task_id=first["identity"].task_id,
     )
     assert requeued["status"] == "queued"
-    lease = service.runtime._leases["room-1"]
     retried = driver.start_task(
         db,
         first["identity"],
@@ -1298,6 +1377,106 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
         clock=clock,
     )
     assert retried.execution_generation == old_attempt.execution_generation + 1
+
+
+def test_service_refuses_deferred_retry_when_projection_compacts_after_precheck(
+    tmp_path: Path,
+    monkeypatch,
+):
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.rpc = _FakeRPC()
+    service.runtime.rpc = service.rpc
+    service.runtime.clock = clock
+    service.runtime.lease_ttl_seconds = 30
+    service.runtime.indeterminate_defer_seconds = 5
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Compacted room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "default"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-compacted",
+        payload={"text": "Check this", "thread_id": "thread-1"},
+    )
+    first = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    old_lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=service.bindings()[0].gateway_id,
+        authority_epoch=1,
+        process_generation="offline-member",
+        ttl_seconds=1,
+        clock=clock,
+    )
+    driver.start_task(
+        db,
+        first["identity"],
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+
+    now[0] = 102.0
+    binding = service.bindings()[0]
+    service.runtime._process_room(binding)
+    now[0] = 108.0
+    service.runtime._process_room(binding)
+    deferred = driver.list_tasks(db, room_id="room-1", status="deferred")[0]
+
+    source_event_seq = int(deferred["payload"]["source_event_seq"])
+    assert service.policy_checkpoint.events_for_task(
+        room_id="room-1",
+        source_event_seq=source_event_seq,
+    )
+    original_requeue = driver.requeue_deferred_task
+
+    def compact_then_requeue(*args, **kwargs):
+        hosted_rooms.append_event(
+            db,
+            room_id="room-1",
+            event_id="activity-compacted",
+            kind="room.activity",
+            actor={"kind": "gateway", "id": str(room["authority_gateway_id"])},
+            payload={
+                "status": "settled",
+                "reason_code": "silent_round",
+                "thread_id": "thread-1",
+                "discussion_event_id": "user-compacted",
+            },
+            authority_gateway_id=str(room["authority_gateway_id"]),
+            authority_epoch=int(room["authority_epoch"]),
+        )
+        latest = hosted_rooms.room_state(db, room_id="room-1")
+        service.policy_checkpoint.sync(
+            room_id="room-1",
+            latest_seq=int(latest["latest_seq"]),
+        )
+        assert service.policy_checkpoint.events_for_task(
+            room_id="room-1",
+            source_event_seq=source_event_seq,
+        ) == []
+        return original_requeue(*args, **kwargs)
+
+    monkeypatch.setattr(driver, "requeue_deferred_task", compact_then_requeue)
+    with pytest.raises(
+        driver.InvalidTaskTransitionError,
+        match="source discussion is no longer active",
+    ):
+        service.retry_room_task("room-1", task_id=first["identity"].task_id)
+
+    unchanged = driver.list_tasks(db, room_id="room-1", status="deferred")[0]
+    assert unchanged["execution_generation"] == deferred["execution_generation"]
 
 
 def test_stop_fence_prevents_the_next_room_member_from_starting(
@@ -1375,7 +1554,7 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
         def info(self, *, profile, session_id, source):
             return {"active": True, "task_id": self.active_task_id}
 
-        def interrupt(self, *, profile, session_id, source, expected_task_id):
+        def interrupt_admitted(self, *, task, execution_generation, source):
             return None
 
     db = tmp_path / "state.db"
@@ -1449,11 +1628,13 @@ def test_demote_retry_stops_newer_turn_before_authority_transfer(
                 "task_id": self.active_task_id,
             }
 
-        def interrupt(self, *, profile, session_id, source, expected_task_id):
-            self.expected_task_ids.append(expected_task_id)
+        def interrupt_admitted(self, *, task, execution_generation, source):
+            self.expected_task_ids.append(task.task_id)
+            if self.active_task_id != task.task_id:
+                return {"found": False, "active": False, "interrupted": False}
             if not self.acknowledge:
-                return None
-            return {"interrupted": True}
+                return {"found": True, "active": True, "interrupted": False}
+            return {"found": True, "active": True, "interrupted": True}
 
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)
@@ -1482,6 +1663,8 @@ def test_demote_retry_stops_newer_turn_before_authority_transfer(
         gateway_id=binding.gateway_id,
         authority_epoch=binding.authority_epoch,
         process_generation=service.runtime.process_generation,
+        process_pid=service.runtime.process_pid,
+        process_start_time=service.runtime.process_start_time,
         ttl_seconds=30,
         clock=time.time,
     )
@@ -1578,6 +1761,7 @@ def test_demote_retry_stops_newer_turn_before_authority_transfer(
     assert result["authority_gateway_id"] == observed_gateway
     assert result["authority_epoch"] == 2
     assert rpc.expected_task_ids == [
+        task["identity"].task_id,
         task["identity"].task_id,
         newer_task["identity"].task_id,
         newer_task["identity"].task_id,

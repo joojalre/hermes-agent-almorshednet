@@ -615,6 +615,62 @@ def _assert_event_capacity(
         )
 
 
+def _is_terminal_recovery_plan(
+    plan: list[tuple[int, dict[str, Any]]],
+) -> bool:
+    """Return whether one complete batch is a bounded terminal publication."""
+
+    if all(
+        event["kind"] in _TERMINAL_COMPLETION_EVENT_KINDS
+        for _, event in plan
+    ):
+        return True
+    if len(plan) != 2:
+        return False
+    member = plan[0][1]
+    terminal = plan[1][1]
+    if member["kind"] != "message.member" or terminal["kind"] != "turn.settled":
+        return False
+    try:
+        member_payload = json.loads(member["payload_json"])
+        terminal_payload = json.loads(terminal["payload_json"])
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(member_payload, dict) or not isinstance(
+        terminal_payload, dict
+    ):
+        return False
+
+    for field in (
+        "task_id",
+        "discussion_event_id",
+        "member_id",
+        "thread_id",
+        "turn_id",
+    ):
+        member_value = member_payload.get(field)
+        terminal_value = terminal_payload.get(field)
+        if (
+            not isinstance(member_value, str)
+            or not member_value.strip()
+            or not isinstance(terminal_value, str)
+            or not terminal_value.strip()
+            or terminal_value != member_value
+        ):
+            return False
+
+    member_event_id = member.get("event_id")
+    message_event_id = terminal_payload.get("message_event_id")
+    return (
+        terminal_payload.get("passed") is False
+        and isinstance(member_event_id, str)
+        and bool(member_event_id.strip())
+        and isinstance(message_event_id, str)
+        and bool(message_event_id.strip())
+        and message_event_id == member_event_id
+    )
+
+
 def _prune_disbanded_rooms_locked(
     conn: sqlite3.Connection,
     *,
@@ -1267,12 +1323,8 @@ def append_events(
                     raise AuthorityConflictError("stale hosted room authority")
 
             additional_bytes = sum(event["event_bytes"] for _, event in pending)
-            terminal_recovery = (
-                allow_terminal_recovery
-                and all(
-                    event["kind"] in _TERMINAL_COMPLETION_EVENT_KINDS
-                    for _, event in pending
-                )
+            terminal_recovery = allow_terminal_recovery and _is_terminal_recovery_plan(
+                list(enumerate(prepared))
             )
             _assert_event_capacity(
                 conn,
