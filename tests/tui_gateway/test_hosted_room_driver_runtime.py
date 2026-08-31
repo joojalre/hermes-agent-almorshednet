@@ -1701,8 +1701,8 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     assert worker_failure_recorded.wait(1.0)
     cycles = runtime.status()["cycles"]
     runtime.wakeup()
-    _wait_for(lambda: runtime.status()["cycles"] > cycles)
     release_worker.set()
+    _wait_for(lambda: runtime.status()["cycles"] > cycles)
     _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
     assert attempts >= 3
     assert runtime.stop(timeout=1.0)
