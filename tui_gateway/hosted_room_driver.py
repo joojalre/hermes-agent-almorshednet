@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import sqlite3
 import threading
 import time
 import uuid
@@ -38,6 +39,10 @@ _ROOM_SESSION_TITLE_MAX_CHARS = 100
 _TERMINAL_TRUNCATION_NOTICE = (
     "\n\n[Reply truncated. Ask the Bot to share the full result as a file.]"
 )
+
+
+class RoomSessionIdentityUnavailableError(RuntimeError):
+    """The durable room registry could not safely resolve a session title."""
 
 
 class InternalSessionRPC(Protocol):
@@ -1267,6 +1272,65 @@ def room_session_title(room_id: str) -> str:
         - len(digest)
     )
     return f"{_ROOM_SESSION_TITLE_PREFIX}{room_id[:room_prefix_chars]}~{digest}"
+
+
+def recover_room_id_from_session_title(
+    db_path: Path | str,
+    title: str,
+) -> str | None:
+    """Resolve a canonical title against the durable active-room registry.
+
+    Long room ids cannot be recovered by reversing their bounded digest title.
+    The title is therefore only a lookup key: identity comes from an exact
+    canonical-title match against room ids stored in the shared room database.
+    Missing registries and unmatched legacy display titles return ``None``;
+    unavailable or ambiguous registries fail closed.
+    """
+    if not isinstance(title, str) or not title.startswith(
+        _ROOM_SESSION_TITLE_PREFIX
+    ):
+        return None
+    path = Path(db_path)
+    if not path.is_file():
+        return None
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=0.05,
+        )
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='hosted_rooms' LIMIT 1"
+        ).fetchone()
+        if table is None:
+            return None
+        room_ids = (
+            str(row[0])
+            for row in conn.execute(
+                "SELECT room_id FROM hosted_rooms WHERE disbanded_at IS NULL"
+            ).fetchall()
+        )
+        matches = [
+            room_id
+            for room_id in room_ids
+            if room_session_title(room_id) == title
+        ]
+    except sqlite3.Error as exc:
+        raise RoomSessionIdentityUnavailableError(
+            "hosted room session identity is temporarily unavailable"
+        ) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if len(matches) > 1:
+        raise RoomSessionIdentityUnavailableError(
+            "hosted room session title is ambiguous"
+        )
+    return matches[0] if matches else None
 
 
 def _session_id(session: Mapping[str, Any]) -> str:

@@ -119,6 +119,40 @@ def test_direct_prompt_recovers_persisted_room_id_for_bounded_title(
     assert result["error"]["code"] == 4122
 
 
+def test_legacy_prompt_fence_recovers_actual_long_room_id(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    room_id = "r" * 127 + "a"
+    db = hosted_rooms.default_db_path()
+    hosted_rooms.create_room(
+        db,
+        room_id=room_id,
+        name="Long hosted room",
+        members=[],
+        authority_gateway_id=hosted_rooms.local_authority_gateway_id(),
+    )
+    title = room_session_title(room_id)
+    assert len(title) == 100
+    _stub_session(monkeypatch, title=title)
+
+    probed_room_ids = []
+    probe = hosted_rooms.probe_hosted_room
+
+    def recording_probe(db_path, *, room_id):
+        probed_room_ids.append(room_id)
+        return probe(db_path, room_id=room_id)
+
+    monkeypatch.setattr(hosted_rooms, "probe_hosted_room", recording_probe)
+
+    result = server._methods["prompt.submit"](
+        "request-long", {"session_id": "session-1", "text": "continue"}
+    )
+
+    assert result["error"]["code"] == 4122
+    assert probed_room_ids == [room_id]
+
+
 def test_direct_prompt_to_non_hosted_group_reaches_normal_admission(
     tmp_path, monkeypatch
 ):

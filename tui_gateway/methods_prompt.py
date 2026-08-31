@@ -379,9 +379,7 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 room_id = ""
         title = str(session.get("title") or "")
-        if not room_id and title.startswith("Group: "):
-            room_id = title.removeprefix("Group: ").strip()
-        if room_id:
+        if room_id or title.startswith("Group: "):
             try:
                 from gateway.hosted_rooms import (
                     HostedRoomError,
@@ -389,9 +387,22 @@ def _(rid, params: dict) -> dict:
                     default_db_path,
                     probe_hosted_room,
                 )
+                from tui_gateway.hosted_room_driver import (
+                    RoomSessionIdentityUnavailableError,
+                    recover_room_id_from_session_title,
+                )
 
-                hosted = probe_hosted_room(default_db_path(), room_id=room_id)
-            except RoomProbeUnavailableError:
+                db_path = default_db_path()
+                if not room_id:
+                    recovered_room_id = recover_room_id_from_session_title(
+                        db_path,
+                        title,
+                    )
+                    room_id = recovered_room_id or title.removeprefix(
+                        "Group: "
+                    ).strip()
+                hosted = probe_hosted_room(db_path, room_id=room_id)
+            except (RoomProbeUnavailableError, RoomSessionIdentityUnavailableError):
                 return _err(
                     rid,
                     5122,
