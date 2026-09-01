@@ -114,6 +114,17 @@ def _insert_method_before(
     return merged
 
 
+def _patch_uuid_import(text: str) -> str:
+    if "\nimport uuid\n" in text:
+        return text
+    old = "import time\n"
+    if text.count(old) != 1:
+        raise RuntimeError("unexpected HostedRoomService time import")
+    merged = text.replace(old, old + "import uuid\n", 1)
+    ast.parse(merged, filename=str(TARGET))
+    return merged
+
+
 def _patch_prepare_room(text: str) -> str:
     old = '''    def prepare_room(self, binding: HostedRoomBinding) -> None:
         with self._policy_lock:
@@ -143,7 +154,7 @@ def _patch_prepare_room(text: str) -> str:
 
 
 def build(current: str, source: str) -> str:
-    text = current
+    text = _patch_uuid_import(current)
     for name in REPLACED_METHODS:
         text = _replace_method(text, source, name)
     text = _insert_method_before(
@@ -172,6 +183,7 @@ def main() -> None:
     Path(args.output).write_text(merged, encoding="utf-8")
     summary = {
         "source_final": SOURCE_FINAL,
+        "import_additions": ["uuid"],
         "replaced_methods": list(REPLACED_METHODS),
         "inserted_method": INSERTED_METHOD,
         "prepare_room_additions": [
