@@ -1,4 +1,4 @@
-name: PR21 Patch 4 final compatibility probe
+name: PR21 Patch 4 service lifecycle integration probe
 
 on:
   push:
@@ -17,13 +17,13 @@ concurrency:
 
 jobs:
   probe:
-    name: Verify final runtime stop and liveness hybrid
+    name: Probe runtime and durable demotion integration
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 7ce6835b69cf8a07db111126696e29a1a1b4ec67
-      REPORT_DIR: /tmp/pr21-patch4-probe-v7
+      EXPECTED_PARENT: e34fe658fddfa570b695826c6cb22cb14a5d76a1
+      REPORT_DIR: /tmp/pr21-patch4-probe-v8
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -60,61 +60,123 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Build final compatible hybrid in runner only
+      - name: Build verified Runtime hybrid
         shell: bash
         run: |
           set -euo pipefail
           cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/current-runtime.py"
-          python .github/scripts/pr21_patch4_probe.py | tee "$REPORT_DIR/apply.txt"
-          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/full-candidate-runtime.py"
+          python .github/scripts/pr21_patch4_probe.py \
+            | tee "$REPORT_DIR/full-runtime-build.txt"
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/full-runtime.py"
           python .github/scripts/pr21_patch4_hybrid.py \
             --baseline "$REPORT_DIR/current-runtime.py" \
             --candidate tui_gateway/hosted_room_driver.py \
             --output tui_gateway/hosted_room_driver.py \
-            --report "$REPORT_DIR/hybrid-summary.json" \
-            | tee "$REPORT_DIR/hybrid-build.txt"
-          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/hybrid-runtime.py"
-          git diff -- tui_gateway/hosted_room_driver.py \
-            > "$REPORT_DIR/hybrid.patch"
-          git diff --stat | tee "$REPORT_DIR/hybrid-stat.txt"
-          python -m py_compile tui_gateway/hosted_room_driver.py
-          git diff --check
+            --report "$REPORT_DIR/runtime-hybrid-summary.json" \
+            | tee "$REPORT_DIR/runtime-hybrid-build.txt"
+          test "$(sha256sum tui_gateway/hosted_room_driver.py | awk '{print $1}')" = \
+            "def9c9cf8f39a4e0447cc5d6fce33b73824d3fc371f0e6e4df9b3392ade10bf6"
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/runtime-hybrid.py"
 
-      - name: Prove test runner has no retry plugin
+      - name: Build selective Service lifecycle integration
         shell: bash
         run: |
           set -euo pipefail
-          uv run python -m pytest --help > "$REPORT_DIR/pytest-help.txt"
-          if grep -F -- "--file-retries" "$REPORT_DIR/pytest-help.txt"; then
-            echo "unexpected file retry plugin is active" >&2
-            exit 1
-          fi
-          echo "single_execution_no_retry_plugin=true" \
-            | tee "$REPORT_DIR/retry-policy.txt"
+          cp tui_gateway/hosted_room_service.py "$REPORT_DIR/current-service.py"
+          python .github/scripts/pr21_patch4_service.py \
+            --output tui_gateway/hosted_room_service.py \
+            --report "$REPORT_DIR/service-summary.json" \
+            | tee "$REPORT_DIR/service-build.txt"
+          cp tui_gateway/hosted_room_service.py "$REPORT_DIR/service-candidate.py"
+          git diff -- \
+            tui_gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_service.py \
+            > "$REPORT_DIR/candidate.patch"
+          git diff --stat | tee "$REPORT_DIR/candidate-stat.txt"
+          python -m py_compile \
+            tui_gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_service.py
+          git diff --check
 
-      - name: Run exact Patch 4 target suite once
+      - name: GREEN exact Runtime suite
         shell: bash
         run: |
           set -euo pipefail
           uv run python -m pytest \
             tests/tui_gateway/test_hosted_room_driver_runtime.py \
             -q --tb=short \
-            | tee "$REPORT_DIR/target-suite.log"
+            | tee "$REPORT_DIR/runtime.log"
+
+      - name: Capture Service suite result
+        shell: bash
+        run: |
+          set +e
+          uv run python -m pytest \
+            tests/tui_gateway/test_hosted_room_service.py \
+            -q --tb=short > "$REPORT_DIR/service.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" | tee "$REPORT_DIR/service.exit"
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          report = Path("/tmp/pr21-patch4-probe-v8")
+          lines = (report / "service.log").read_text(
+              encoding="utf-8", errors="replace"
+          ).splitlines()
+          failures = sorted(
+              {
+                  line[len("FAILED "):].split(" - ", 1)[0]
+                  for line in lines
+                  if line.startswith("FAILED ")
+              }
+          )
+          payload = {"count": len(failures), "failures": failures}
+          (report / "service-failures.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          PY
+
+      - name: Capture remaining integration result
+        shell: bash
+        run: |
+          set +e
+          uv run python -m pytest \
+            tests/gateway/test_hosted_room_driver.py \
+            tests/gateway/test_hosted_room_gateway_lifecycle.py \
+            tests/gateway/test_hosted_room_worker_shutdown.py \
+            tests/gateway/test_hosted_room_discussion.py \
+            tests/tui_gateway/test_hosted_room_prompt_fence.py \
+            tests/tui_gateway/test_hosted_room_server_rpc.py \
+            tests/tui_gateway/test_groups_methods.py \
+            tests/tui_gateway/test_groups_replication_methods.py \
+            tests/gateway/test_hosted_room_replicas_patch3.py \
+            -q --tb=short > "$REPORT_DIR/integration.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" | tee "$REPORT_DIR/integration.exit"
 
       - name: Static verification
         shell: bash
         run: |
           set -euo pipefail
-          uv run ruff check tui_gateway/hosted_room_driver.py \
+          uv run ruff check \
+            tui_gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_service.py \
             | tee "$REPORT_DIR/ruff-check.log"
-          python -m compileall -q tui_gateway/hosted_room_driver.py
+          python -m compileall -q \
+            tui_gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_service.py
           git diff --check
 
       - name: Upload probe evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-probe-v7
-          path: /tmp/pr21-patch4-probe-v7/**
+          name: pr21-patch4-service-probe-v8
+          path: /tmp/pr21-patch4-probe-v8/**
           if-no-files-found: warn
           retention-days: 14
