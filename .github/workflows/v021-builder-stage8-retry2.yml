@@ -1,0 +1,132 @@
+name: Hermes v0.21.0 candidate builder stage 8 retry 2
+
+on:
+  push:
+    branches:
+      - codex/v021-builder-stage8-retry2-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hermes-v021-candidate-writer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Retry stage 8 with source-backed profile deletion regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_REMOTE: c19e98fbf5e0ceb243d066e3e46a4f304fb8d606
+    steps:
+      - name: Checkout pinned stage 8 resolver
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: d6e92d7221deabbb0967829f7ef964924842f873
+          path: control
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout candidate branch with write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Harden resolver for the current test layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(grep -c '^def _stub_session' candidate/tests/tui_gateway/test_hosted_room_prompt_fence.py)" = "1"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("control/.github/scripts/v021_replay_stage8.py")
+          text = path.read_text(encoding="utf-8")
+
+          uniqueness_guard = (
+              '    if text.find(start_marker, start + 1) >= 0:\n'
+              '        raise RuntimeError(f"{label}: start marker is not unique")\n'
+          )
+          if text.count(uniqueness_guard) != 1:
+              raise SystemExit("expected one resolver uniqueness guard")
+          text = text.replace(uniqueness_guard, "", 1)
+
+          helper_anchor = "def require_auto_applied_markers(repo: Path) -> None:\n"
+          helper = (
+              "def ensure_profile_deleted_test(repo: Path) -> None:\n"
+              "    relative = \"tests/tui_gateway/test_hosted_room_service.py\"\n"
+              "    path = repo / relative\n"
+              "    current = path.read_text(encoding=\"utf-8\")\n"
+              "    marker = \"def test_profile_deleted_after_planning_is_deferred_before_admission\"\n"
+              "    if marker in current:\n"
+              "        return\n"
+              "    incoming = output(repo, \"show\", f\"{FIRST}:{relative}\")\n"
+              "    start = incoming.find(marker)\n"
+              "    if start < 0:\n"
+              "        raise RuntimeError(\"source commit lost the profile deletion regression\")\n"
+              "    end = incoming.find(\"\\ndef \", start + len(marker))\n"
+              "    if end < 0:\n"
+              "        end = len(incoming)\n"
+              "    regression = incoming[start:end].rstrip() + \"\\n\\n\"\n"
+              "    anchor = \"def test_demotion_interrupts_inflight_turn_before_authority_changes\"\n"
+              "    if current.count(anchor) != 1:\n"
+              "        raise RuntimeError(\"expected one demotion-test insertion anchor\")\n"
+              "    current = current.replace(anchor, regression + anchor, 1)\n"
+              "    ast.parse(current, filename=str(path))\n"
+              "    path.write_text(current, encoding=\"utf-8\")\n"
+              "    git(repo, \"add\", \"--\", relative)\n"
+              "\n\n"
+          )
+          if text.count(helper_anchor) != 1:
+              raise SystemExit("expected one auto-applied marker helper")
+          text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          call_anchor = "    require_auto_applied_markers(repo)\n\n    remaining ="
+          call_replacement = (
+              "    ensure_profile_deleted_test(repo)\n"
+              "    require_auto_applied_markers(repo)\n\n"
+              "    remaining ="
+          )
+          if text.count(call_anchor) != 1:
+              raise SystemExit("expected one auto-applied marker call")
+          text = text.replace(call_anchor, call_replacement, 1)
+
+          path.write_text(text, encoding="utf-8")
+          PY
+          python -m py_compile control/.github/scripts/v021_replay_stage8.py
+
+      - name: Reconcile room identity and replay until next conflict
+        shell: bash
+        run: |
+          set -euo pipefail
+          python control/.github/scripts/v021_replay_stage8.py \
+            --repo candidate \
+            --report "$RUNNER_TEMP/hermes-v021-builder-stage8-retry2"
+
+      - name: Fast-forward candidate branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_head="$(git -C candidate ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$EXPECTED_REMOTE"
+          test -z "$(git -C candidate status --porcelain)"
+          git -C candidate merge-base --is-ancestor "$remote_head" HEAD
+          git -C candidate push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          pushed="$(git -C candidate ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$pushed" = "$(git -C candidate rev-parse HEAD)"
+          echo "pushed_head=$pushed" | tee -a "$RUNNER_TEMP/hermes-v021-builder-stage8-retry2/push.txt"
+
+      - name: Upload builder evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-builder-stage8-retry2
+          path: ${{ runner.temp }}/hermes-v021-builder-stage8-retry2/**
+          if-no-files-found: warn
+          retention-days: 14
