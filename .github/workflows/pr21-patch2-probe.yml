@@ -76,6 +76,19 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
+      - name: Measure candidate baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$REPORT_DIR/current-driver.py" gateway/hosted_room_driver.py
+          cp "$REPORT_DIR/current-driver-tests.py" tests/gateway/test_hosted_room_driver.py
+          set +e
+          uv run python -m pytest tests/gateway/test_hosted_room_driver.py \
+            -q --tb=short > "$REPORT_DIR/baseline-current.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$REPORT_DIR/baseline-current.exit"
+
       - name: Install final driver only in temporary checkout
         shell: bash
         run: |
@@ -85,29 +98,68 @@ jobs:
           uv run ruff check gateway/hosted_room_driver.py \
             | tee "$REPORT_DIR/final-driver-ruff.log"
 
-      - name: Run candidate driver tests against final driver
+      - name: Measure candidate tests against final driver
         shell: bash
         run: |
           set -euo pipefail
           cp "$REPORT_DIR/current-driver-tests.py" tests/gateway/test_hosted_room_driver.py
+          set +e
           uv run python -m pytest tests/gateway/test_hosted_room_driver.py \
-            -q --tb=short | tee "$REPORT_DIR/current-tests-final-driver.log"
+            -q --tb=short > "$REPORT_DIR/current-tests-final-driver.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$REPORT_DIR/current-tests-final-driver.exit"
 
-      - name: Run candidate runtime tests against final driver
+      - name: Measure candidate runtime tests against final driver
         shell: bash
         run: |
           set -euo pipefail
+          set +e
           uv run python -m pytest \
             tests/tui_gateway/test_hosted_room_driver_runtime.py \
-            -q --tb=short | tee "$REPORT_DIR/runtime-tests-final-driver.log"
+            -q --tb=short > "$REPORT_DIR/runtime-tests-final-driver.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$REPORT_DIR/runtime-tests-final-driver.exit"
 
-      - name: Run final PR19 driver tests against final driver
+      - name: Measure final PR19 driver tests against final driver
         shell: bash
         run: |
           set -euo pipefail
           cp "$REPORT_DIR/final-driver-tests.py" tests/gateway/test_hosted_room_driver.py
+          set +e
           uv run python -m pytest tests/gateway/test_hosted_room_driver.py \
-            -q --tb=short | tee "$REPORT_DIR/final-tests-final-driver.log"
+            -q --tb=short > "$REPORT_DIR/final-tests-final-driver.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$REPORT_DIR/final-tests-final-driver.exit"
+
+      - name: Summarize compatibility matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$REPORT_DIR" <<'PY'
+          from pathlib import Path
+          import json
+          import sys
+
+          report = Path(sys.argv[1])
+          names = (
+              "baseline-current",
+              "current-tests-final-driver",
+              "runtime-tests-final-driver",
+              "final-tests-final-driver",
+          )
+          summary = {
+              name: int((report / f"{name}.exit").read_text().strip())
+              for name in names
+          }
+          (report / "compatibility-matrix.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, sort_keys=True))
+          PY
 
       - name: Verify probe did not mutate remote state
         shell: bash
@@ -122,7 +174,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch2-driver-probe
+          name: pr21-patch2-driver-probe-v2
           path: /tmp/pr21-patch2-driver-probe/**
           if-no-files-found: error
           retention-days: 14
