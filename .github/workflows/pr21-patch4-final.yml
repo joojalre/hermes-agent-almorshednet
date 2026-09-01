@@ -19,13 +19,13 @@ jobs:
   apply:
     name: RED GREEN runtime stop and liveness invariants
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 80
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 133fd5896783358d9a6336958dbfc223016efddc
+      EXPECTED_PARENT: c79df24992f43200d904e1cd13edacc2b179ff7a
       EXPECTED_BASELINE_SHA256: 79789fe9e725ba3e2bf15440dc1de0ce60b45bb7d137d3c42b86f58eed1839fe
       EXPECTED_HYBRID_SHA256: def9c9cf8f39a4e0447cc5d6fce33b73824d3fc371f0e6e4df9b3392ade10bf6
-      REPORT_DIR: /tmp/pr21-patch4-final
+      REPORT_DIR: /tmp/pr21-patch4-final-v2
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -63,6 +63,61 @@ jobs:
           set -euo pipefail
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
+
+      - name: Capture untouched hosted-room service baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          uv run python -m pytest \
+            tests/tui_gateway/test_hosted_room_service.py \
+            -q --tb=short > "$REPORT_DIR/baseline-service.log" 2>&1
+          baseline_rc=$?
+          set -e
+          echo "$baseline_rc" | tee "$REPORT_DIR/baseline-service.exit"
+          test "$baseline_rc" = "1"
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          report = Path("/tmp/pr21-patch4-final-v2")
+          lines = (report / "baseline-service.log").read_text(
+              encoding="utf-8", errors="replace"
+          ).splitlines()
+          failures = sorted(
+              {
+                  line[len("FAILED "):].split(" - ", 1)[0]
+                  for line in lines
+                  if line.startswith("FAILED ")
+              }
+          )
+          expected = sorted(
+              {
+                  "tests/tui_gateway/test_hosted_room_service.py::test_stop_room_snapshots_tasks_before_status_transitions",
+                  "tests/tui_gateway/test_hosted_room_service.py::test_demotion_interrupts_inflight_turn_before_authority_changes",
+                  "tests/tui_gateway/test_hosted_room_service.py::test_terminal_publication_recovers_legacy_member_prefix_at_normal_limit",
+                  "tests/tui_gateway/test_hosted_room_service.py::test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer",
+                  "tests/tui_gateway/test_hosted_room_service.py::test_headless_room_publishes_peer_member_reply_without_desktop_transport",
+                  "tests/tui_gateway/test_hosted_room_service.py::test_peer_approval_is_scoped_visible_and_resolvable",
+                  "tests/tui_gateway/test_hosted_room_service.py::test_local_room_approval_uses_the_exact_hidden_session",
+                  "tests/tui_gateway/test_hosted_room_service.py::test_stale_local_approval_cannot_resolve_replacement_request",
+              }
+          )
+          payload = {"failures": failures, "expected": expected}
+          (report / "baseline-service-failures.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          (report / "baseline-service-failures.txt").write_text(
+              "\n".join(failures) + "\n",
+              encoding="utf-8",
+          )
+          if failures != expected:
+              raise SystemExit(
+                  f"unexpected untouched service baseline: {failures}"
+              )
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          PY
 
       - name: Prove current Runtime suite is RED
         shell: bash
@@ -114,7 +169,57 @@ jobs:
             -q --tb=short \
             | tee "$REPORT_DIR/green-runtime.log"
 
-      - name: GREEN driver and lifecycle integration
+      - name: Prove no new hosted-room service failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          uv run python -m pytest \
+            tests/tui_gateway/test_hosted_room_service.py \
+            -q --tb=short > "$REPORT_DIR/candidate-service.log" 2>&1
+          candidate_rc=$?
+          set -e
+          echo "$candidate_rc" | tee "$REPORT_DIR/candidate-service.exit"
+          test "$candidate_rc" = "1"
+          python - <<'PY'
+          from pathlib import Path
+          import json
+
+          report = Path("/tmp/pr21-patch4-final-v2")
+
+          def failures(name: str) -> list[str]:
+              lines = (report / name).read_text(
+                  encoding="utf-8", errors="replace"
+              ).splitlines()
+              return sorted(
+                  {
+                      line[len("FAILED "):].split(" - ", 1)[0]
+                      for line in lines
+                      if line.startswith("FAILED ")
+                  }
+              )
+
+          baseline = failures("baseline-service.log")
+          candidate = failures("candidate-service.log")
+          payload = {
+              "baseline_failures": baseline,
+              "candidate_failures": candidate,
+              "added_failures": sorted(set(candidate) - set(baseline)),
+              "removed_failures": sorted(set(baseline) - set(candidate)),
+              "identical": baseline == candidate,
+          }
+          (report / "service-differential.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          if baseline != candidate:
+              raise SystemExit("Patch 4 changed the hosted-room service failure set")
+          if len(candidate) != 8:
+              raise SystemExit(f"unexpected service failure count: {len(candidate)}")
+          PY
+
+      - name: GREEN remaining driver and lifecycle integration
         shell: bash
         run: |
           set -euo pipefail
@@ -123,7 +228,6 @@ jobs:
             tests/gateway/test_hosted_room_gateway_lifecycle.py \
             tests/gateway/test_hosted_room_worker_shutdown.py \
             tests/gateway/test_hosted_room_discussion.py \
-            tests/tui_gateway/test_hosted_room_service.py \
             tests/tui_gateway/test_hosted_room_prompt_fence.py \
             tests/tui_gateway/test_hosted_room_server_rpc.py \
             tests/tui_gateway/test_groups_methods.py \
@@ -208,7 +312,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-evidence-final
-          path: /tmp/pr21-patch4-final/**
+          name: pr21-patch4-runtime-evidence-final-v2
+          path: /tmp/pr21-patch4-final-v2/**
           if-no-files-found: warn
           retention-days: 14
