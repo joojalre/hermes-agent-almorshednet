@@ -22,8 +22,9 @@ jobs:
     timeout-minutes: 55
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: e34fe658fddfa570b695826c6cb22cb14a5d76a1
-      REPORT_DIR: /tmp/pr21-patch4-probe-v8
+      EXPECTED_PARENT: fba4bee42556c38d5481b00b6f5b4227626e21aa
+      SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
+      REPORT_DIR: /tmp/pr21-patch4-probe-v9
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -35,13 +36,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify immutable probe point
+      - name: Verify immutable probe point and PR19 source
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$REPORT_DIR"
           test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
           test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$GITHUB_SHA"
+          git fetch --no-tags origin \
+            refs/pull/19/head:refs/remotes/origin/pr19-final
+          test "$(git rev-parse refs/remotes/origin/pr19-final)" = "$SOURCE_FINAL"
           git status --short | tee "$REPORT_DIR/start-status.txt"
 
       - name: Install uv
@@ -121,7 +125,7 @@ jobs:
           from pathlib import Path
           import json
 
-          report = Path("/tmp/pr21-patch4-probe-v8")
+          report = Path("/tmp/pr21-patch4-probe-v9")
           lines = (report / "service.log").read_text(
               encoding="utf-8", errors="replace"
           ).splitlines()
@@ -176,7 +180,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-service-probe-v8
-          path: /tmp/pr21-patch4-probe-v8/**
+          name: pr21-patch4-service-probe-v9
+          path: /tmp/pr21-patch4-probe-v9/**
           if-no-files-found: warn
           retention-days: 14
