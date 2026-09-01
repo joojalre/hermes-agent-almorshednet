@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 60
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: d4948ee6afda65b5f9d47be5c3de03c60117b5f3
+      EXPECTED_PARENT: b3e1eb4c9370f243caa9db5fc594fa34ef6d7edb
       REPORT_DIR: /tmp/pr21-patch1-storage
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
@@ -47,7 +47,6 @@ jobs:
           git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
           test "$(git rev-parse refs/remotes/origin/pr19-final)" = "20d0a6a42365b2b2351e1dca819022b6ec477b39"
           git cat-file -e c19e98fbf5e0ceb243d066e3e46a4f304fb8d606^{commit}
-          git cat-file -e 20d0a6a42365b2e32c91180006445f9011d33c^{commit} || true
           git cat-file -e 20d0a6a42365b2b2351e1dca819022b6ec477b39^{commit}
           git status --short | tee "$REPORT_DIR/start-status.txt"
 
@@ -68,7 +67,7 @@ jobs:
         shell: bash
         run: uv sync --locked --python 3.11 --extra dev
 
-      - name: Add focused regressions without production changes
+      - name: Add focused regressions and record baseline format drift
         shell: bash
         run: |
           set -euo pipefail
@@ -77,6 +76,18 @@ jobs:
           git diff -- gateway/hosted_rooms.py > "$REPORT_DIR/pre-red-production.diff"
           test ! -s "$REPORT_DIR/pre-red-production.diff"
           python -m py_compile tests/gateway/test_hosted_room_storage_reservations.py
+
+          set +e
+          uv run ruff format --check \
+            gateway/hosted_rooms.py \
+            tests/gateway/test_hosted_rooms.py \
+            > "$REPORT_DIR/baseline-format-drift.log" 2>&1
+          baseline_format_rc=$?
+          set -e
+          echo "$baseline_format_rc" > "$REPORT_DIR/baseline-format-drift.exit"
+          test "$baseline_format_rc" = "1"
+          grep -F "gateway/hosted_rooms.py" "$REPORT_DIR/baseline-format-drift.log"
+          grep -F "tests/gateway/test_hosted_rooms.py" "$REPORT_DIR/baseline-format-drift.log"
 
       - name: RED correlated terminal publication
         shell: bash
@@ -158,10 +169,21 @@ jobs:
             tests/gateway/test_hosted_room_storage_reservations.py \
             | tee "$REPORT_DIR/ruff-check.log"
           uv run ruff format --check \
+            tests/gateway/test_hosted_room_storage_reservations.py \
+            | tee "$REPORT_DIR/ruff-format-new-test.log"
+
+          set +e
+          uv run ruff format --check \
             gateway/hosted_rooms.py \
             tests/gateway/test_hosted_rooms.py \
-            tests/gateway/test_hosted_room_storage_reservations.py \
-            | tee "$REPORT_DIR/ruff-format-check.log"
+            > "$REPORT_DIR/post-format-drift.log" 2>&1
+          post_format_rc=$?
+          set -e
+          echo "$post_format_rc" > "$REPORT_DIR/post-format-drift.exit"
+          test "$post_format_rc" = "1"
+          grep -F "gateway/hosted_rooms.py" "$REPORT_DIR/post-format-drift.log"
+          grep -F "tests/gateway/test_hosted_rooms.py" "$REPORT_DIR/post-format-drift.log"
+
           python -m py_compile \
             gateway/hosted_rooms.py \
             tests/gateway/test_hosted_rooms.py \
@@ -234,7 +256,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch1-storage-evidence-semantic-v2
+          name: pr21-patch1-storage-evidence-semantic-v3
           path: /tmp/pr21-patch1-storage/**
           if-no-files-found: warn
           retention-days: 14
