@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 70
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 8c65e765299a5dac30f49ab4b6a748e8d8abc632
+      EXPECTED_PARENT: 93dbbb25de85a48f15710382ee21b2e9b8352697
       REPORT_DIR: /tmp/pr21-patch3-replica
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
@@ -130,19 +130,19 @@ jobs:
           test "$rc" = "1"
           grep -F "DID NOT RAISE" "$REPORT_DIR/red-incomplete.log"
 
-      - name: RED authoritative room capacity preflight
+      - name: RED authoritative event capacity preflight
         shell: bash
         run: |
           set -euo pipefail
           set +e
           uv run python -m pytest \
-            tests/gateway/test_hosted_room_replicas_patch3.py::test_promote_refuses_when_active_room_capacity_is_full \
-            -q --tb=short > "$REPORT_DIR/red-room-capacity.log" 2>&1
+            tests/gateway/test_hosted_room_replicas_patch3.py::test_promote_preflights_authoritative_event_count \
+            -q --tb=short > "$REPORT_DIR/red-event-capacity.log" 2>&1
           rc=$?
           set -e
-          echo "$rc" > "$REPORT_DIR/red-room-capacity.exit"
+          echo "$rc" > "$REPORT_DIR/red-event-capacity.exit"
           test "$rc" = "1"
-          grep -F "DID NOT RAISE" "$REPORT_DIR/red-room-capacity.log"
+          grep -F "DID NOT RAISE" "$REPORT_DIR/red-event-capacity.log"
 
       - name: RED unpublished terminal demotion fence
         shell: bash
@@ -291,7 +291,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch3-replica-evidence
+          name: pr21-patch3-replica-evidence-v2
           path: /tmp/pr21-patch3-replica/**
           if-no-files-found: warn
           retention-days: 14
