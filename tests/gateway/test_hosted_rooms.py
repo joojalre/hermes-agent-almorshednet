@@ -790,12 +790,27 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
             payload={"text": "x" * 180, "index": index},
         )
 
-    one_event = rooms.read_events(db, room_id="room-1", limit=1)
-    budget = len(
-        json.dumps(one_event, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
+    def page_bytes(page):
+        return len(
+            json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
         )
-    ) + 1
+
+    # created_at is serialized into every event and its float representation
+    # can differ by a byte or more between adjacent events. Size every possible
+    # single-event page instead of assuming the first event is the largest.
+    single_event_pages = [
+        rooms.read_events(
+            db,
+            room_id="room-1",
+            since_seq=since_seq,
+            limit=1,
+        )
+        for since_seq in range(4)
+    ]
+    budget = max(page_bytes(page) for page in single_event_pages) + 1
+    assert page_bytes(rooms.read_events(db, room_id="room-1", limit=2)) > budget
     monkeypatch.setattr(rooms, "MAX_LOG_PAGE_BYTES", budget)
 
     first = rooms.read_events(db, room_id="room-1", limit=4)
@@ -808,7 +823,6 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
         limit=4,
     )
     assert second["events"][0]["seq"] == first["cursor"] + 1
-
 
 def test_room_log_pages_bound_multibyte_utf8_and_advance_cursor(tmp_path, monkeypatch):
     db = tmp_path / "state.db"

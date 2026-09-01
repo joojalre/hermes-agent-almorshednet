@@ -24,6 +24,8 @@ from gateway import hosted_rooms
 
 
 Clock = Callable[[], float]
+OwnerProcessState = Literal["alive", "dead", "unknown"]
+OwnerLiveness = Callable[[int, int], OwnerProcessState]
 TaskStatus = Literal[
     "queued",
     "running",
@@ -1620,6 +1622,73 @@ def _raise_if_task_fenced(
         raise TaskAdmissionBlockedError(
             "task source event is behind the current Stop fence"
         )
+
+def _stop_fenced_inactive_rows(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+) -> tuple[str, list[sqlite3.Row]] | None:
+    _load_active_room(conn, room_id)
+    stop = conn.execute(
+        """SELECT seq, payload_json FROM hosted_room_events
+           WHERE room_id=? AND kind='room.stop_requested'
+           ORDER BY seq DESC LIMIT 1""",
+        (room_id,),
+    ).fetchone()
+    if stop is None:
+        return None
+    try:
+        payload = json.loads(stop["payload_json"])
+        cancel_id = _identifier(payload.get("cancel_id"), label="cancel_id")
+    except (AttributeError, json.JSONDecodeError, DriverValidationError) as exc:
+        raise DriverStateError("latest Stop event payload is invalid") from exc
+    rows = conn.execute(
+        """SELECT * FROM hosted_room_driver_tasks
+           WHERE room_id=? AND status IN ('queued', 'deferred')
+             AND source_event_seq <= ?
+           ORDER BY source_event_seq, created_at, task_id""",
+        (room_id, int(stop["seq"])),
+    ).fetchall()
+    return cancel_id, rows
+def reconcile_stop_fenced_inactive_tasks(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    clock: Clock,
+) -> list[TaskIdentity]:
+    """Cancel inactive work stranded by a durable Stop before process exit."""
+
+    room_id = _identifier(room_id, label="room_id")
+    preflight = _connect(db_path)
+    try:
+        candidate = _stop_fenced_inactive_rows(preflight, room_id=room_id)
+    finally:
+        preflight.close()
+    if candidate is None or not candidate[1]:
+        return []
+
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        current = _stop_fenced_inactive_rows(conn, room_id=room_id)
+        if current is None or not current[1]:
+            return []
+        cancel_id, rows = current
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='cancelled', cancel_generation=cancel_generation+1,
+                   cancel_id=?, terminal_at=?, updated_at=?
+               WHERE room_id=? AND status IN ('queued', 'deferred')
+                 AND source_event_seq <= (
+                     SELECT MAX(seq) FROM hosted_room_events
+                     WHERE room_id=? AND kind='room.stop_requested'
+                 )""",
+            (cancel_id, now, now, room_id, room_id),
+        )
+        if updated.rowcount != len(rows):
+            raise StaleTaskError(
+                "stop-fenced inactive tasks changed during reconciliation"
+            )
+        return [_task_identity_from_row(row) for row in rows]
 
 def admit_task(
     db_path: Path | str,
