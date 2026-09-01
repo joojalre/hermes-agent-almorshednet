@@ -1,0 +1,114 @@
+name: Hermes v0.21.0 conflict bundle
+
+on:
+  push:
+    branches:
+      - codex/v021-conflict-bundle-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-conflict-bundle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  collect:
+    name: Export base, fork, and release conflict variants
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout fork history without credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build conflict bundle
+        shell: bash
+        env:
+          FORK_SNAPSHOT: e6c06033a04d9745ed1efea97ce35401323dbfd7
+          UPSTREAM_CUTOFF: a9c783f21995723c812dcb2f8ae58bc6a4323e2f
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-conflict-bundle"
+          WT="$RUNNER_TEMP/hermes-v021-conflict-worktree"
+          mkdir -p "$REPORT/files"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          git merge-base --is-ancestor "$UPSTREAM_CUTOFF" "$RELEASE"
+          git cat-file -e "$FORK_SNAPSHOT^{commit}"
+
+          TREE="$(git rev-parse "$FORK_SNAPSHOT^{tree}")"
+          export GIT_AUTHOR_NAME="Hermes Conflict Probe"
+          export GIT_AUTHOR_EMAIL="conflict-probe@invalid.local"
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          SYNTHETIC="$(printf '%s\n' 'chore: anchor fork tree to upstream cutoff for conflict export' | git commit-tree "$TREE" -p "$UPSTREAM_CUTOFF" -p "$FORK_SNAPSHOT")"
+          test "$(git rev-parse "$SYNTHETIC^{tree}")" = "$TREE"
+
+          git worktree add --detach "$WT" "$SYNTHETIC"
+          git -C "$WT" config user.name "Hermes Conflict Probe"
+          git -C "$WT" config user.email "conflict-probe@invalid.local"
+
+          set +e
+          GIT_MERGE_AUTOEDIT=no git -C "$WT" merge --no-commit --no-ff "$RELEASE" > "$REPORT/merge.log" 2>&1
+          MERGE_EXIT=$?
+          set -e
+          test "$MERGE_EXIT" -ne 0
+
+          git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/conflicts.txt"
+          CONFLICTS="$(wc -l < "$REPORT/conflicts.txt" | tr -d ' ')"
+          test "$CONFLICTS" -gt 0
+
+          printf 'path\tbase_lines\tfork_lines\trelease_lines\tbase_sha256\tfork_sha256\trelease_sha256\n' > "$REPORT/manifest.tsv"
+
+          while IFS= read -r path; do
+            dest="$REPORT/files/$path"
+            mkdir -p "$dest"
+            git -C "$WT" show ":1:$path" > "$dest/base"
+            git -C "$WT" show ":2:$path" > "$dest/fork"
+            git -C "$WT" show ":3:$path" > "$dest/release"
+            set +e
+            git diff --no-index --histogram -- "$dest/base" "$dest/fork" > "$dest/base-to-fork.diff"
+            git diff --no-index --histogram -- "$dest/base" "$dest/release" > "$dest/base-to-release.diff"
+            git diff --no-index --histogram -- "$dest/release" "$dest/fork" > "$dest/release-to-fork.diff"
+            set -e
+            git log --format='%H%x09%ad%x09%s' --date=iso-strict "$UPSTREAM_CUTOFF..$RELEASE" -- "$path" > "$dest/release-commits.tsv"
+            git log --format='%H%x09%ad%x09%s' --date=iso-strict "$UPSTREAM_CUTOFF..$FORK_SNAPSHOT" -- "$path" > "$dest/fork-commits.tsv"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$path" \
+              "$(wc -l < "$dest/base" | tr -d ' ')" \
+              "$(wc -l < "$dest/fork" | tr -d ' ')" \
+              "$(wc -l < "$dest/release" | tr -d ' ')" \
+              "$(sha256sum "$dest/base" | cut -d' ' -f1)" \
+              "$(sha256sum "$dest/fork" | cut -d' ' -f1)" \
+              "$(sha256sum "$dest/release" | cut -d' ' -f1)" \
+              >> "$REPORT/manifest.tsv"
+          done < "$REPORT/conflicts.txt"
+
+          {
+            echo "fork_snapshot=$FORK_SNAPSHOT"
+            echo "fork_tree=$TREE"
+            echo "upstream_cutoff=$UPSTREAM_CUTOFF"
+            echo "release=$RELEASE"
+            echo "synthetic_commit=$SYNTHETIC"
+            echo "merge_exit=$MERGE_EXIT"
+            echo "conflict_files=$CONFLICTS"
+          } > "$REPORT/summary.txt"
+
+          git -C "$WT" status --short > "$REPORT/status.txt"
+          git worktree remove --force "$WT"
+
+      - name: Upload conflict evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-conflict-bundle
+          path: ${{ runner.temp }}/hermes-v021-conflict-bundle/**
+          if-no-files-found: error
+          retention-days: 14
