@@ -56,25 +56,27 @@ jobs:
                   raise SystemExit(f"expected one marker in resolver: {old}")
               text = text.replace(old, new, 1)
 
-          old_guard = '''    tracked = output(repo, "ls-tree", "-r", "--name-only", "HEAD")
-    if "hermes-update-mutex" in tracked or "/var/folders/" in tracked:
-        raise RuntimeError("temporary macOS updater paths leaked into candidate")
-'''
-          new_guard = '''    tracked = set(output(repo, "ls-tree", "-r", "--name-only", "HEAD").splitlines())
-    release_tracked = set(
-        output(repo, "ls-tree", "-r", "--name-only", RELEASE).splitlines()
-    )
-    introduced_temporary_paths = sorted(
-        path
-        for path in tracked - release_tracked
-        if "hermes-update-mutex" in path or "/var/folders/" in path
-    )
-    if introduced_temporary_paths:
-        raise RuntimeError(
-            "candidate introduced temporary macOS updater paths: "
-            + ", ".join(introduced_temporary_paths)
-        )
-'''
+          old_guard = (
+              '    tracked = output(repo, "ls-tree", "-r", "--name-only", "HEAD")\n'
+              '    if "hermes-update-mutex" in tracked or "/var/folders/" in tracked:\n'
+              '        raise RuntimeError("temporary macOS updater paths leaked into candidate")\n'
+          )
+          new_guard = (
+              '    tracked = set(output(repo, "ls-tree", "-r", "--name-only", "HEAD").splitlines())\n'
+              '    release_tracked = set(\n'
+              '        output(repo, "ls-tree", "-r", "--name-only", RELEASE).splitlines()\n'
+              '    )\n'
+              '    introduced_temporary_paths = sorted(\n'
+              '        candidate_path\n'
+              '        for candidate_path in tracked - release_tracked\n'
+              '        if "hermes-update-mutex" in candidate_path or "/var/folders/" in candidate_path\n'
+              '    )\n'
+              '    if introduced_temporary_paths:\n'
+              '        raise RuntimeError(\n'
+              '            "candidate introduced temporary macOS updater paths: "\n'
+              '            + ", ".join(introduced_temporary_paths)\n'
+              '        )\n'
+          )
           if text.count(old_guard) != 1:
               raise SystemExit("expected one temporary-path guard in resolver")
           text = text.replace(old_guard, new_guard, 1)
