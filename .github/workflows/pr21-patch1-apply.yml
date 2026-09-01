@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 60
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 74a5e77605c6f3886bc1581c0901a9fff66d2589
+      EXPECTED_PARENT: d4948ee6afda65b5f9d47be5c3de03c60117b5f3
       REPORT_DIR: /tmp/pr21-patch1-storage
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
@@ -47,6 +47,7 @@ jobs:
           git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
           test "$(git rev-parse refs/remotes/origin/pr19-final)" = "20d0a6a42365b2b2351e1dca819022b6ec477b39"
           git cat-file -e c19e98fbf5e0ceb243d066e3e46a4f304fb8d606^{commit}
+          git cat-file -e 20d0a6a42365b2e32c91180006445f9011d33c^{commit} || true
           git cat-file -e 20d0a6a42365b2b2351e1dca819022b6ec477b39^{commit}
           git status --short | tee "$REPORT_DIR/start-status.txt"
 
@@ -112,7 +113,9 @@ jobs:
           python .github/scripts/pr21_patch1_apply_sequential.py \
             --report-dir "$REPORT_DIR"
           git diff --check
-          python -m py_compile gateway/hosted_rooms.py
+          python -m py_compile \
+            gateway/hosted_rooms.py \
+            tests/gateway/test_hosted_rooms.py
           python - <<'PY'
           from gateway import hosted_rooms as rooms
 
@@ -151,14 +154,17 @@ jobs:
           set -euo pipefail
           uv run ruff check \
             gateway/hosted_rooms.py \
+            tests/gateway/test_hosted_rooms.py \
             tests/gateway/test_hosted_room_storage_reservations.py \
             | tee "$REPORT_DIR/ruff-check.log"
           uv run ruff format --check \
             gateway/hosted_rooms.py \
+            tests/gateway/test_hosted_rooms.py \
             tests/gateway/test_hosted_room_storage_reservations.py \
             | tee "$REPORT_DIR/ruff-format-check.log"
           python -m py_compile \
             gateway/hosted_rooms.py \
+            tests/gateway/test_hosted_rooms.py \
             tests/gateway/test_hosted_room_storage_reservations.py
           git diff --check
 
@@ -183,6 +189,7 @@ jobs:
           }
           required = {
               "gateway/hosted_rooms.py",
+              "tests/gateway/test_hosted_rooms.py",
               "tests/gateway/test_hosted_room_storage_reservations.py",
           }
           allowed = temporary | required
@@ -227,7 +234,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch1-storage-evidence-semantic
+          name: pr21-patch1-storage-evidence-semantic-v2
           path: /tmp/pr21-patch1-storage/**
           if-no-files-found: warn
           retention-days: 14
