@@ -1,0 +1,103 @@
+name: Hermes v0.21.0 synthetic merge probe
+
+on:
+  push:
+    branches:
+      - codex/v021-synthetic-merge-probe-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-synthetic-merge-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Merge release from the real upstream cutoff
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout fork history without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build synthetic parent and probe release merge
+        shell: bash
+        env:
+          FORK_SNAPSHOT: e6c06033a04d9745ed1efea97ce35401323dbfd7
+          UPSTREAM_CUTOFF: a9c783f21995723c812dcb2f8ae58bc6a4323e2f
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-synthetic-merge"
+          WT="$RUNNER_TEMP/hermes-v021-synthetic-worktree"
+          mkdir -p "$REPORT"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          git cat-file -e "$UPSTREAM_CUTOFF^{commit}"
+          git cat-file -e "$FORK_SNAPSHOT^{commit}"
+          git merge-base --is-ancestor "$UPSTREAM_CUTOFF" "$RELEASE"
+
+          TREE="$(git rev-parse "$FORK_SNAPSHOT^{tree}")"
+          export GIT_AUTHOR_NAME="Hermes Sync Probe"
+          export GIT_AUTHOR_EMAIL="sync-probe@invalid.local"
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          SYNTHETIC="$(printf '%s\n' 'chore: anchor fork tree to upstream cutoff for merge analysis' | git commit-tree "$TREE" -p "$UPSTREAM_CUTOFF" -p "$FORK_SNAPSHOT")"
+
+          test "$(git rev-parse "$SYNTHETIC^{tree}")" = "$TREE"
+          test "$(git rev-parse "$FORK_SNAPSHOT^{tree}")" = "$TREE"
+
+          git worktree add --detach "$WT" "$SYNTHETIC"
+          git -C "$WT" config user.name "Hermes Sync Probe"
+          git -C "$WT" config user.email "sync-probe@invalid.local"
+
+          set +e
+          GIT_MERGE_AUTOEDIT=no git -C "$WT" merge --no-commit --no-ff "$RELEASE" > "$REPORT/merge.log" 2>&1
+          EXIT=$?
+          set -e
+
+          git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/conflicts.txt" || true
+          git -C "$WT" status --short > "$REPORT/status.txt" || true
+          git -C "$WT" diff --cached --name-status > "$REPORT/staged-name-status.txt" || true
+          git -C "$WT" diff --cached --shortstat > "$REPORT/staged-shortstat.txt" || true
+
+          {
+            echo "fork_snapshot=$FORK_SNAPSHOT"
+            echo "fork_tree=$TREE"
+            echo "upstream_cutoff=$UPSTREAM_CUTOFF"
+            echo "release=$RELEASE"
+            echo "synthetic_commit=$SYNTHETIC"
+            echo "merge_exit=$EXIT"
+            echo "conflict_files=$(wc -l < "$REPORT/conflicts.txt" | tr -d ' ')"
+            echo "staged_files=$(wc -l < "$REPORT/staged-name-status.txt" | tr -d ' ')"
+          } | tee "$REPORT/summary.txt"
+
+          if [ "$EXIT" -eq 0 ]; then
+            echo "merged_tree=$(git -C "$WT" write-tree)" > "$REPORT/result-tree.txt"
+            sed -n 's/^version = "\([^"]*\)"/project_version=\1/p' "$WT/pyproject.toml" | head -1 >> "$REPORT/result-tree.txt"
+            sed -n 's/^__version__ = "\([^"]*\)"/cli_version=\1/p' "$WT/hermes_cli/__init__.py" | head -1 >> "$REPORT/result-tree.txt"
+            sed -n 's/^__release_date__ = "\([^"]*\)"/release_date=\1/p' "$WT/hermes_cli/__init__.py" | head -1 >> "$REPORT/result-tree.txt"
+          fi
+
+          set +e
+          git -C "$WT" diff --cached --check > "$REPORT/diff-check.txt" 2>&1
+          echo "$?" > "$REPORT/diff-check.exit"
+          set -e
+
+          git worktree remove --force "$WT"
+
+      - name: Upload synthetic merge evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-synthetic-merge-probe
+          path: ${{ runner.temp }}/hermes-v021-synthetic-merge/**
+          if-no-files-found: error
+          retention-days: 14
