@@ -136,18 +136,26 @@ def _make_mock_app():
     return mock_app, mock_polling_req
 
 
+@pytest.mark.parametrize(
+    "shutdown_error",
+    [
+        pytest.param(Exception("shutdown boom"), id="completed-error"),
+        pytest.param(asyncio.TimeoutError("request timeout"), id="completed-timeout"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_initialize_still_runs_when_shutdown_fails():
-    """If shutdown() raises, initialize() must still be attempted.
+async def test_initialize_still_runs_when_shutdown_fails(shutdown_error):
+    """If shutdown() completes with an error, initialize() must still run.
 
     This prevents a failed shutdown from leaving the request pool in a
-    permanently closed state.
+    permanently closed state. A request-raised TimeoutError is also a completed
+    failure, distinct from Hermes abandoning shutdown at its own deadline.
     """
     adapter = _make_adapter()
     adapter._polling_network_error_count = 1
 
     mock_app, mock_polling_req = _make_mock_app()
-    mock_polling_req.shutdown = AsyncMock(side_effect=Exception("shutdown boom"))
+    mock_polling_req.shutdown = AsyncMock(side_effect=shutdown_error)
     adapter._app = mock_app
     general_req = mock_app.bot._request[1]
 
@@ -215,16 +223,14 @@ async def test_general_pool_drain_is_bounded_when_close_hangs(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reconnect_continues_if_drain_hangs(monkeypatch):
-    """If the polling request drain HANGS (wedged httpx pool close on a
-    CLOSE-WAIT socket), the reconnect ladder must still advance rather than
-    freezing the tracked _polling_error_task forever.
+async def test_reconnect_quarantines_timed_out_drain(monkeypatch):
+    """A polling shutdown abandoned at the drain deadline is quarantined.
 
     Regression test for #66377: an unbounded ``shutdown()`` /
     ``initialize()`` in ``_drain_polling_connections`` leaves the handler
     task pending, which gates every escalation path and silently kills the
-    gateway. The drain awaits are bounded by ``_DRAIN_TIMEOUT``, so the
-    handler must complete and reach ``start_polling`` within a hard bound.
+    gateway. The bounded drain must still finish promptly, but the abandoned
+    request cannot be initialized or reconnected while shutdown may be alive.
     """
     adapter = _make_adapter()
     adapter._polling_network_error_count = 1
@@ -238,6 +244,7 @@ async def test_reconnect_continues_if_drain_hangs(monkeypatch):
     mock_polling_req.shutdown = AsyncMock(side_effect=_hang)
     mock_polling_req.initialize = AsyncMock(side_effect=_hang)
     adapter._app = mock_app
+    adapter._notify_fatal_error = AsyncMock()
 
     # Keep the drain timeout tiny so the test stays fast; the real default
     # is generous enough not to truncate healthy closes.
@@ -251,8 +258,12 @@ async def test_reconnect_continues_if_drain_hangs(monkeypatch):
             timeout=5,
         )
 
-    # Ladder advanced past the wedged drain despite it never returning.
-    mock_app.updater.start_polling.assert_called_once()
+    # The ladder advanced to fresh-adapter recovery without reusing the request.
+    mock_polling_req.shutdown.assert_awaited_once()
+    mock_polling_req.initialize.assert_not_awaited()
+    mock_app.updater.start_polling.assert_not_awaited()
+    assert adapter.has_fatal_error
+    adapter._notify_fatal_error.assert_awaited_once()
     assert adapter._polling_network_error_count == 2
     # The tracked task must not be stuck pending — otherwise every
     # escalation path stays gated behind an in-flight guard.
@@ -303,12 +314,14 @@ async def test_reconnect_stop_deadline_does_not_wait_for_cancel_cleanup(monkeypa
     adapter._app = mock_app
     adapter._notify_fatal_error = AsyncMock()
 
-    monkeypatch.setattr(tg_adapter, "_UPDATER_STOP_TIMEOUT", 0.01)
+    # Keep the test deadline short without depending on 10 ms thread-timer
+    # scheduling, which is not reliable on Windows under startup load.
+    monkeypatch.setattr(tg_adapter, "_UPDATER_STOP_TIMEOUT", 0.2)
     with patch("asyncio.sleep", new_callable=AsyncMock):
         recovery = asyncio.create_task(
             adapter._handle_polling_network_error(Exception("Timed out"))
         )
-        done, _ = await asyncio.wait({recovery}, timeout=0.2)
+        done, _ = await asyncio.wait({recovery}, timeout=1.5)
 
     try:
         assert recovery in done, (
@@ -321,6 +334,72 @@ async def test_reconnect_stop_deadline_does_not_wait_for_cancel_cleanup(monkeypa
         mock_updater.start_polling.assert_not_awaited()
     finally:
         release_stop.set()
+        if not recovery.done():
+            recovery.cancel()
+        await asyncio.gather(recovery, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_quarantines_cancellation_resistant_shutdown(monkeypatch):
+    """An abandoned polling shutdown must quarantine the request before retry.
+
+    Distinct from ``test_reconnect_quarantines_timed_out_drain``: that test's
+    ``_hang`` is cancellable, so the pre-existing ``asyncio.wait_for`` bound
+    also releases. httpcore's pool close runs under ``AsyncShieldCancellation``
+    (#58236/#63309), so Hermes abandons the task at its wall-clock deadline.
+    The old shutdown can still be running then; re-initializing or reconnecting
+    with that same request would race its unfinished cleanup. Recovery must
+    hand off to a fresh adapter instead.
+    """
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 1
+
+    mock_app, mock_polling_req = _make_mock_app()
+    release_close = asyncio.Event()
+    close_cancelled = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    async def _shielded_close():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            close_cancelled.set()
+            # Cancellation-resistant cleanup: swallows the cancel and waits.
+            await release_close.wait()
+            raise
+        finally:
+            close_finished.set()
+
+    mock_polling_req.shutdown = AsyncMock(side_effect=_shielded_close)
+    mock_polling_req.initialize = AsyncMock()
+    adapter._app = mock_app
+    adapter._notify_fatal_error = AsyncMock()
+
+    monkeypatch.setattr(tg_adapter, "_DRAIN_TIMEOUT", 0.05, raising=False)
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        recovery = asyncio.create_task(
+            adapter._handle_polling_network_error(Exception("Timed out"))
+        )
+        done, _ = await asyncio.wait({recovery}, timeout=2)
+
+    try:
+        assert recovery in done, (
+            "reconnect remained blocked waiting for cancellation-shielded "
+            "polling-pool shutdown() cleanup"
+        )
+        assert close_cancelled.is_set(), "drain must have cancelled the close"
+        assert adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_awaited_once()
+        mock_polling_req.initialize.assert_not_awaited()
+        mock_app.updater.start_polling.assert_not_awaited()
+        assert adapter._polling_error_task is None or adapter._polling_error_task.done()
+    finally:
+        release_close.set()
+        if close_cancelled.is_set():
+            await asyncio.wait_for(close_finished.wait(), timeout=1)
+        # On the unfixed baseline start_polling() still runs, so settle its
+        # verifier even when the assertions above expose the regression.
+        await _complete_current_polling_generation(adapter)
         if not recovery.done():
             recovery.cancel()
         await asyncio.gather(recovery, return_exceptions=True)
@@ -399,8 +478,7 @@ async def test_drain_helper_noop_without_app():
     """_drain_polling_connections must be a no-op when _app is None."""
     adapter = _make_adapter()
     adapter._app = None
-    # Should not raise
-    await adapter._drain_polling_connections()
+    assert await adapter._drain_polling_connections() is True
 
 
 # ── Heartbeat probe ──────────────────────────────────────────────────────
@@ -790,3 +868,112 @@ async def test_disconnect_advances_past_cancellation_swallowing_lifecycle(monkey
 
     release.set()
     await asyncio.wait({wedged}, timeout=0.2)
+
+
+# ---------------------------------------------------------------------------
+# Exception-graph walker + pool/connect classifier contracts (PR #98094
+# follow-up): the two classifiers previously had no direct tests at all.
+# ---------------------------------------------------------------------------
+class TestIterExceptionGraph:
+    def test_flat_single(self):
+        err = ValueError("boom")
+        assert list(tg_adapter._iter_exception_graph(err)) == [err]
+
+    def test_walks_cause_chain(self):
+        root = ValueError("root")
+        mid = RuntimeError("mid")
+        mid.__cause__ = root
+        top = Exception("top")
+        top.__cause__ = mid
+        seen = list(tg_adapter._iter_exception_graph(top))
+        assert top in seen and mid in seen and root in seen
+
+    def test_walks_context_chain(self):
+        root = ValueError("during handling")
+        top = RuntimeError("top")
+        top.__context__ = root
+        seen = list(tg_adapter._iter_exception_graph(top))
+        assert top in seen and root in seen
+
+    def test_cycle_guard(self):
+        a = ValueError("a")
+        b = RuntimeError("b")
+        a.__cause__ = b
+        b.__cause__ = a  # cycle
+        seen = list(tg_adapter._iter_exception_graph(a))
+        assert seen.count(a) == 1 and seen.count(b) == 1  # terminates, no dupes
+
+    def test_diamond_no_duplicates(self):
+        root = ValueError("root")
+        left = RuntimeError("left"); left.__cause__ = root
+        right = TypeError("right"); right.__cause__ = root
+        top = Exception("top"); top.__cause__ = left; top.__context__ = right
+        seen = list(tg_adapter._iter_exception_graph(top))
+        assert seen.count(root) == 1
+
+
+class TestPoolTimeoutClassifier:
+    def test_ptb_pool_timeout_message(self):
+        err = Exception(
+            "Pool timeout: All connections in the connection pool are occupied. "
+            "Request was *not* sent to Telegram."
+        )
+        assert TelegramAdapter._looks_like_pool_timeout(err) is True
+
+    def test_wrapped_httpx_pooltimeout_class(self):
+        try:
+            raise ConnectionError("inner")
+        except ConnectionError as inner:
+            err = Exception("Timed out")
+            err.__context__ = inner
+            assert TelegramAdapter._looks_like_pool_timeout(err) is False
+
+    def test_httpx_pooltimeout_class_name(self):
+        class FakePoolTimeout(Exception):
+            pass
+        err = Exception("Timed out")
+        err.__cause__ = FakePoolTimeout("x")
+        assert TelegramAdapter._looks_like_pool_timeout(err) is True
+
+    def test_generic_timeout_negative(self):
+        assert TelegramAdapter._looks_like_pool_timeout(Exception("Timed out")) is False
+        assert TelegramAdapter._looks_like_pool_timeout(Exception("Bad Gateway")) is False
+
+    def test_occupied_connection_pool_substring(self):
+        # Both substrings present -> match even without "pool timeout" phrasing.
+        assert TelegramAdapter._looks_like_pool_timeout(
+            Exception("All connections in the connection pool are occupied")
+        ) is True
+        # "occupied" alone (no "connection pool") must not match.
+        assert TelegramAdapter._looks_like_pool_timeout(
+            Exception("seat was occupied")
+        ) is False
+        # "connection pool" alone (no "occupied") must not match.
+        assert TelegramAdapter._looks_like_pool_timeout(
+            Exception("connection pool sizing")
+        ) is False
+
+
+class TestConnectTimeoutClassifier:
+    def test_class_name_match(self):
+        class FakeConnectTimeout(Exception):
+            pass
+        assert TelegramAdapter._looks_like_connect_timeout(FakeConnectTimeout("x")) is True
+
+    def test_message_match(self):
+        assert TelegramAdapter._looks_like_connect_timeout(
+            Exception("connect timeout")
+        ) is True
+        assert TelegramAdapter._looks_like_connect_timeout(
+            Exception("connect timed out")
+        ) is True
+
+    def test_wrapped_in_cause(self):
+        class FakeConnectTimeout(Exception):
+            pass
+        err = Exception("Timed out")
+        err.__cause__ = FakeConnectTimeout("x")
+        assert TelegramAdapter._looks_like_connect_timeout(err) is True
+
+    def test_generic_negative(self):
+        assert TelegramAdapter._looks_like_connect_timeout(Exception("Timed out")) is False
