@@ -1,0 +1,209 @@
+name: PR21 Patch 4 runtime AST inventory
+
+on:
+  push:
+    branches:
+      - codex/sync-hermes-v021-20260901
+    paths:
+      - .github/workflows/pr21-patch4-ast.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr21-patch4-runtime-ast
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    name: Inventory exact runtime delta
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_PARENT: 55e62d6fc7384c46256b637e6bb56edf1c223c51
+      SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
+      REPORT_DIR: /tmp/pr21-patch4-ast
+    steps:
+      - name: Checkout exact PR21 branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact head and immutable source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$GITHUB_SHA"
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
+          test "$(git rev-parse refs/remotes/origin/pr19-final)" = "$SOURCE_FINAL"
+
+      - name: Produce AST and full scoped diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            gateway/hosted_room_driver.py
+            gateway/hosted_room_discussion.py
+            tui_gateway/hosted_room_driver.py
+            tui_gateway/hosted_room_service.py
+            tests/gateway/test_hosted_room_driver.py
+            tests/gateway/test_hosted_room_gateway_lifecycle.py
+            tests/tui_gateway/test_hosted_room_driver_runtime.py
+            tests/tui_gateway/test_hosted_room_service.py
+          )
+          git diff --no-renames --stat HEAD "$SOURCE_FINAL" -- "${files[@]}" \
+            | tee "$REPORT_DIR/runtime-diff-stat.txt"
+          git diff --no-renames --unified=8 HEAD "$SOURCE_FINAL" -- "${files[@]}" \
+            > "$REPORT_DIR/runtime-full.diff"
+
+          python - <<'PY'
+          from __future__ import annotations
+
+          import ast
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          from typing import Any
+
+          source = os.environ["SOURCE_FINAL"]
+          report_dir = Path(os.environ["REPORT_DIR"])
+          files = (
+              "gateway/hosted_room_driver.py",
+              "gateway/hosted_room_discussion.py",
+              "tui_gateway/hosted_room_driver.py",
+              "tui_gateway/hosted_room_service.py",
+              "tests/gateway/test_hosted_room_driver.py",
+              "tests/gateway/test_hosted_room_gateway_lifecycle.py",
+              "tests/tui_gateway/test_hosted_room_driver_runtime.py",
+              "tests/tui_gateway/test_hosted_room_service.py",
+          )
+
+          def old(path: str) -> str:
+              return Path(path).read_text(encoding="utf-8")
+
+          def final(path: str) -> str:
+              return subprocess.check_output(
+                  ["git", "show", f"{source}:{path}"], text=True
+              )
+
+          def nodes(text: str) -> dict[str, ast.AST]:
+              return {
+                  node.name: node
+                  for node in ast.parse(text).body
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+              }
+
+          def methods(node: ast.ClassDef) -> dict[str, ast.AST]:
+              return {
+                  child.name: child
+                  for child in node.body
+                  if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+              }
+
+          def same(left: ast.AST, right: ast.AST) -> bool:
+              return ast.dump(left, include_attributes=False) == ast.dump(
+                  right, include_attributes=False
+              )
+
+          def segment(text: str, node: ast.AST) -> str:
+              value = ast.get_source_segment(text, node)
+              if value is None:
+                  raise RuntimeError("AST source segment unavailable")
+              return value.rstrip() + "\n"
+
+          report: dict[str, Any] = {}
+          source_segments: list[str] = []
+          for path in files:
+              current_text = old(path)
+              final_text = final(path)
+              current_nodes = nodes(current_text)
+              final_nodes = nodes(final_text)
+              changed_top: list[str] = []
+              missing_top: list[str] = []
+              current_only: list[str] = []
+              class_delta: dict[str, dict[str, list[str]]] = {}
+
+              for name in sorted(set(current_nodes) | set(final_nodes)):
+                  current_node = current_nodes.get(name)
+                  final_node = final_nodes.get(name)
+                  if current_node is None:
+                      missing_top.append(name)
+                      source_segments.extend(
+                          [f"# FILE {path} :: MISSING {name}", segment(final_text, final_node)]
+                      )
+                      continue
+                  if final_node is None:
+                      current_only.append(name)
+                      continue
+                  if not same(current_node, final_node):
+                      changed_top.append(name)
+                  if isinstance(current_node, ast.ClassDef) and isinstance(final_node, ast.ClassDef):
+                      current_methods = methods(current_node)
+                      final_methods = methods(final_node)
+                      changed_methods: list[str] = []
+                      missing_methods: list[str] = []
+                      current_only_methods: list[str] = []
+                      for method_name in sorted(set(current_methods) | set(final_methods)):
+                          current_method = current_methods.get(method_name)
+                          final_method = final_methods.get(method_name)
+                          if current_method is None:
+                              missing_methods.append(method_name)
+                              source_segments.extend(
+                                  [
+                                      f"# FILE {path} :: CLASS {name} :: MISSING {method_name}",
+                                      segment(final_text, final_method),
+                                  ]
+                              )
+                          elif final_method is None:
+                              current_only_methods.append(method_name)
+                          elif not same(current_method, final_method):
+                              changed_methods.append(method_name)
+                              source_segments.extend(
+                                  [
+                                      f"# FILE {path} :: CLASS {name} :: CHANGED {method_name}",
+                                      segment(final_text, final_method),
+                                  ]
+                              )
+                      if changed_methods or missing_methods or current_only_methods:
+                          class_delta[name] = {
+                              "changed": changed_methods,
+                              "missing_in_current": missing_methods,
+                              "current_only": current_only_methods,
+                          }
+                  elif not same(current_node, final_node):
+                      source_segments.extend(
+                          [f"# FILE {path} :: CHANGED {name}", segment(final_text, final_node)]
+                      )
+
+              report[path] = {
+                  "changed_top_level": changed_top,
+                  "missing_in_current": missing_top,
+                  "current_only": current_only,
+                  "class_methods": class_delta,
+              }
+
+          (report_dir / "runtime-ast.json").write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          (report_dir / "runtime-pr19-segments.py.txt").write_text(
+              "\n\n".join(source_segments).rstrip() + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload AST evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr21-patch4-runtime-ast
+          path: /tmp/pr21-patch4-ast/**
+          if-no-files-found: error
+          retention-days: 14
