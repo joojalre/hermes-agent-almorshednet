@@ -98,6 +98,73 @@ def build_hybrid(baseline_text: str, candidate_text: str) -> str:
         raise RuntimeError("unexpected stopping owner gate shape")
     hybrid_text = hybrid_text.replace(old_owner_gate, new_owner_gate, 1)
 
+    old_admission_interrupt = '''        if admission is not None:
+            admitted_transport, admitted_profile, admitted_session_id = admission
+            result = admitted_transport.interrupt(
+                profile=admitted_profile,
+                session_id=admitted_session_id,
+                source=ROOM_SESSION_SOURCE,
+                expected_task_id=task["identity"].task_id,
+            )
+            if result is None:
+                return False
+            if result.get("interrupted") is True or str(result.get("status") or "") in {
+                "cancelled",
+                "interrupted",
+                "stopping",
+            }:
+                return True
+            info = admitted_transport.info(
+                profile=admitted_profile,
+                session_id=admitted_session_id,
+                source=ROOM_SESSION_SOURCE,
+            )
+            return not bool(info.get("active", info.get("running", False)))
+'''
+    new_admission_interrupt = '''        if admission is not None:
+            admitted_transport, admitted_profile, admitted_session_id = admission
+            info = admitted_transport.info(
+                profile=admitted_profile,
+                session_id=admitted_session_id,
+                source=ROOM_SESSION_SOURCE,
+            )
+            active = bool(info.get("active", info.get("running", False)))
+            current = state.get_task(self.db_path, task["identity"])
+            if current["status"] in state.TERMINAL_STATUSES:
+                return True
+            if not active:
+                return True
+            if not _info_is_active_for(info, task["identity"], require_exact=True):
+                return False
+            result = admitted_transport.interrupt(
+                profile=admitted_profile,
+                session_id=admitted_session_id,
+                source=ROOM_SESSION_SOURCE,
+                expected_task_id=task["identity"].task_id,
+            )
+            if result is None:
+                return False
+            if result.get("interrupted") is True or str(result.get("status") or "") in {
+                "cancelled",
+                "interrupted",
+                "stopping",
+            }:
+                return True
+            info = admitted_transport.info(
+                profile=admitted_profile,
+                session_id=admitted_session_id,
+                source=ROOM_SESSION_SOURCE,
+            )
+            return not bool(info.get("active", info.get("running", False)))
+'''
+    if hybrid_text.count(old_admission_interrupt) != 1:
+        raise RuntimeError("unexpected local admission interrupt shape")
+    hybrid_text = hybrid_text.replace(
+        old_admission_interrupt,
+        new_admission_interrupt,
+        1,
+    )
+
     old_not_admitted = '''            if submit_attempted and bool(getattr(exc, "not_admitted", False)):
                 try:
                     state.requeue_not_admitted_task(
@@ -171,6 +238,7 @@ def main() -> None:
         "restored_current_methods": list(RESTORED_CURRENT_METHODS),
         "compatibility_adjustments": [
             "allow_current_runtime_attempt_through_owner_liveness_gate",
+            "probe_local_admission_before_interrupt_so_completion_wins",
             "retry_retryable_not_admitted_and_fail_proven_local_rejection",
         ],
         "baseline_sha256": hashlib.sha256(
