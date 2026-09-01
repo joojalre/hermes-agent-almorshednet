@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 70
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: bd8dbd95e92721c9c0e58f1f99cbc5f968474df2
+      EXPECTED_PARENT: 81f39d9053e1c39b5815b31b594f704c30e71307
       REPORT_DIR: /tmp/pr21-patch2-driver
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
@@ -80,6 +80,19 @@ jobs:
           set -euo pipefail
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
+
+      - name: Measure pre-Patch2 runtime baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          uv run python -m pytest \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py \
+            -q --tb=short > "$REPORT_DIR/runtime-baseline.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$REPORT_DIR/runtime-baseline.exit"
+          test "$rc" = "0" -o "$rc" = "1"
 
       - name: Add focused regressions without production changes
         shell: bash
@@ -169,13 +182,48 @@ jobs:
             tests/gateway/test_hosted_room_driver.py \
             -q --tb=short | tee "$REPORT_DIR/green-current-driver.log"
 
-      - name: GREEN current hosted-room runtime suite
+      - name: Verify Patch2 adds no runtime regression
         shell: bash
         run: |
           set -euo pipefail
+          set +e
           uv run python -m pytest \
             tests/tui_gateway/test_hosted_room_driver_runtime.py \
-            -q --tb=short | tee "$REPORT_DIR/green-runtime.log"
+            -q --tb=short > "$REPORT_DIR/runtime-after.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$REPORT_DIR/runtime-after.exit"
+          test "$rc" = "0" -o "$rc" = "1"
+          python - "$REPORT_DIR" <<'PY'
+          from pathlib import Path
+          import json
+          import re
+          import sys
+
+          report = Path(sys.argv[1])
+          pattern = re.compile(r"^FAILED (.+?) -", re.MULTILINE)
+          baseline = set(pattern.findall((report / "runtime-baseline.log").read_text()))
+          after = set(pattern.findall((report / "runtime-after.log").read_text()))
+          added = sorted(after - baseline)
+          resolved = sorted(baseline - after)
+          summary = {
+              "baseline_exit": int((report / "runtime-baseline.exit").read_text()),
+              "after_exit": int((report / "runtime-after.exit").read_text()),
+              "baseline_failures": sorted(baseline),
+              "after_failures": sorted(after),
+              "added_failures": added,
+              "resolved_failures": resolved,
+          }
+          (report / "runtime-comparison.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          if added:
+              raise SystemExit(f"Patch2 introduced runtime failures: {added}")
+          if not baseline and after:
+              raise SystemExit("Patch2 changed a green runtime baseline to red")
+          print(json.dumps(summary, sort_keys=True))
+          PY
 
       - name: Verify Patch 1 storage integration remains green
         shell: bash
@@ -268,7 +316,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch2-driver-evidence-v2
+          name: pr21-patch2-driver-evidence-v3
           path: /tmp/pr21-patch2-driver/**
           if-no-files-found: warn
           retention-days: 14
