@@ -22,8 +22,8 @@ jobs:
     timeout-minutes: 45
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 8829e77ff8e9c0a26e7345ed222e086840cc79ac
-      REPORT_DIR: /tmp/pr21-patch4-probe-v6
+      EXPECTED_PARENT: 7ce6835b69cf8a07db111126696e29a1a1b4ec67
+      REPORT_DIR: /tmp/pr21-patch4-probe-v7
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -45,7 +45,7 @@ jobs:
           git status --short | tee "$REPORT_DIR/start-status.txt"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.9.28"
           enable-cache: true
@@ -67,165 +67,12 @@ jobs:
           cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/current-runtime.py"
           python .github/scripts/pr21_patch4_probe.py | tee "$REPORT_DIR/apply.txt"
           cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/full-candidate-runtime.py"
-          python - <<'PY'
-          from __future__ import annotations
-
-          import ast
-          import hashlib
-          import json
-          from pathlib import Path
-
-          report_dir = Path("/tmp/pr21-patch4-probe-v6")
-          target = Path("tui_gateway/hosted_room_driver.py")
-          baseline_text = (report_dir / "current-runtime.py").read_text(encoding="utf-8")
-          hybrid_text = target.read_text(encoding="utf-8")
-          restored = (
-              "cancel",
-              "_execute_attempt",
-              "_process_room",
-              "_retry_stopping_tasks",
-          )
-
-          def class_method(text: str, method_name: str) -> ast.AST:
-              tree = ast.parse(text)
-              classes = [
-                  node
-                  for node in tree.body
-                  if isinstance(node, ast.ClassDef)
-                  and node.name == "HostedRoomRuntime"
-              ]
-              if len(classes) != 1:
-                  raise RuntimeError("HostedRoomRuntime class is ambiguous")
-              matches = [
-                  node
-                  for node in classes[0].body
-                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                  and node.name == method_name
-              ]
-              if len(matches) != 1:
-                  raise RuntimeError(
-                      f"expected one HostedRoomRuntime.{method_name}, found {len(matches)}"
-                  )
-              return matches[0]
-
-          def span(text: str, node: ast.AST) -> tuple[int, int]:
-              lines = text.splitlines(keepends=True)
-              offsets: list[int] = []
-              total = 0
-              for line in lines:
-                  offsets.append(total)
-                  total += len(line)
-              start_line = int(node.lineno)
-              decorators = getattr(node, "decorator_list", None) or ()
-              if decorators:
-                  start_line = min(
-                      start_line, *(int(item.lineno) for item in decorators)
-                  )
-              start = offsets[start_line - 1]
-              end_line = int(node.end_lineno)
-              end = offsets[end_line] if end_line < len(lines) else total
-              return start, end
-
-          for method_name in restored:
-              source_node = class_method(baseline_text, method_name)
-              target_node = class_method(hybrid_text, method_name)
-              source_start, source_end = span(baseline_text, source_node)
-              target_start, target_end = span(hybrid_text, target_node)
-              replacement = baseline_text[source_start:source_end].rstrip()
-              hybrid_text = (
-                  hybrid_text[:target_start]
-                  + replacement
-                  + "\n\n"
-                  + hybrid_text[target_end:].lstrip("\n")
-              ).rstrip() + "\n"
-              ast.parse(hybrid_text, filename=str(target))
-
-          old_owner_gate = '''        owner_state = self._stopping_owner_state(task)
-        if owner_state in {"alive", "unknown"}:
-            return False
-'''
-          new_owner_gate = '''        owner_state = self._stopping_owner_state(task)
-        with self._status_lock:
-            current_attempt_is_local = (
-                self._current_tasks.get(binding.room_id) == task["identity"]
-            )
-        if owner_state in {"alive", "unknown"} and not current_attempt_is_local:
-            return False
-'''
-          if hybrid_text.count(old_owner_gate) != 1:
-              raise RuntimeError("unexpected stopping owner gate shape")
-          hybrid_text = hybrid_text.replace(old_owner_gate, new_owner_gate, 1)
-
-          old_not_admitted = '''            if submit_attempted and bool(getattr(exc, "not_admitted", False)):
-                try:
-                    state.requeue_not_admitted_task(
-                        self.db_path,
-                        attempt,
-                        clock=self.clock,
-                    )
-                except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
-                    self._drop_lease(binding.room_id)
-                    self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
-                    self._record_error(
-                        f"task {attempt.identity.task_id} not-admitted proof lost "
-                        f"its fence: {fence_exc}"
-                    )
-                else:
-                    delay = self._defer_unavailable_route(task)
-                    self._record_error(
-                        f"task {attempt.identity.task_id} was not admitted; "
-                        f"queued for retry in {delay:g}s"
-                    )
-'''
-          new_not_admitted = '''            if submit_attempted and bool(getattr(exc, "not_admitted", False)):
-                if transport is self.rpc:
-                    self._settle_failure_if_current(attempt, exc)
-                else:
-                    try:
-                        state.requeue_not_admitted_task(
-                            self.db_path,
-                            attempt,
-                            clock=self.clock,
-                        )
-                    except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
-                        self._drop_lease(binding.room_id)
-                        self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
-                        self._record_error(
-                            f"task {attempt.identity.task_id} not-admitted proof lost "
-                            f"its fence: {fence_exc}"
-                        )
-                    else:
-                        delay = self._defer_unavailable_route(task)
-                        self._record_error(
-                            f"task {attempt.identity.task_id} was not admitted; "
-                            f"queued for retry in {delay:g}s"
-                        )
-'''
-          if hybrid_text.count(old_not_admitted) != 1:
-              raise RuntimeError("unexpected not-admitted branch shape")
-          hybrid_text = hybrid_text.replace(old_not_admitted, new_not_admitted, 1)
-          ast.parse(hybrid_text, filename=str(target))
-          target.write_text(hybrid_text, encoding="utf-8")
-
-          payload = {
-              "restored_current_methods": list(restored),
-              "compatibility_adjustments": [
-                  "allow_current_runtime_attempt_through_owner_gate",
-                  "settle_local_not_admitted_but_retry_peer_not_admitted",
-              ],
-              "baseline_sha256": hashlib.sha256(
-                  baseline_text.encode("utf-8")
-              ).hexdigest(),
-              "hybrid_sha256": hashlib.sha256(
-                  hybrid_text.encode("utf-8")
-              ).hexdigest(),
-          }
-          (report_dir / "hybrid-summary.json").write_text(
-              json.dumps(payload, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          print(json.dumps(payload, indent=2, sort_keys=True))
-          PY
+          python .github/scripts/pr21_patch4_hybrid.py \
+            --baseline "$REPORT_DIR/current-runtime.py" \
+            --candidate tui_gateway/hosted_room_driver.py \
+            --output tui_gateway/hosted_room_driver.py \
+            --report "$REPORT_DIR/hybrid-summary.json" \
+            | tee "$REPORT_DIR/hybrid-build.txt"
           cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/hybrid-runtime.py"
           git diff -- tui_gateway/hosted_room_driver.py \
             > "$REPORT_DIR/hybrid.patch"
@@ -233,20 +80,31 @@ jobs:
           python -m py_compile tui_gateway/hosted_room_driver.py
           git diff --check
 
+      - name: Prove test runner has no retry plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest --help > "$REPORT_DIR/pytest-help.txt"
+          if grep -F -- "--file-retries" "$REPORT_DIR/pytest-help.txt"; then
+            echo "unexpected file retry plugin is active" >&2
+            exit 1
+          fi
+          echo "single_execution_no_retry_plugin=true" \
+            | tee "$REPORT_DIR/retry-policy.txt"
+
       - name: Run exact Patch 4 target suite once
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           uv run python -m pytest \
             tests/tui_gateway/test_hosted_room_driver_runtime.py \
             -q --tb=short \
             | tee "$REPORT_DIR/target-suite.log"
 
       - name: Static verification
-        if: always()
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           uv run ruff check tui_gateway/hosted_room_driver.py \
             | tee "$REPORT_DIR/ruff-check.log"
           python -m compileall -q tui_gateway/hosted_room_driver.py
@@ -256,7 +114,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-probe-v6
-          path: /tmp/pr21-patch4-probe-v6/**
+          name: pr21-patch4-runtime-probe-v7
+          path: /tmp/pr21-patch4-probe-v7/**
           if-no-files-found: warn
           retention-days: 14
