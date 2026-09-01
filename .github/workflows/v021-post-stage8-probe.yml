@@ -1,0 +1,158 @@
+name: Hermes v0.21.0 post-stage8 replay probe
+
+on:
+  push:
+    branches:
+      - codex/v021-post-stage8-probe-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-post-stage8-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Replay remaining PR19 commits until first conflict
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout current candidate without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch exact PR19 history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-head
+          git config user.name "Hermes Post-Stage8 Probe"
+          git config user.email "hermes-post-stage8-probe@invalid.local"
+
+      - name: Replay locally and capture first conflict
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-post-stage8-probe"
+          mkdir -p "$REPORT/next-conflict/files"
+          START="$(git rev-parse HEAD)"
+          printf 'source\tresult\tlocal_head\n' > "$REPORT/replay.tsv"
+
+          COMMITS=(
+            acf3708e2475ca5f868bfc7326c5f76289177bb0
+            5af994bf71b710955ea4710a2198067b253ab3b6
+            e7d3e23562ee996a25c5e6ff025ef0fde90fe6a5
+            d3b9806383d10ee063333f39f1b8c4023ad9a685
+            e5780d2e9c9e40a14214fc2712e750aec6989c9e
+            37be945a99611cf3b5589746726e376b8164bcb6
+            d1ef0ea7d033e915ed1089c4612edbfdc4f445e1
+            c1875cad92ff6b005cb2523ee1bc89b116b5c2cd
+            4431c43453e8586ca1a8a42fae5b339d661fa126
+            27cbc9bbbb9ade9c9fe13d6549a2acf6b8292993
+            10618eb0979f4c3af980f8ce380d9c0fb06fc5ca
+            7c6a0c8e648b441bf89ecdef5e53c8410cd0d174
+            6db80964f7c25c99e577f6d550ad0568f833a5dd
+            b7f1acdef0308ac75f09c3aa41702686e420b599
+            20d0a6a42365b2b2351e1dca819022b6ec477b39
+          )
+
+          FAILED=""
+          FAILURE_KIND=""
+          for source in "${COMMITS[@]}"; do
+            parent_count="$(git rev-list --parents -n1 "$source" | awk '{print NF-1}')"
+            args=(cherry-pick)
+            if [ "$parent_count" -gt 1 ]; then
+              args+=(-m 1)
+            fi
+            args+=("$source")
+
+            set +e
+            git "${args[@]}" > "$REPORT/${source:0:12}.log" 2>&1
+            rc=$?
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+              printf '%s\tclean\t%s\n' "$source" "$(git rev-parse HEAD)" >> "$REPORT/replay.tsv"
+              continue
+            fi
+
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [ -n "$conflicts" ]; then
+              FAILED="$source"
+              FAILURE_KIND=conflict
+              printf '%s\tconflict\t%s\n' "$source" "$(git rev-parse HEAD)" >> "$REPORT/replay.tsv"
+              printf '%s\n' "$source" > "$REPORT/next-conflict/commit.txt"
+              printf '%s\n' "$conflicts" > "$REPORT/next-conflict/files.txt"
+              git status --short > "$REPORT/next-conflict/status.txt"
+
+              while IFS= read -r relative; do
+                [ -n "$relative" ] || continue
+                dir="$REPORT/next-conflict/files/$relative"
+                mkdir -p "$dir"
+                git show ":1:$relative" > "$dir/base" 2>/dev/null || true
+                git show ":2:$relative" > "$dir/current" 2>/dev/null || true
+                git show ":3:$relative" > "$dir/incoming" 2>/dev/null || true
+                git diff --no-index --histogram -- "$dir/base" "$dir/current" > "$dir/base-to-current.diff" || true
+                git diff --no-index --histogram -- "$dir/base" "$dir/incoming" > "$dir/base-to-incoming.diff" || true
+                git diff --no-index --histogram -- "$dir/current" "$dir/incoming" > "$dir/current-to-incoming.diff" || true
+              done <<< "$conflicts"
+              break
+            fi
+
+            if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 \
+              && git diff --cached --quiet \
+              && git diff --quiet; then
+              git cherry-pick --skip
+              printf '%s\tempty\t%s\n' "$source" "$(git rev-parse HEAD)" >> "$REPORT/replay.tsv"
+              continue
+            fi
+
+            FAILED="$source"
+            FAILURE_KIND=failed_without_conflict
+            printf '%s\tfailed_without_conflict\t%s\n' "$source" "$(git rev-parse HEAD)" >> "$REPORT/replay.tsv"
+            printf '%s\n' "$source" > "$REPORT/next-conflict/commit.txt"
+            git status --short > "$REPORT/next-conflict/status.txt"
+            break
+          done
+
+          if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1; then
+            git cherry-pick --abort || true
+          fi
+
+          python - "$REPORT/summary.json" "$START" "$FAILED" "$FAILURE_KIND" <<'PY'
+          import json
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          out, start, failed, failure_kind = sys.argv[1:]
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          Path(out).write_text(
+              json.dumps(
+                  {
+                      "candidate_start": start,
+                      "local_probe_head": head,
+                      "failed_commit": failed,
+                      "failure_kind": failure_kind,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload replay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-post-stage8-probe
+          path: ${{ runner.temp }}/hermes-v021-post-stage8-probe/**
+          if-no-files-found: error
+          retention-days: 14
