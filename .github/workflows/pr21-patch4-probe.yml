@@ -1,4 +1,4 @@
-name: PR21 Patch 4 runtime selective candidate probe
+name: PR21 Patch 4 runtime candidate AST probe
 
 on:
   push:
@@ -17,13 +17,13 @@ concurrency:
 
 jobs:
   probe:
-    name: Probe compatible runtime stop and liveness candidate
+    name: Inspect exact runtime candidate delta
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 8c928a4e41d11876f7214901f8736bb7e3e7467e
-      REPORT_DIR: /tmp/pr21-patch4-probe-v3
+      EXPECTED_PARENT: 0a6b0b728c5e25846f819f9f8e6a8cf21be19759
+      REPORT_DIR: /tmp/pr21-patch4-probe-v4
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -60,119 +60,117 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Apply candidate but preserve current attempt loop
+      - name: Apply candidate and record exact AST delta
         shell: bash
         run: |
           set -euo pipefail
           cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/current-runtime.py"
           python .github/scripts/pr21_patch4_probe.py | tee "$REPORT_DIR/apply.txt"
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/candidate-runtime.py"
+          git diff -- tui_gateway/hosted_room_driver.py \
+            > "$REPORT_DIR/candidate.patch"
+          git diff --stat | tee "$REPORT_DIR/candidate-stat.txt"
           python - <<'PY'
           from __future__ import annotations
 
           import ast
+          import hashlib
+          import json
           from pathlib import Path
 
-          target = Path("tui_gateway/hosted_room_driver.py")
-          baseline = Path("/tmp/pr21-patch4-probe-v3/current-runtime.py")
-          candidate_text = target.read_text(encoding="utf-8")
-          baseline_text = baseline.read_text(encoding="utf-8")
+          report_dir = Path("/tmp/pr21-patch4-probe-v4")
+          before = (report_dir / "current-runtime.py").read_text(encoding="utf-8")
+          after = (report_dir / "candidate-runtime.py").read_text(encoding="utf-8")
 
-          def method(text: str, class_name: str, method_name: str) -> ast.AST:
+          def digest(node: ast.AST) -> str:
+              rendered = ast.dump(node, include_attributes=False)
+              return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+          def inventory(text: str) -> dict[str, object]:
               tree = ast.parse(text)
-              classes = [
-                  node
-                  for node in tree.body
-                  if isinstance(node, ast.ClassDef) and node.name == class_name
-              ]
-              if len(classes) != 1:
-                  raise RuntimeError(
-                      f"expected one {class_name} class, found {len(classes)}"
-                  )
-              matches = [
-                  node
-                  for node in classes[0].body
-                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                  and node.name == method_name
-              ]
-              if len(matches) != 1:
-                  raise RuntimeError(
-                      f"expected one {class_name}.{method_name}, found {len(matches)}"
-                  )
-              return matches[0]
+              functions: dict[str, str] = {}
+              classes: dict[str, dict[str, str]] = {}
+              for node in tree.body:
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                      functions[node.name] = digest(node)
+                  elif isinstance(node, ast.ClassDef):
+                      methods: dict[str, str] = {}
+                      for child in node.body:
+                          if isinstance(
+                              child, (ast.FunctionDef, ast.AsyncFunctionDef)
+                          ):
+                              methods[child.name] = digest(child)
+                      classes[node.name] = methods
+              return {"functions": functions, "classes": classes}
 
-          def span(text: str, node: ast.AST) -> tuple[int, int]:
-              lines = text.splitlines(keepends=True)
-              offsets: list[int] = []
-              total = 0
-              for line in lines:
-                  offsets.append(total)
-                  total += len(line)
-              start_line = int(node.lineno)
-              decorators = getattr(node, "decorator_list", None) or ()
-              if decorators:
-                  start_line = min(
-                      start_line, *(int(item.lineno) for item in decorators)
-                  )
-              start = offsets[start_line - 1]
-              end_line = int(node.end_lineno)
-              end = offsets[end_line] if end_line < len(lines) else total
-              return start, end
-
-          current_node = method(
-              candidate_text, "HostedRoomRuntime", "_run_one_task"
+          left = inventory(before)
+          right = inventory(after)
+          changed_functions = sorted(
+              name
+              for name in set(left["functions"]) | set(right["functions"])
+              if left["functions"].get(name) != right["functions"].get(name)
           )
-          baseline_node = method(
-              baseline_text, "HostedRoomRuntime", "_run_one_task"
-          )
-          current_start, current_end = span(candidate_text, current_node)
-          baseline_start, baseline_end = span(baseline_text, baseline_node)
-          replacement = baseline_text[baseline_start:baseline_end].rstrip()
-          merged = (
-              candidate_text[:current_start]
-              + replacement
-              + "\n\n"
-              + candidate_text[current_end:].lstrip("\n")
-          ).rstrip() + "\n"
-          ast.parse(merged, filename=str(target))
-          restored_node = method(merged, "HostedRoomRuntime", "_run_one_task")
-          if ast.dump(restored_node, include_attributes=False) != ast.dump(
-              baseline_node, include_attributes=False
+          changed_methods: dict[str, list[str]] = {}
+          for class_name in sorted(
+              set(left["classes"]) | set(right["classes"])
           ):
-              raise RuntimeError("current _run_one_task was not restored exactly")
-          target.write_text(merged, encoding="utf-8")
+              left_methods = left["classes"].get(class_name, {})
+              right_methods = right["classes"].get(class_name, {})
+              changed = sorted(
+                  name
+                  for name in set(left_methods) | set(right_methods)
+                  if left_methods.get(name) != right_methods.get(name)
+              )
+              if changed:
+                  changed_methods[class_name] = changed
+
+          payload = {
+              "changed_top_level_functions": changed_functions,
+              "changed_class_methods": changed_methods,
+              "before_sha256": hashlib.sha256(before.encode("utf-8")).hexdigest(),
+              "after_sha256": hashlib.sha256(after.encode("utf-8")).hexdigest(),
+          }
+          (report_dir / "ast-diff.json").write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          markdown = [
+              "# Patch 4 candidate AST delta",
+              "",
+              "## Top-level functions",
+              "",
+              *[f"- `{name}`" for name in changed_functions],
+              "",
+              "## Class methods",
+              "",
+          ]
+          for class_name, names in changed_methods.items():
+              markdown.append(f"### `{class_name}`")
+              markdown.extend(f"- `{name}`" for name in names)
+              markdown.append("")
+          (report_dir / "ast-diff.md").write_text(
+              "\n".join(markdown).rstrip() + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(payload, indent=2, sort_keys=True))
           PY
           python -m py_compile tui_gateway/hosted_room_driver.py
           git diff --check
-          git diff --stat | tee "$REPORT_DIR/candidate-stat.txt"
-          git diff -- tui_gateway/hosted_room_driver.py \
-            > "$REPORT_DIR/candidate.patch"
-          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/candidate-runtime.py"
-
-      - name: Prove test runner has no retry plugin
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run python -m pytest --help > "$REPORT_DIR/pytest-help.txt"
-          if grep -F -- "--file-retries" "$REPORT_DIR/pytest-help.txt"; then
-            echo "unexpected file retry plugin is active" >&2
-            exit 1
-          fi
-          echo "single_execution_no_retry_plugin=true" \
-            | tee "$REPORT_DIR/retry-policy.txt"
 
       - name: Run exact Patch 4 target suite once
         shell: bash
         run: |
-          set -euo pipefail
+          set -o pipefail
           uv run python -m pytest \
             tests/tui_gateway/test_hosted_room_driver_runtime.py \
             -q --tb=short \
             | tee "$REPORT_DIR/target-suite.log"
 
       - name: Static verification
+        if: always()
         shell: bash
         run: |
-          set -euo pipefail
+          set -o pipefail
           uv run ruff check tui_gateway/hosted_room_driver.py \
             | tee "$REPORT_DIR/ruff-check.log"
           python -m compileall -q tui_gateway/hosted_room_driver.py
@@ -182,7 +180,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-probe-v3
-          path: /tmp/pr21-patch4-probe-v3/**
+          name: pr21-patch4-runtime-probe-v4
+          path: /tmp/pr21-patch4-probe-v4/**
           if-no-files-found: warn
           retention-days: 14
