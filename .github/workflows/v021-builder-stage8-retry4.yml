@@ -1,0 +1,87 @@
+name: Hermes v0.21.0 candidate builder stage 8 retry 4
+
+on:
+  push:
+    branches:
+      - codex/v021-builder-stage8-retry4-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hermes-v021-candidate-writer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Retry stage 8 with local-profile deferral and room identity persistence
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_REMOTE: c19e98fbf5e0ceb243d066e3e46a4f304fb8d606
+    steps:
+      - name: Checkout retry preparation and pinned resolver
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/v021-builder-stage8-retry4-20260901
+          path: control
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout pinned stage 8 source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: d6e92d7221deabbb0967829f7ef964924842f873
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout candidate branch with write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Prepare resolver for modern local and peer targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp source/.github/scripts/v021_replay_stage8.py "$RUNNER_TEMP/v021_replay_stage8_retry4.py"
+          python control/.github/scripts/v021_stage8_retry4_prepare.py \
+            --resolver "$RUNNER_TEMP/v021_replay_stage8_retry4.py" \
+            --candidate candidate
+          python -m py_compile "$RUNNER_TEMP/v021_replay_stage8_retry4.py"
+
+      - name: Reconcile room identity and replay until next conflict
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$RUNNER_TEMP/v021_replay_stage8_retry4.py" \
+            --repo candidate \
+            --report "$RUNNER_TEMP/hermes-v021-builder-stage8-retry4"
+
+      - name: Fast-forward candidate branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_head="$(git -C candidate ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$EXPECTED_REMOTE"
+          test -z "$(git -C candidate status --porcelain)"
+          git -C candidate merge-base --is-ancestor "$remote_head" HEAD
+          git -C candidate push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          pushed="$(git -C candidate ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$pushed" = "$(git -C candidate rev-parse HEAD)"
+          echo "pushed_head=$pushed" | tee -a "$RUNNER_TEMP/hermes-v021-builder-stage8-retry4/push.txt"
+
+      - name: Upload builder evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-builder-stage8-retry4
+          path: ${{ runner.temp }}/hermes-v021-builder-stage8-retry4/**
+          if-no-files-found: warn
+          retention-days: 14
