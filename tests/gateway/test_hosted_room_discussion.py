@@ -282,10 +282,16 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
     assert first.identity.thread_id == "thread-1"
     assert first.payload == {
         "target_profile": "research",
+        "target_member_id": "member-research",
         "prompt": first.payload["prompt"],
         "source_event_seq": user["seq"],
     }
-    assert set(first.payload) == {"target_profile", "prompt", "source_event_seq"}
+    assert set(first.payload) == {
+        "target_profile",
+        "target_member_id",
+        "prompt",
+        "source_event_seq",
+    }
 
     admitted = driver.admit_task(
         db,
@@ -313,6 +319,37 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
         )
         == first
     )
+
+
+def test_reconstructs_legacy_three_field_task_payload(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="Check the release.")
+    planned = _next_task(room, db)
+    legacy_payload = {
+        "target_profile": planned.payload["target_profile"],
+        "prompt": planned.payload["prompt"],
+        "source_event_seq": planned.payload["source_event_seq"],
+    }
+
+    driver.admit_task(
+        db,
+        planned.identity,
+        payload=legacy_payload,
+        clock=time.time,
+    )
+    stored = driver.get_task(db, planned.identity)
+    reconstructed = discussion.reconstruct_task_plan(
+        room,
+        _events(db),
+        stored,
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    assert stored["payload"] == legacy_payload
+    assert reconstructed == planned
+    assert reconstructed.payload["target_member_id"] == "member-research"
 
 
 @pytest.mark.parametrize(

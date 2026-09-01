@@ -400,6 +400,99 @@ def test_promote_replays_correlated_terminal_pair_with_its_reserve(
     ]
 
 
+def test_promote_replays_closing_room_activity_with_discussion_reserve(
+    tmp_path, monkeypatch
+):
+    adb = _authority_db(tmp_path)
+    rooms.create_room(
+        adb,
+        room_id="room-1",
+        name="Field Room",
+        members=MEMBERS,
+        authority_gateway_id=AUTH_A,
+    )
+    rooms.append_event(
+        adb,
+        room_id="room-1",
+        event_id="discussion-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "at the ordinary limit", "thread_id": "thread-1"},
+        authority_gateway_id=AUTH_A,
+        authority_epoch=1,
+    )
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 1)
+    monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 0)
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 3)
+    correlation = {
+        "task_id": "task-1",
+        "discussion_event_id": "discussion-1",
+        "member_id": "planner",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+    }
+    rooms.append_events(
+        adb,
+        events=[
+            {
+                "room_id": "room-1",
+                "event_id": "member-terminal-1",
+                "kind": "message.member",
+                "actor": {"kind": "member", "id": "planner"},
+                "payload": correlation,
+                "authority_gateway_id": AUTH_A,
+                "authority_epoch": 1,
+            },
+            {
+                "room_id": "room-1",
+                "event_id": "settled-terminal-1",
+                "kind": "turn.settled",
+                "actor": {"kind": "gateway", "id": AUTH_A},
+                "payload": {
+                    **correlation,
+                    "message_event_id": "member-terminal-1",
+                    "passed": False,
+                },
+                "authority_gateway_id": AUTH_A,
+                "authority_epoch": 1,
+            },
+        ],
+        allow_terminal_recovery=True,
+    )
+    rooms.append_event(
+        adb,
+        room_id="room-1",
+        event_id="activity-settled-1",
+        kind="room.activity",
+        actor={"kind": "gateway", "id": AUTH_A},
+        payload={
+            "status": "settled",
+            "reason_code": "complete",
+            "thread_id": "thread-1",
+            "discussion_event_id": "discussion-1",
+        },
+        authority_gateway_id=AUTH_A,
+        authority_epoch=1,
+    )
+    page = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb, room_id="room-1", room_name="Field Room", members=MEMBERS, page=page
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+
+    replicas.promote_replica(rdb, room_id="room-1")
+
+    replay = rooms.read_events(rdb, room_id="room-1", since_seq=0, limit=100)
+    assert [event["kind"] for event in replay["events"]] == [
+        "message.user",
+        "message.member",
+        "turn.settled",
+        "room.activity",
+        "authority.claimed",
+    ]
+
+
 def test_promote_refuses_when_active_room_capacity_is_full(tmp_path, monkeypatch):
     page = _seed_room(_authority_db(tmp_path), n_events=1)
     rdb = _replica_db(tmp_path)

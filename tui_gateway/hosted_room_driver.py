@@ -33,6 +33,7 @@ from typing import Any, ContextManager, Protocol, cast
 import psutil
 
 from gateway import hosted_room_driver as state
+from gateway import hosted_rooms
 
 _CANCEL_ROUTE_RETRIES = 8
 ROOM_SESSION_SOURCE = "bot_room"
@@ -643,9 +644,27 @@ class HostedRoomRuntime:
         if self.pending_action is None:
             return
         payload = task.get("payload") or {}
-        member_id = str(
-            payload.get("target_member_id") or payload.get("target_profile") or ""
-        )
+        target_member_id = payload.get("target_member_id")
+        if target_member_id is None:
+            target_profile = str(payload.get("target_profile") or "")
+            room = hosted_rooms.room_state(
+                self.db_path,
+                room_id=task["identity"].room_id,
+            )
+            matching_members = [
+                member
+                for member in room.get("members") or ()
+                if isinstance(member, Mapping)
+                and str(member.get("profile") or "") == target_profile
+            ]
+            if len(matching_members) != 1:
+                raise state.DriverStateError(
+                    "legacy task target profile does not match the frozen room roster"
+                )
+            target_member_id = matching_members[0].get("member_id") or target_profile
+        member_id = str(target_member_id or "")
+        if not member_id:
+            raise state.DriverStateError("task target member id is missing")
         approval = info.get("pending_approval") or info.get("approval")
         action = None
         if isinstance(approval, Mapping):

@@ -274,9 +274,13 @@ def _(rid, params: dict) -> dict:
 @method("groups.disband")
 def _(rid, params: dict) -> dict:
     """Permanently tombstone a hosted room id."""
+    import time
+
+    from gateway import hosted_room_driver as driver
     from gateway.hosted_rooms import (
         AuthorityConflictError,
         HostedRoomError,
+        RoomConflictError,
         RoomHistoryExpiredError,
         disband_room,
         local_authority_gateway_id,
@@ -288,8 +292,10 @@ def _(rid, params: dict) -> dict:
         if service is None:
             return _err(rid, 4123, _WORKER_UNAVAILABLE)
 
+        local_gateway_id = local_authority_gateway_id()
+        disband_barrier_reason = "room-disband"
+
         def disband_with_state(state: dict | None = None) -> dict:
-            local_gateway_id = local_authority_gateway_id()
             if state is not None and (
                 str(state["authority_gateway_id"]) != local_gateway_id
             ):
@@ -319,6 +325,27 @@ def _(rid, params: dict) -> dict:
         if existing.get("disbanded_at") is not None:
             tombstone = disband_with_state(existing)
             return _ok(rid, {"tombstone": tombstone})
+        expected_epoch = int(existing["authority_epoch"])
+        try:
+            barrier = driver.block_room_admissions(
+                service.db_path,
+                room_id=params.get("room_id"),
+                reason=disband_barrier_reason,
+                expected_gateway_id=local_gateway_id,
+                expected_epoch=expected_epoch,
+                clock=time.time,
+            )
+        except driver.StaleLeaseError as exc:
+            raise AuthorityConflictError("stale hosted room authority") from exc
+        if (
+            str(barrier.get("gateway_id") or "") != local_gateway_id
+            or int(barrier.get("authority_epoch") or 0) != expected_epoch
+        ):
+            raise AuthorityConflictError("stale hosted room authority")
+        if barrier.get("reason") != disband_barrier_reason:
+            raise RoomConflictError(
+                "room authority epoch is blocked for a different reason"
+            )
         service.stop_room(
             str(params.get("room_id") or ""),
             cancel_id=str(

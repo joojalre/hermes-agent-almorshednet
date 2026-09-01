@@ -2324,8 +2324,14 @@ def test_demote_barrier_blocks_post_stop_admission_from_another_process(
     assert result["authority_epoch"] == 2
 
 
-def test_cross_process_pending_approval_requires_exact_generation_and_owner_consumes(
+@pytest.mark.parametrize(
+    "legacy_payload",
+    [False, True],
+    ids=["current-payload", "legacy-payload"],
+)
+def test_cross_process_pending_approval_uses_frozen_member_id_and_exact_generation(
     tmp_path: Path,
+    legacy_payload: bool,
 ):
     class ApprovalRPC(_FakeRPC):
         def __init__(self) -> None:
@@ -2348,7 +2354,7 @@ def test_cross_process_pending_approval_requires_exact_generation_and_owner_cons
         name="Release room",
         members=[
             {"member_id": "default", "profile": "default", "handle": "hermes"},
-            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+            {"member_id": "member-ops", "profile": "ops", "handle": "ops"},
         ],
     )
     service.send(
@@ -2357,6 +2363,25 @@ def test_cross_process_pending_approval_requires_exact_generation_and_owner_cons
         payload={"text": "@ops inspect", "thread_id": "thread-1"},
     )
     task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    assert task["payload"]["target_member_id"] == "member-ops"
+    if legacy_payload:
+        legacy = dict(task["payload"])
+        legacy.pop("target_member_id")
+        _, payload_json, payload_digest = driver._task_payload(legacy)
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """UPDATE hosted_room_driver_tasks
+                      SET payload_json=?, payload_digest=?
+                    WHERE room_id=? AND task_id=?""",
+                (
+                    payload_json,
+                    payload_digest,
+                    task["identity"].room_id,
+                    task["identity"].task_id,
+                ),
+            )
+        task = driver.get_task(db, task["identity"])
+        assert "target_member_id" not in task["payload"]
     binding = service.bindings()[0]
     lease = driver.acquire_lease(
         db,
@@ -2387,12 +2412,12 @@ def test_cross_process_pending_approval_requires_exact_generation_and_owner_cons
     )
 
     action = service.status("room-1")["pending_actions"][0]
-    assert action["member_id"] == "ops"
+    assert action["member_id"] == "member-ops"
     assert action["approval"]["choices"] == ["once", "deny"]
     with pytest.raises(RuntimeError, match="no longer pending"):
         service.approve_room_task(
             "room-1",
-            member_id="ops",
+            member_id="member-ops",
             task_id=task["identity"].task_id,
             execution_generation=1,
             choice="once",
@@ -2406,7 +2431,7 @@ def test_cross_process_pending_approval_requires_exact_generation_and_owner_cons
         args=(
             str(db),
             "room-1",
-            "ops",
+            "member-ops",
             task["identity"].task_id,
             1,
             "approval-1",

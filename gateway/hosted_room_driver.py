@@ -58,7 +58,13 @@ TASK_STATUSES = frozenset({
 TERMINAL_STATUSES = frozenset({"settled", "failed", "cancelled"})
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
-_TASK_PAYLOAD_FIELDS = frozenset({"target_profile", "prompt", "source_event_seq"})
+_TASK_REQUIRED_PAYLOAD_FIELDS = frozenset({
+    "target_profile",
+    "prompt",
+    "source_event_seq",
+})
+_TASK_OPTIONAL_PAYLOAD_FIELDS = frozenset({"target_member_id"})
+_TASK_PAYLOAD_FIELDS = _TASK_REQUIRED_PAYLOAD_FIELDS | _TASK_OPTIONAL_PAYLOAD_FIELDS
 _LEASE_COLUMNS = frozenset({
     "room_id",
     "gateway_id",
@@ -307,7 +313,7 @@ def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
     if not isinstance(value, dict):
         raise DriverValidationError("payload must be an object")
     unknown = set(value) - _TASK_PAYLOAD_FIELDS
-    missing = _TASK_PAYLOAD_FIELDS - set(value)
+    missing = _TASK_REQUIRED_PAYLOAD_FIELDS - set(value)
     if unknown:
         raise DriverValidationError(
             f"unknown payload fields: {', '.join(sorted(unknown))}"
@@ -318,6 +324,11 @@ def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
         )
 
     target_profile = _identifier(value["target_profile"], label="target_profile")
+    target_member_id = (
+        _identifier(value["target_member_id"], label="target_member_id")
+        if "target_member_id" in value
+        else None
+    )
     prompt = value["prompt"]
     if not isinstance(prompt, str):
         raise DriverValidationError("prompt must be a string")
@@ -338,6 +349,8 @@ def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
         "prompt": prompt,
         "source_event_seq": source_event_seq,
     }
+    if target_member_id is not None:
+        normalized["target_member_id"] = target_member_id
     encoded = json.dumps(
         normalized,
         ensure_ascii=True,
@@ -1431,7 +1444,7 @@ def block_room_admissions(
     expected_epoch: Any,
     clock: Clock,
 ) -> dict[str, Any]:
-    """Permanently fence new tasks for one superseded room authority epoch."""
+    """Permanently fence new tasks for one room authority epoch."""
 
     room_id = _identifier(room_id, label="room_id")
     reason = _identifier(reason, label="admission barrier reason")

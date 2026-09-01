@@ -6,11 +6,11 @@ nothing about transports or model runtimes.  Callers persist the returned task
 with :mod:`gateway.hosted_room_driver` and append publication plans with
 :mod:`gateway.hosted_rooms`.
 
-The unpublished driver payload intentionally remains unchanged.  Discussion
-coordinates live in deterministic ``TaskIdentity`` values and typed terminal
-events; a restart can therefore reconstruct a task without widening the driver
-schema.  Callers must reconcile terminal driver rows into publication plans
-before asking for the next task.
+The driver payload keeps the target profile and, when it differs, the frozen
+roster member id. Discussion coordinates live in deterministic ``TaskIdentity``
+values and typed terminal events; a restart can therefore reconstruct both the
+current payload and legacy three-field rows. Callers must reconcile terminal
+driver rows into publication plans before asking for the next task.
 """
 
 from __future__ import annotations
@@ -1096,6 +1096,8 @@ def _make_task_plan(
         "prompt": prompt,
         "source_event_seq": discussion_event.seq,
     }
+    if member.member_id != member.profile:
+        payload["target_member_id"] = member.member_id
     return DiscussionTaskPlan(
         identity=identity,
         payload=payload,
@@ -1316,11 +1318,17 @@ def reconstruct_task_plan(
         raise DiscussionReconstructionError(
             "driver task has no valid identity or payload"
         )
-    if frozenset(payload) != frozenset({
+    required_payload_fields = frozenset({
         "target_profile",
         "prompt",
         "source_event_seq",
-    }):
+    })
+    allowed_payload_fields = required_payload_fields | frozenset({"target_member_id"})
+    payload_fields = frozenset(payload)
+    if (
+        not required_payload_fields.issubset(payload_fields)
+        or not payload_fields.issubset(allowed_payload_fields)
+    ):
         raise DiscussionReconstructionError("driver task payload shape changed")
     match = _TURN_ID_RE.fullmatch(identity.turn_id)
     if match is None:
@@ -1349,8 +1357,18 @@ def reconstruct_task_plan(
             "task identity does not match its room thread"
         )
     profile = payload.get("target_profile")
+    target_member_id = payload.get("target_member_id")
     member = next(
-        (candidate for candidate in room.members if candidate.profile == profile), None
+        (
+            candidate
+            for candidate in room.members
+            if candidate.profile == profile
+            and (
+                target_member_id is None
+                or candidate.member_id == target_member_id
+            )
+        ),
+        None,
     )
     if member is None or _member_digest(member) != match.group("member"):
         raise DiscussionReconstructionError("task target member does not match turn_id")
@@ -1368,9 +1386,12 @@ def reconstruct_task_plan(
         seen_through_seq=seen_through_seq,
         prompt=prompt,
     )
-    if reconstructed.identity != identity or dict(reconstructed.payload) != dict(
-        payload
-    ):
+    expected_payload = dict(reconstructed.payload)
+    if "target_member_id" not in payload:
+        expected_payload.pop("target_member_id", None)
+    elif "target_member_id" not in expected_payload:
+        expected_payload["target_member_id"] = member.member_id
+    if reconstructed.identity != identity or expected_payload != dict(payload):
         raise DiscussionReconstructionError(
             "driver task failed deterministic reconstruction"
         )

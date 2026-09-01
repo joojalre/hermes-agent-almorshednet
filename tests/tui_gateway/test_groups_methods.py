@@ -204,6 +204,93 @@ def test_groups_disband_generates_a_fresh_fence_for_each_attempt(home, monkeypat
     assert cancel_ids[2:] == ["explicit-disband", "explicit-disband"]
 
 
+def test_groups_disband_blocks_a_second_service_before_stop_and_tombstone(
+    home, monkeypatch
+):
+    from gateway import hosted_room_driver as driver
+    from gateway import hosted_rooms
+    from tui_gateway.hosted_room_service import HostedRoomService
+
+    _create_room()
+    service = methods_groups.get_hosted_room_service()
+    assert service is not None
+    competing_service = HostedRoomService(srv, db_path=service.db_path)
+    original_stop = service.stop_room
+    observed = {}
+
+    def stop_after_competing_send(room_id, *, cancel_id, require_acknowledged):
+        with pytest.raises(hosted_rooms.RoomAdmissionBlockedError) as blocked:
+            competing_service.send(
+                room_id=room_id,
+                event_id="racing-send",
+                payload={"text": "must not land", "thread_id": "thread-race"},
+            )
+        observed["reason"] = blocked.value.reason
+        observed["events"] = hosted_rooms.read_events(
+            service.db_path,
+            room_id=room_id,
+        )["events"]
+        observed["tasks"] = driver.list_tasks(service.db_path, room_id=room_id)
+        return original_stop(
+            room_id,
+            cancel_id=cancel_id,
+            require_acknowledged=require_acknowledged,
+        )
+
+    monkeypatch.setattr(service, "stop_room", stop_after_competing_send)
+
+    result = _result(srv._methods["groups.disband"](2, {"room_id": "room-1"}))
+
+    assert observed == {
+        "reason": "room_admissions_blocked",
+        "events": [],
+        "tasks": [],
+    }
+    assert result["tombstone"]["idempotent"] is False
+    events = hosted_rooms.read_events(
+        service.db_path,
+        room_id="room-1",
+        include_disbanded=True,
+    )["events"]
+    assert [event["kind"] for event in events] == [
+        "room.stop_requested",
+        "room.disbanded",
+    ]
+
+
+def test_groups_disband_rejects_an_existing_barrier_for_a_different_reason(
+    home, monkeypatch
+):
+    from gateway import hosted_room_driver as driver
+    from gateway.hosted_rooms import room_state
+
+    _create_room()
+    service = methods_groups.get_hosted_room_service()
+    assert service is not None
+    room = room_state(service.db_path, room_id="room-1")
+    driver.block_room_admissions(
+        service.db_path,
+        room_id="room-1",
+        reason="authority-demotion",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+        clock=lambda: 1.0,
+    )
+    stop_called = False
+
+    def record_stop(*_args, **_kwargs):
+        nonlocal stop_called
+        stop_called = True
+
+    monkeypatch.setattr(service, "stop_room", record_stop)
+
+    result = srv._methods["groups.disband"](2, {"room_id": "room-1"})
+
+    assert result["error"]["code"] == 4113
+    assert "different reason" in result["error"]["message"]
+    assert stop_called is False
+
+
 def test_groups_list_returns_bounded_pages(home):
     _create_room()
     _result(

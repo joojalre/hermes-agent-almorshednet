@@ -38,6 +38,7 @@ from gateway.hosted_rooms import (
     _CRITICAL_CONTROL_EVENT_KINDS,
     _assert_event_capacity,
     _canonical_json,
+    _closing_discussion_liability_keys,
     _connect,
     _correlated_terminal_task_ids,
     _is_terminal_recovery_plan,
@@ -491,6 +492,12 @@ def promote_replica(
                 for index, batch_event in enumerate(batch)
             ]
             terminal_recovery = _is_terminal_recovery_plan(batch_plan)
+            replay_events = [event for _, event in batch_plan]
+            closing_discussion_keys = _closing_discussion_liability_keys(
+                conn,
+                room_id=room_id,
+                events=replay_events,
+            )
             _assert_event_capacity(
                 conn,
                 room_id=room_id,
@@ -505,16 +512,19 @@ def promote_replica(
                     str(batch_event["kind"]) == "room.stop_requested"
                     for batch_event in batch
                 ),
-                allow_terminal_recovery=terminal_recovery,
+                allow_terminal_recovery=(
+                    terminal_recovery or bool(closing_discussion_keys)
+                ),
                 released_task_ids=(
                     _correlated_terminal_task_ids(
                         conn,
                         room_id=room_id,
-                        events=[event for _, event in batch_plan],
+                        events=replay_events,
                     )
                     if terminal_recovery
                     else frozenset()
                 ),
+                released_liability_keys=closing_discussion_keys,
             )
             for batch_event, event_bytes in zip(batch, batch_bytes, strict=True):
                 conn.execute(

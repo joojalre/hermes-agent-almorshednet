@@ -986,6 +986,14 @@ def _closing_discussion_liability_keys(
         if event.get("kind") != "room.activity":
             continue
         payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload_json = event.get("payload_json")
+            if not isinstance(payload_json, str):
+                continue
+            try:
+                payload = json.loads(payload_json)
+            except json.JSONDecodeError:
+                continue
         if not isinstance(payload, dict) or payload.get("status") not in {
             "settled",
             "bounded",
