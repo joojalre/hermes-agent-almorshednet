@@ -1,0 +1,86 @@
+name: Hermes v0.21.0 PR19 cherry-pick probe
+
+on:
+  push:
+    branches:
+      - codex/v021-pr19-cherry-probe-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-pr19-cherry-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Apply PR19 squash patch over v0.21.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout full fork history without credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run isolated cherry-pick probe
+        shell: bash
+        env:
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+          PR19_SQUASH: e6c06033a04d9745ed1efea97ce35401323dbfd7
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-pr19-cherry-probe"
+          WT="$RUNNER_TEMP/hermes-v021-pr19-worktree"
+          mkdir -p "$REPORT"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          git cat-file -e "$PR19_SQUASH^{commit}"
+
+          git worktree add --detach "$WT" "$RELEASE"
+          git -C "$WT" config user.name "Hermes PR19 Probe"
+          git -C "$WT" config user.email "pr19-probe@invalid.local"
+
+          set +e
+          git -C "$WT" cherry-pick --no-commit "$PR19_SQUASH" > "$REPORT/cherry-pick.log" 2>&1
+          EXIT=$?
+          set -e
+
+          git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/conflicts.txt" || true
+          git -C "$WT" status --short > "$REPORT/status.txt" || true
+          git -C "$WT" diff --cached --name-status > "$REPORT/staged-name-status.txt" || true
+          git -C "$WT" diff --cached --shortstat > "$REPORT/staged-shortstat.txt" || true
+          {
+            echo "release=$RELEASE"
+            echo "pr19_squash=$PR19_SQUASH"
+            echo "cherry_pick_exit=$EXIT"
+            echo "conflict_files=$(wc -l < "$REPORT/conflicts.txt" | tr -d ' ')"
+            echo "staged_files=$(wc -l < "$REPORT/staged-name-status.txt" | tr -d ' ')"
+          } | tee "$REPORT/summary.txt"
+
+          if [ "$EXIT" -eq 0 ]; then
+            echo "tree=$(git -C "$WT" write-tree)" > "$REPORT/result-tree.txt"
+            sed -n 's/^version = "\([^"]*\)"/project_version=\1/p' "$WT/pyproject.toml" | head -1 >> "$REPORT/result-tree.txt"
+            sed -n 's/^__version__ = "\([^"]*\)"/cli_version=\1/p' "$WT/hermes_cli/__init__.py" | head -1 >> "$REPORT/result-tree.txt"
+            sed -n 's/^__release_date__ = "\([^"]*\)"/release_date=\1/p' "$WT/hermes_cli/__init__.py" | head -1 >> "$REPORT/result-tree.txt"
+          fi
+
+          set +e
+          git -C "$WT" diff --cached --check > "$REPORT/diff-check.txt" 2>&1
+          echo "$?" > "$REPORT/diff-check.exit"
+          set -e
+
+          git worktree remove --force "$WT"
+
+      - name: Upload probe evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-pr19-cherry-probe
+          path: ${{ runner.temp }}/hermes-v021-pr19-cherry-probe/**
+          if-no-files-found: error
+          retention-days: 14
