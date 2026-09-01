@@ -1,0 +1,128 @@
+name: PR21 Patch 2 driver compatibility probe
+
+on:
+  push:
+    branches:
+      - codex/sync-hermes-v021-20260901
+    paths:
+      - .github/workflows/pr21-patch2-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr21-patch2-driver-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Probe final PR19 driver against v0.21 candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      REPORT_DIR: /tmp/pr21-patch2-driver-probe
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      NOUS_API_KEY: ""
+    steps:
+      - name: Checkout exact candidate without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify candidate and fetch immutable PR19 final head
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          git merge-base --is-ancestor 778d5d79d513317938a5df6fb31a58baca370960 HEAD
+          remote_head="$(git ls-remote origin refs/heads/codex/sync-hermes-v021-20260901 | awk '{print $1}')"
+          test "$remote_head" = "$GITHUB_SHA"
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
+          test "$(git rev-parse refs/remotes/origin/pr19-final)" = "20d0a6a42365b2b2351e1dca819022b6ec477b39"
+          git status --short | tee "$REPORT_DIR/start-status.txt"
+
+      - name: Capture current and final driver trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp gateway/hosted_room_driver.py "$REPORT_DIR/current-driver.py"
+          cp tests/gateway/test_hosted_room_driver.py "$REPORT_DIR/current-driver-tests.py"
+          git show 20d0a6a42365b2b2351e1dca819022b6ec477b39:gateway/hosted_room_driver.py \
+            > "$REPORT_DIR/final-driver.py"
+          git show 20d0a6a42365b2b2351e1dca819022b6ec477b39:tests/gateway/test_hosted_room_driver.py \
+            > "$REPORT_DIR/final-driver-tests.py"
+          python .github/scripts/pr21_patch2_probe.py \
+            --current "$REPORT_DIR/current-driver.py" \
+            --final "$REPORT_DIR/final-driver.py" \
+            --output "$REPORT_DIR"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11 and test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra dev
+
+      - name: Install final driver only in temporary checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$REPORT_DIR/final-driver.py" gateway/hosted_room_driver.py
+          python -m py_compile gateway/hosted_room_driver.py
+          uv run ruff check gateway/hosted_room_driver.py \
+            | tee "$REPORT_DIR/final-driver-ruff.log"
+
+      - name: Run candidate driver tests against final driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$REPORT_DIR/current-driver-tests.py" tests/gateway/test_hosted_room_driver.py
+          uv run python -m pytest tests/gateway/test_hosted_room_driver.py \
+            -q --tb=short | tee "$REPORT_DIR/current-tests-final-driver.log"
+
+      - name: Run candidate runtime tests against final driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py \
+            -q --tb=short | tee "$REPORT_DIR/runtime-tests-final-driver.log"
+
+      - name: Run final PR19 driver tests against final driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$REPORT_DIR/final-driver-tests.py" tests/gateway/test_hosted_room_driver.py
+          uv run python -m pytest tests/gateway/test_hosted_room_driver.py \
+            -q --tb=short | tee "$REPORT_DIR/final-tests-final-driver.log"
+
+      - name: Verify probe did not mutate remote state
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_head="$(git ls-remote origin refs/heads/codex/sync-hermes-v021-20260901 | awk '{print $1}')"
+          test "$remote_head" = "$GITHUB_SHA"
+          git diff --check
+          git status --short | tee "$REPORT_DIR/final-status.txt"
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr21-patch2-driver-probe
+          path: /tmp/pr21-patch2-driver-probe/**
+          if-no-files-found: error
+          retention-days: 14
