@@ -1,0 +1,92 @@
+name: Hermes v0.21.0 merge probe
+
+on:
+  push:
+    branches:
+      - codex/v021-merge-probe-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-merge-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Probe fork-main merge with v0.21.0 release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout fork snapshot without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch release and run isolated merge
+        shell: bash
+        env:
+          FORK_SNAPSHOT: e6c06033a04d9745ed1efea97ce35401323dbfd7
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-merge-probe"
+          WT="$RUNNER_TEMP/hermes-v021-merge-worktree"
+          mkdir -p "$REPORT"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          git cat-file -e "$FORK_SNAPSHOT^{commit}"
+
+          git worktree add --detach "$WT" "$FORK_SNAPSHOT"
+          git -C "$WT" config user.name "Hermes Sync Probe"
+          git -C "$WT" config user.email "sync-probe@invalid.local"
+
+          set +e
+          GIT_MERGE_AUTOEDIT=no git -C "$WT" merge --no-commit --no-ff "$RELEASE" > "$REPORT/merge.log" 2>&1
+          MERGE_EXIT=$?
+          set -e
+
+          git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/conflicts.txt" || true
+          git -C "$WT" status --short > "$REPORT/status.txt" || true
+          CONFLICTS="$(wc -l < "$REPORT/conflicts.txt" | tr -d ' ')"
+
+          {
+            echo "fork_snapshot=$FORK_SNAPSHOT"
+            echo "release_commit=$RELEASE"
+            echo "merge_exit=$MERGE_EXIT"
+            echo "conflict_files=$CONFLICTS"
+          } | tee "$REPORT/summary.txt"
+
+          if [ "$MERGE_EXIT" -eq 0 ]; then
+            MERGED_TREE="$(git -C "$WT" write-tree)"
+            PROJECT_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$WT/pyproject.toml" | head -1)"
+            CLI_VERSION="$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' "$WT/hermes_cli/__init__.py" | head -1)"
+            RELEASE_DATE="$(sed -n 's/^__release_date__ = "\([^"]*\)"/\1/p' "$WT/hermes_cli/__init__.py" | head -1)"
+            {
+              echo "merged_tree=$MERGED_TREE"
+              echo "project_version=$PROJECT_VERSION"
+              echo "cli_version=$CLI_VERSION"
+              echo "release_date=$RELEASE_DATE"
+            } | tee "$REPORT/merged-tree.txt"
+            git -C "$WT" diff --cached --shortstat > "$REPORT/index-shortstat.txt"
+            git -C "$WT" diff --cached --name-status > "$REPORT/index-name-status.txt"
+            set +e
+            git -C "$WT" diff --cached --check > "$REPORT/index-diff-check.txt" 2>&1
+            echo "$?" > "$REPORT/index-diff-check.exit"
+            set -e
+          fi
+
+          git worktree remove --force "$WT"
+
+      - name: Upload merge evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-merge-probe
+          path: ${{ runner.temp }}/hermes-v021-merge-probe/**
+          if-no-files-found: error
+          retention-days: 14
