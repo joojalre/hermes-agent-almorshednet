@@ -55,7 +55,6 @@ jobs:
 
           reset_wt() {
             git -C "$WT" cherry-pick --abort >/dev/null 2>&1 || true
-            git -C "$WT" checkout --detach "$RELEASE" >/dev/null
             git -C "$WT" reset --hard "$RELEASE" >/dev/null
             git -C "$WT" clean -fdx >/dev/null
           }
