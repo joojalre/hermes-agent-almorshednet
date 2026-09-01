@@ -1,0 +1,281 @@
+name: Hermes v0.21.0 fork patch matrix
+
+on:
+  push:
+    branches:
+      - codex/v021-patch-matrix-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-patch-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Test fork-only commits against v0.21.0 release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork history without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch immutable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+
+      - name: Build individual and grouped patch matrix
+        shell: bash
+        env:
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+          EXPECTED_FORK_MAIN: e6c06033a04d9745ed1efea97ce35401323dbfd7
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-patch-matrix"
+          WT="$RUNNER_TEMP/hermes-v021-patch-worktree"
+          mkdir -p "$REPORT/commit-logs" "$REPORT/group-logs"
+
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          ORIGIN_MAIN="$(git rev-parse refs/remotes/origin/main)"
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          test "$ORIGIN_MAIN" = "$EXPECTED_FORK_MAIN"
+
+          git worktree add --detach "$WT" "$RELEASE"
+          git -C "$WT" config user.name "Hermes Patch Matrix"
+          git -C "$WT" config user.email "hermes-patch-matrix@invalid.local"
+
+          reset_wt() {
+            git -C "$WT" cherry-pick --abort >/dev/null 2>&1 || true
+            git -C "$WT" checkout --detach "$RELEASE" >/dev/null
+            git -C "$WT" reset --hard "$RELEASE" >/dev/null
+            git -C "$WT" clean -fdx >/dev/null
+          }
+
+          cat > "$REPORT/commits.txt" <<'EOF'
+          9fec221fc2abf441c508080cf2b5709ab89eacaf|publishing|exclude_default
+          590210c696bbd1dc3d0793af7b252d852d8c6fb8|runtime|review
+          172fd45df4226f2432434b3c09eb183f1898125b|sync_snapshot|exclude_snapshot
+          e96023f2bad0de500b5d63e3dbc464e0c67ec951|windows|review
+          076605c76f992a0b6b766e51b523da1f1efa77b4|ci|review
+          8b006386f551a28580e739da50d5711cf3deab26|ci|review
+          06a24e5849a6ae6539dd0ad23da7632b943f5145|windows_sync_snapshot|extract_fix_only
+          f6b12d9743cbd62dccbe9a5a670063b709acdb43|ci|review
+          61a120d78d47d0ac1502cdb54567084a4e279d3b|knowledge|move_to_pr_b
+          df22b1629192bb8636fbcb8269b7669a797237ca|ci|review
+          679744ad1fe0bc47e2bc423974afb2fb6f58f043|ci|review
+          be91b1de493dce88a583d9251a9f1ab9ffe4a17f|ci|review
+          63b82f40bffefc1462093aebcccee2b53055a1eb|windows_tests|review
+          8355a1965e245845999de22df5d3e663523236c8|windows|review
+          10b16181b2682bb741e935b3cf4599cead63f283|knowledge|move_to_pr_b
+          4d0cc9d325566ba6441cabbd9dc441a7e0e95ca5|sync_snapshot|exclude_snapshot
+          e6c06033a04d9745ed1efea97ce35401323dbfd7|pr19|selective_preserve
+          EOF
+
+          printf 'sha|title|area|retention|changed_files|result|conflict_count|staged_count|conflict_paths\n' > "$REPORT/individual.tsv"
+
+          while IFS='|' read -r sha area retention; do
+            [ -n "$sha" ] || continue
+            reset_wt
+            title="$(git show -s --format=%s "$sha" | tr '\t|' '  ')"
+            parent="$(git show -s --format=%P "$sha" | awk '{print $1}')"
+            changed="$(git diff --find-renames --name-only "$parent" "$sha" | sed '/^$/d' | wc -l | tr -d ' ')"
+            log="$REPORT/commit-logs/${sha:0:12}.txt"
+
+            set +e
+            git -C "$WT" cherry-pick --no-commit "$sha" > "$log" 2>&1
+            rc=$?
+            set -e
+
+            conflict_paths="$(git -C "$WT" diff --name-only --diff-filter=U | paste -sd, -)"
+            conflict_count="$(git -C "$WT" diff --name-only --diff-filter=U | sed '/^$/d' | wc -l | tr -d ' ')"
+            staged_count="$(git -C "$WT" diff --cached --name-only | sed '/^$/d' | wc -l | tr -d ' ')"
+
+            if [ "$rc" -eq 0 ] && [ "$staged_count" -eq 0 ]; then
+              result=empty
+            elif [ "$rc" -eq 0 ]; then
+              result=clean
+            elif [ "$conflict_count" -gt 0 ]; then
+              result=conflict
+            else
+              result=failed_without_conflict
+            fi
+
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+              "$sha" "$title" "$area" "$retention" "$changed" "$result" \
+              "$conflict_count" "$staged_count" "$conflict_paths" \
+              >> "$REPORT/individual.tsv"
+          done < "$REPORT/commits.txt"
+
+          printf 'group|result|applied|empty|failed_sha|failure_kind|conflict_count|changed_files|diff_check_exit|shortstat\n' > "$REPORT/groups.tsv"
+
+          probe_group() {
+            name="$1"
+            shift
+            reset_wt
+            applied=0
+            empty=0
+            failed_sha=""
+            failure_kind=""
+            conflict_count=0
+            group_log="$REPORT/group-logs/$name.txt"
+            : > "$group_log"
+
+            for sha in "$@"; do
+              {
+                echo
+                echo "## $sha"
+              } >> "$group_log"
+              set +e
+              git -C "$WT" cherry-pick "$sha" >> "$group_log" 2>&1
+              rc=$?
+              set -e
+              echo "returncode=$rc" >> "$group_log"
+
+              if [ "$rc" -eq 0 ]; then
+                applied=$((applied + 1))
+                continue
+              fi
+
+              conflict_count="$(git -C "$WT" diff --name-only --diff-filter=U | sed '/^$/d' | wc -l | tr -d ' ')"
+              if [ "$conflict_count" -gt 0 ]; then
+                failed_sha="$sha"
+                failure_kind=conflict
+                git -C "$WT" diff --name-only --diff-filter=U >> "$group_log"
+                break
+              fi
+
+              if git -C "$WT" rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+                && git -C "$WT" diff --cached --quiet; then
+                git -C "$WT" cherry-pick --skip >> "$group_log" 2>&1 || true
+                empty=$((empty + 1))
+                continue
+              fi
+
+              failed_sha="$sha"
+              failure_kind=failed_without_conflict
+              break
+            done
+
+            if [ -n "$failed_sha" ]; then
+              git -C "$WT" cherry-pick --abort >/dev/null 2>&1 || true
+              result=failed
+            else
+              result=clean
+            fi
+
+            changed_files="$(git -C "$WT" diff --name-only "$RELEASE" HEAD | sed '/^$/d' | wc -l | tr -d ' ')"
+            shortstat="$(git -C "$WT" diff --shortstat "$RELEASE" HEAD | tr '|' '/')"
+            set +e
+            git -C "$WT" diff --check "$RELEASE" HEAD >> "$group_log" 2>&1
+            diff_check_exit=$?
+            set -e
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+              "$name" "$result" "$applied" "$empty" "$failed_sha" "$failure_kind" \
+              "$conflict_count" "$changed_files" "$diff_check_exit" "$shortstat" \
+              >> "$REPORT/groups.tsv"
+          }
+
+          probe_group ci_only \
+            076605c76f992a0b6b766e51b523da1f1efa77b4 \
+            8b006386f551a28580e739da50d5711cf3deab26 \
+            f6b12d9743cbd62dccbe9a5a670063b709acdb43 \
+            df22b1629192bb8636fbcb8269b7669a797237ca \
+            679744ad1fe0bc47e2bc423974afb2fb6f58f043 \
+            be91b1de493dce88a583d9251a9f1ab9ffe4a17f
+
+          probe_group windows_without_sync_snapshots \
+            e96023f2bad0de500b5d63e3dbc464e0c67ec951 \
+            63b82f40bffefc1462093aebcccee2b53055a1eb \
+            8355a1965e245845999de22df5d3e663523236c8
+
+          probe_group windows_with_sync_snapshot \
+            e96023f2bad0de500b5d63e3dbc464e0c67ec951 \
+            06a24e5849a6ae6539dd0ad23da7632b943f5145 \
+            63b82f40bffefc1462093aebcccee2b53055a1eb \
+            8355a1965e245845999de22df5d3e663523236c8
+
+          probe_group knowledge_only \
+            61a120d78d47d0ac1502cdb54567084a4e279d3b \
+            10b16181b2682bb741e935b3cf4599cead63f283
+
+          probe_group runtime_only \
+            590210c696bbd1dc3d0793af7b252d852d8c6fb8
+
+          probe_group pr19_whole \
+            e6c06033a04d9745ed1efea97ce35401323dbfd7
+
+          probe_group pr18_then_pr19 \
+            4d0cc9d325566ba6441cabbd9dc441a7e0e95ca5 \
+            e6c06033a04d9745ed1efea97ce35401323dbfd7
+
+          probe_group release_first_without_snapshots_or_pr19 \
+            590210c696bbd1dc3d0793af7b252d852d8c6fb8 \
+            e96023f2bad0de500b5d63e3dbc464e0c67ec951 \
+            076605c76f992a0b6b766e51b523da1f1efa77b4 \
+            8b006386f551a28580e739da50d5711cf3deab26 \
+            f6b12d9743cbd62dccbe9a5a670063b709acdb43 \
+            df22b1629192bb8636fbcb8269b7669a797237ca \
+            679744ad1fe0bc47e2bc423974afb2fb6f58f043 \
+            be91b1de493dce88a583d9251a9f1ab9ffe4a17f \
+            63b82f40bffefc1462093aebcccee2b53055a1eb \
+            8355a1965e245845999de22df5d3e663523236c8
+
+          probe_group release_first_with_knowledge_then_pr19 \
+            590210c696bbd1dc3d0793af7b252d852d8c6fb8 \
+            e96023f2bad0de500b5d63e3dbc464e0c67ec951 \
+            076605c76f992a0b6b766e51b523da1f1efa77b4 \
+            8b006386f551a28580e739da50d5711cf3deab26 \
+            f6b12d9743cbd62dccbe9a5a670063b709acdb43 \
+            df22b1629192bb8636fbcb8269b7669a797237ca \
+            679744ad1fe0bc47e2bc423974afb2fb6f58f043 \
+            be91b1de493dce88a583d9251a9f1ab9ffe4a17f \
+            61a120d78d47d0ac1502cdb54567084a4e279d3b \
+            10b16181b2682bb741e935b3cf4599cead63f283 \
+            63b82f40bffefc1462093aebcccee2b53055a1eb \
+            8355a1965e245845999de22df5d3e663523236c8 \
+            e6c06033a04d9745ed1efea97ce35401323dbfd7
+
+          {
+            echo "# Hermes v0.21.0 fork patch matrix"
+            echo
+            echo "- Release: \`$RELEASE\`"
+            echo "- Fork main snapshot: \`$ORIGIN_MAIN\`"
+            echo
+            echo "## Individual results"
+            echo
+            echo "| Commit | Title | Area | Retention | Files | Result | Conflicts |"
+            echo "|---|---|---|---|---:|---|---:|"
+            tail -n +2 "$REPORT/individual.tsv" | while IFS='|' read -r sha title area retention changed result conflicts staged paths; do
+              echo "| \`${sha:0:12}\` | $title | $area | $retention | $changed | $result | $conflicts |"
+            done
+            echo
+            echo "## Group results"
+            echo
+            echo "| Group | Result | Applied | Empty | Failed commit | Failure | Conflicts | Changed files | Diff check |"
+            echo "|---|---|---:|---:|---|---|---:|---:|---:|"
+            tail -n +2 "$REPORT/groups.tsv" | while IFS='|' read -r name result applied empty failed failure conflicts changed diffcheck shortstat; do
+              echo "| \`$name\` | $result | $applied | $empty | \`${failed:0:12}\` | $failure | $conflicts | $changed | $diffcheck |"
+            done
+          } > "$REPORT/REPORT.md"
+
+          git worktree remove --force "$WT"
+          tar -C "$REPORT" -czf "$RUNNER_TEMP/hermes-v021-patch-matrix.tgz" .
+
+      - name: Upload patch matrix evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-patch-matrix
+          path: |
+            ${{ runner.temp }}/hermes-v021-patch-matrix/**
+            ${{ runner.temp }}/hermes-v021-patch-matrix.tgz
+          if-no-files-found: error
+          retention-days: 14
