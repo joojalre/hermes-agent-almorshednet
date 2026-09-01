@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 70
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 0414d5604a459b67907cbfe6c0d1acadedc2bd21
+      EXPECTED_PARENT: bd8dbd95e92721c9c0e58f1f99cbc5f968474df2
       REPORT_DIR: /tmp/pr21-patch2-driver
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
@@ -94,19 +94,19 @@ jobs:
           git diff -- gateway/hosted_room_driver.py > "$REPORT_DIR/pre-red-driver.diff"
           test ! -s "$REPORT_DIR/pre-red-driver.diff"
 
-      - name: RED durable admission barrier API
+      - name: RED atomic Stop admission fence
         shell: bash
         run: |
           set -euo pipefail
           set +e
           uv run python -m pytest \
-            tests/gateway/test_hosted_room_driver_admission.py::test_durable_admission_barrier_blocks_new_tasks_idempotently \
+            tests/gateway/test_hosted_room_driver_admission.py::test_task_admission_is_atomically_fenced_by_latest_stop \
             -q --tb=short > "$REPORT_DIR/red-barrier.log" 2>&1
           rc=$?
           set -e
           echo "$rc" > "$REPORT_DIR/red-barrier.exit"
           test "$rc" = "1"
-          grep -F "block_room_admissions" "$REPORT_DIR/red-barrier.log"
+          grep -F "TaskAdmissionBlockedError" "$REPORT_DIR/red-barrier.log"
 
       - name: RED owner identity schema migration
         shell: bash
@@ -268,7 +268,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch2-driver-evidence
+          name: pr21-patch2-driver-evidence-v2
           path: /tmp/pr21-patch2-driver/**
           if-no-files-found: warn
           retention-days: 14
