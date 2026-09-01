@@ -1,0 +1,405 @@
+name: Hermes v0.21.0 PR19 replay stage 1
+
+on:
+  push:
+    branches:
+      - codex/v021-pr19-series-probe-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-pr19-replay-stage1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    name: Resolve first conflict and continue PR19 replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout fork history without credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Replay through the next conflict
+        shell: bash
+        env:
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+          PRELUDE_COMMIT: ca18e49eaeda7523fef201d756b8e081ec1bddb3
+          FIRST_CONFLICT_COMMIT: 3b323b078967ddb29ca0f792f007ccc6a559e79e
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-pr19-replay-stage1"
+          WT="$RUNNER_TEMP/hermes-v021-pr19-replay-stage1-worktree"
+          mkdir -p "$REPORT/next-conflict"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-head
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          git cat-file -e "$PRELUDE_COMMIT^{commit}"
+          git cat-file -e "$FIRST_CONFLICT_COMMIT^{commit}"
+
+          git worktree add --detach "$WT" "$RELEASE"
+          git -C "$WT" config user.name "Hermes PR19 Replay"
+          git -C "$WT" config user.email "pr19-replay@invalid.local"
+          git -C "$WT" config merge.conflictStyle diff3
+
+          git -C "$WT" cherry-pick --no-commit "$PRELUDE_COMMIT"
+          git -C "$WT" add -A
+          git -C "$WT" commit --no-gpg-sign --no-verify -C "$PRELUDE_COMMIT" >/dev/null
+          echo "$PRELUDE_COMMIT $(git -C "$WT" rev-parse HEAD)" > "$REPORT/applied.txt"
+
+          set +e
+          git -C "$WT" cherry-pick --no-commit "$FIRST_CONFLICT_COMMIT" > "$REPORT/first-cherry-pick.log" 2>&1
+          FIRST_RC=$?
+          set -e
+          test "$FIRST_RC" -ne 0
+
+          python - "$WT" <<'PY'
+          from __future__ import annotations
+
+          import re
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+
+          def resolve_blocks(path: str, resolver):
+              target = root / path
+              lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+              output: list[str] = []
+              index = 0
+              block = 0
+              while index < len(lines):
+                  if lines[index].startswith("<<<<<<< "):
+                      block += 1
+                      index += 1
+                      ours: list[str] = []
+                      while index < len(lines) and not lines[index].startswith("||||||| "):
+                          ours.append(lines[index])
+                          index += 1
+                      if index >= len(lines):
+                          raise RuntimeError(f"{path}: missing diff3 base marker")
+                      index += 1
+                      base: list[str] = []
+                      while index < len(lines) and not lines[index].startswith("======="):
+                          base.append(lines[index])
+                          index += 1
+                      if index >= len(lines):
+                          raise RuntimeError(f"{path}: missing separator")
+                      index += 1
+                      theirs: list[str] = []
+                      while index < len(lines) and not lines[index].startswith(">>>>>>> "):
+                          theirs.append(lines[index])
+                          index += 1
+                      if index >= len(lines):
+                          raise RuntimeError(f"{path}: missing end marker")
+                      index += 1
+                      replacement = resolver(
+                          block,
+                          "".join(ours),
+                          "".join(base),
+                          "".join(theirs),
+                      )
+                      if replacement and not replacement.endswith("\n"):
+                          replacement += "\n"
+                      output.append(replacement)
+                  else:
+                      output.append(lines[index])
+                      index += 1
+              rendered = "".join(output)
+              if any(marker in rendered for marker in ("<<<<<<<", "|||||||", ">>>>>>>")):
+                  raise RuntimeError(f"{path}: unresolved conflict marker")
+              target.write_text(rendered, encoding="utf-8")
+
+          resolve_blocks(
+              "gateway/hosted_rooms.py",
+              lambda _block, _ours, _base, theirs: theirs,
+          )
+          resolve_blocks(
+              "tests/gateway/test_hosted_rooms.py",
+              lambda _block, ours, _base, theirs: ours.rstrip() + "\n\n" + theirs.lstrip(),
+          )
+
+          def driver_runtime(block: int, ours: str, _base: str, theirs: str) -> str:
+              if block == 1:
+                  indent = re.match(r"(\s*)", ours).group(1)
+                  return f"{indent}rpc.history_failures = 1\n{indent}now[0] = 102.0\n"
+              if block in {2, 3}:
+                  return ours
+              raise RuntimeError(f"unexpected runtime conflict block {block}")
+
+          resolve_blocks(
+              "tests/tui_gateway/test_hosted_room_driver_runtime.py",
+              driver_runtime,
+          )
+
+          def service_tests(block: int, ours: str, _base: str, theirs: str) -> str:
+              if block == 1:
+                  return "import hashlib\nimport multiprocessing\n"
+              if block == 2:
+                  return theirs.rstrip() + "\n\n" + ours.lstrip()
+              raise RuntimeError(f"unexpected service-test conflict block {block}")
+
+          resolve_blocks(
+              "tests/tui_gateway/test_hosted_room_service.py",
+              service_tests,
+          )
+
+          def runtime_driver(_block: int, _ours: str, _base: str, _theirs: str) -> str:
+              # The common line following this diff3 block closes the fallback
+              # _find_terminal_receipt call. Keep the local durable proof first,
+              # then preserve the release's peer/session transport fallback.
+              return '''        receipt = _durable_terminal_receipt(
+                  state.get_terminal_receipt(
+                      self.db_path,
+                      task["identity"],
+                      execution_generation=int(task["execution_generation"]),
+                  )
+              )
+              if receipt is None:
+                  transport = self._transport_for(binding, task)
+                  if transport is None:
+                      return False
+                  profile = task["payload"]["target_profile"]
+                  session = transport.resolve_exact(
+                      profile=profile,
+                      title=room_session_title(binding.room_id),
+                      source=ROOM_SESSION_SOURCE,
+                  )
+                  if session is None:
+                      return False
+                  resumed = transport.resume(
+                      profile=profile,
+                      session_id=_session_id(session),
+                      source=ROOM_SESSION_SOURCE,
+                  )
+                  receipt = _find_terminal_receipt(
+                      transport.history(
+                          profile=profile,
+                          session_id=_session_id(resumed),
+                          source=ROOM_SESSION_SOURCE,
+                      ),
+                      task["identity"],
+                      int(task["execution_generation"]),
+          '''
+
+          resolve_blocks("tui_gateway/hosted_room_driver.py", runtime_driver)
+
+          service_path = root / "tui_gateway/hosted_room_service.py"
+          service_text = service_path.read_text(encoding="utf-8")
+          # Resolve the overlapping function to the release side temporarily,
+          # then replace the whole function with the combined durable/local +
+          # routed/peer contract below.
+          resolve_blocks(
+              "tui_gateway/hosted_room_service.py",
+              lambda _block, ours, _base, _theirs: ours,
+          )
+          service_text = service_path.read_text(encoding="utf-8")
+          start = service_text.index("    def approve_room_task(")
+          end = service_text.index("    def status(", start)
+          combined = '''    def approve_room_task(
+              self,
+              room_id: str,
+              *,
+              member_id: str,
+              task_id: str,
+              execution_generation: int,
+              choice: str,
+              request_id: str | None = None,
+          ) -> Mapping[str, Any]:
+              """Resolve one exact local or peer approval and wake observation."""
+
+              requested_approval_id = str(request_id or "")
+              if not requested_approval_id:
+                  raise RuntimeError("room approval is no longer pending")
+              if choice not in {"once", "deny"}:
+                  raise RuntimeError("room approval choice must be once or deny")
+
+              key = (room_id, member_id)
+              route = self.peer_routes.get(key)
+              client = self.peer_clients.get(key)
+              if route is not None:
+                  with self._policy_lock:
+                      action = self._pending_actions.get(key)
+                  pending_approval_id = str((action or {}).get("request_id") or "")
+                  if (
+                      action is None
+                      or action.get("task_id") != task_id
+                      or int(action.get("execution_generation") or 0)
+                      != execution_generation
+                      or requested_approval_id != pending_approval_id
+                  ):
+                      raise RuntimeError("room approval is no longer pending")
+                  approve = getattr(client, "approve_receipt", None)
+                  if not callable(approve):
+                      raise RuntimeError("room approval target is unavailable")
+                  result = approve(
+                      task_id=task_id,
+                      execution_generation=execution_generation,
+                      request_id=requested_approval_id,
+                      choice=choice,
+                      grant=route.grant,
+                  )
+                  if result is None:
+                      raise RuntimeError("room approval target is unavailable")
+                  with self._policy_lock:
+                      current = self._pending_actions.get(key)
+                      if (
+                          current is not None
+                          and str(current.get("request_id") or "")
+                          == requested_approval_id
+                          and current.get("task_id") == task_id
+                          and int(current.get("execution_generation") or 0)
+                          == execution_generation
+                      ):
+                          self._pending_actions.pop(key, None)
+              else:
+                  pending = next(
+                      (
+                          request
+                          for request in driver.list_pending_approval_requests(
+                              self.db_path,
+                              room_id=room_id,
+                          )
+                          if request["identity"].task_id == task_id
+                          and request["execution_generation"] == execution_generation
+                          and request["member_id"] == member_id
+                          and request["request_id"] == requested_approval_id
+                      ),
+                      None,
+                  )
+                  if pending is None:
+                      raise RuntimeError("room approval is no longer pending")
+                  result = driver.decide_approval_request(
+                      self.db_path,
+                      pending["identity"],
+                      execution_generation=execution_generation,
+                      member_id=member_id,
+                      request_id=requested_approval_id,
+                      choice=choice,
+                      clock=time.time,
+                  )
+
+              self.runtime.wakeup()
+              return result
+
+          '''
+          service_text = service_text[:start] + combined + service_text[end:]
+          service_path.write_text(service_text, encoding="utf-8")
+          PY
+
+          git -C "$WT" add \
+            gateway/hosted_rooms.py \
+            tests/gateway/test_hosted_rooms.py \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py \
+            tests/tui_gateway/test_hosted_room_service.py \
+            tui_gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_service.py
+          test -z "$(git -C "$WT" diff --name-only --diff-filter=U)"
+          ! grep -R -n -E '^(<<<<<<<|\|\|\|\|\|\|\||=======|>>>>>>>)' \
+            "$WT/gateway/hosted_rooms.py" \
+            "$WT/tests/gateway/test_hosted_rooms.py" \
+            "$WT/tests/tui_gateway/test_hosted_room_driver_runtime.py" \
+            "$WT/tests/tui_gateway/test_hosted_room_service.py" \
+            "$WT/tui_gateway/hosted_room_driver.py" \
+            "$WT/tui_gateway/hosted_room_service.py"
+          python -m compileall -q \
+            "$WT/gateway/hosted_rooms.py" \
+            "$WT/tests/gateway/test_hosted_rooms.py" \
+            "$WT/tests/tui_gateway/test_hosted_room_driver_runtime.py" \
+            "$WT/tests/tui_gateway/test_hosted_room_service.py" \
+            "$WT/tui_gateway/hosted_room_driver.py" \
+            "$WT/tui_gateway/hosted_room_service.py"
+          git -C "$WT" commit --no-gpg-sign --no-verify -C "$FIRST_CONFLICT_COMMIT" >/dev/null
+          echo "$FIRST_CONFLICT_COMMIT $(git -C "$WT" rev-parse HEAD)" >> "$REPORT/applied.txt"
+
+          cat > "$REPORT/remaining.txt" <<'COMMITS'
+          8d42059049e155c1e93f34505e63d3995cedb5b9
+          18d6a8ab71bc77183717d424bd83ee356808d8c0
+          b306ba41e62057d4f5d51c70493fdad0c8ae75df
+          60767cb87f3c532f003adc6448ec7aa6e1e925d4
+          28118f12865779ba02eb70d108bb49580322544a
+          87dec320debe42f6288d89327ee5d84669d8a2cf
+          36ac9d4be0a9222b20eba30e4f973d0d21eab4d3
+          b1ea144797a10c440b166d7b3cb79e24817b8173
+          327696f2770fcbcf711c954ec97533525bf98c76
+          e3fd97d9781aec7efc6ce6cd5d291dc81b024bd1
+          acf3708e2475ca5f868bfc7326c5f76289177bb0
+          5af994bf71b710955ea4710a2198067b253ab3b6
+          e7d3e23562ee996a25c5e6ff025ef0fde90fe6a5
+          d3b9806383d10ee063333f39f1b8c4023ad9a685
+          e5780d2e9c9e40a14214fc2712e750aec6989c9e
+          37be945a99611cf3b5589746726e376b8164bcb6
+          d1ef0ea7d033e915ed1089c4612edbfdc4f445e1
+          c1875cad92ff6b005cb2523ee1bc89b116b5c2cd
+          4431c43453e8586ca1a8a42fae5b339d661fa126
+          27cbc9bbbb9ade9c9fe13d6549a2acf6b8292993
+          10618eb0979f4c3af980f8ce380d9c0fb06fc5ca
+          7c6a0c8e648b441bf89ecdef5e53c8410cd0d174
+          6db80964f7c25c99e577f6d550ad0568f833a5dd
+          b7f1acdef0308ac75f09c3aa41702686e420b599
+          20d0a6a42365b2b2351e1dca819022b6ec477b39
+          COMMITS
+
+          : > "$REPORT/empty.txt"
+          replay_exit=0
+          failed_commit=""
+          while IFS= read -r commit; do
+            [ -n "$commit" ] || continue
+            parents=$(( $(git rev-list --parents -n1 "$commit" | wc -w) - 1 ))
+            args=(cherry-pick --no-commit)
+            if [ "$parents" -gt 1 ]; then
+              args+=(-m 1)
+            fi
+            args+=("$commit")
+            set +e
+            git -C "$WT" "${args[@]}" > "$REPORT/replay-$commit.log" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              replay_exit="$rc"
+              failed_commit="$commit"
+              git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/next-conflict/files.txt" || true
+              git -C "$WT" status --short > "$REPORT/next-conflict/status.txt" || true
+              break
+            fi
+            if git -C "$WT" diff --cached --quiet && git -C "$WT" diff --quiet; then
+              echo "$commit" >> "$REPORT/empty.txt"
+              continue
+            fi
+            git -C "$WT" add -A
+            git -C "$WT" commit --no-gpg-sign --no-verify -C "$commit" >/dev/null
+            echo "$commit $(git -C "$WT" rev-parse HEAD)" >> "$REPORT/applied.txt"
+          done < "$REPORT/remaining.txt"
+
+          {
+            echo "release=$RELEASE"
+            echo "first_resolution_commit=$FIRST_CONFLICT_COMMIT"
+            echo "applied=$(wc -l < "$REPORT/applied.txt" | tr -d ' ')"
+            echo "empty=$(wc -l < "$REPORT/empty.txt" | tr -d ' ')"
+            echo "replay_exit=$replay_exit"
+            echo "failed_commit=$failed_commit"
+            echo "candidate_head=$(git -C "$WT" rev-parse HEAD)"
+            echo "candidate_tree=$(git -C "$WT" rev-parse HEAD^{tree})"
+          } | tee "$REPORT/summary.txt"
+
+          if [ "$replay_exit" -eq 0 ]; then
+            git -C "$WT" diff "$RELEASE..HEAD" --check > "$REPORT/diff-check.txt"
+          fi
+
+          git worktree remove --force "$WT"
+
+      - name: Upload replay evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-pr19-replay-stage1
+          path: ${{ runner.temp }}/hermes-v021-pr19-replay-stage1/**
+          if-no-files-found: error
+          retention-days: 14
