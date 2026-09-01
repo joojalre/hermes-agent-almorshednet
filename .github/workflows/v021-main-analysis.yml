@@ -1,0 +1,213 @@
+name: Hermes v0.21.0 upstream-main analysis
+
+on:
+  push:
+    branches:
+      - codex/v021-main-analysis-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-main-analysis-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Compare fork with upstream main at 21b2095
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout fork without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch immutable refs and analyze
+        shell: bash
+        env:
+          EXPECTED_UPSTREAM_MAIN: 21b2095d00a98b8ad7b5c60b10587619c852cdb8
+          RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+          FORK_SNAPSHOT: e6c06033a04d9745ed1efea97ce35401323dbfd7
+          PR19_BASE: 4d0cc9d325566ba6441cabbd9dc441a7e0e95ca5
+          PR19_HEAD: 20d0a6a42365b2b2351e1dca819022b6ec477b39
+          PR20_BASE: 4d0cc9d325566ba6441cabbd9dc441a7e0e95ca5
+          PR20_HEAD: 46904b6a9129c8c8d20ecf5c5d1dabe4152dc604
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-main-analysis"
+          WT="$RUNNER_TEMP/hermes-v021-main-merge"
+          mkdir -p "$REPORT"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream \
+            refs/heads/main:refs/remotes/upstream/main \
+            refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          git fetch --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main \
+            refs/pull/19/head:refs/remotes/origin/pr19-head \
+            refs/heads/codex/harden-knowledge-sync-post-pr18-20260831:refs/remotes/origin/pr20-head
+
+          UPSTREAM_MAIN="$(git rev-parse refs/remotes/upstream/main)"
+          RELEASE_ACTUAL="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          ORIGIN_MAIN="$(git rev-parse refs/remotes/origin/main)"
+          test "$UPSTREAM_MAIN" = "$EXPECTED_UPSTREAM_MAIN"
+          test "$RELEASE_ACTUAL" = "$RELEASE"
+          test "$ORIGIN_MAIN" = "$FORK_SNAPSHOT"
+          test "$(git rev-parse refs/remotes/origin/pr19-head)" = "$PR19_HEAD"
+          test "$(git rev-parse refs/remotes/origin/pr20-head)" = "$PR20_HEAD"
+
+          {
+            echo "upstream_main=$UPSTREAM_MAIN"
+            echo "release=$RELEASE_ACTUAL"
+            echo "fork_snapshot=$FORK_SNAPSHOT"
+            echo "release_to_main_commits=$(git rev-list --count "$RELEASE_ACTUAL..$UPSTREAM_MAIN")"
+            echo "analysis_commit=$(git rev-parse HEAD)"
+          } | tee "$REPORT/refs.txt"
+
+          {
+            for spec in "upstream_main:$UPSTREAM_MAIN" "fork:$FORK_SNAPSHOT" "pr19:$PR19_HEAD" "pr20:$PR20_HEAD"; do
+              name="${spec%%:*}"; ref="${spec#*:}"
+              project="$(git show "$ref:pyproject.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1)"
+              cli="$(git show "$ref:hermes_cli/__init__.py" | sed -n 's/^__version__ = "\([^"]*\)"/\1/p' | head -1)"
+              date="$(git show "$ref:hermes_cli/__init__.py" | sed -n 's/^__release_date__ = "\([^"]*\)"/\1/p' | head -1)"
+              echo "$name project=$project cli=$cli release_date=$date"
+            done
+          } | tee "$REPORT/versions.txt"
+
+          git diff --shortstat "$UPSTREAM_MAIN" "$FORK_SNAPSHOT" > "$REPORT/main-vs-fork-shortstat.txt"
+          git diff --name-status --find-renames "$UPSTREAM_MAIN" "$FORK_SNAPSHOT" > "$REPORT/main-vs-fork-name-status.txt"
+          git diff --numstat --find-renames "$UPSTREAM_MAIN" "$FORK_SNAPSHOT" > "$REPORT/main-vs-fork-numstat.txt"
+
+          python - "$REPORT" "$UPSTREAM_MAIN" "$RELEASE_ACTUAL" "$FORK_SNAPSHOT" "$PR19_BASE" "$PR19_HEAD" "$PR20_BASE" "$PR20_HEAD" <<'PY'
+          import csv
+          import json
+          import subprocess
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          report = Path(sys.argv[1])
+          target, release, fork, pr19_base, pr19_head, pr20_base, pr20_head = sys.argv[2:]
+
+          def cmd(*args: str) -> str:
+              p = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if p.returncode:
+                  raise RuntimeError(f"{' '.join(args)} failed: {p.stderr}")
+              return p.stdout.strip()
+
+          def blob(ref: str, path: str):
+              p = subprocess.run(["git", "rev-parse", f"{ref}:{path}"], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+              return p.stdout.strip() if p.returncode == 0 else None
+
+          def paths(base: str, head: str):
+              out = cmd("git", "diff", "--find-renames", "--name-only", base, head)
+              return [line for line in out.splitlines() if line]
+
+          def classify(base: str, head: str, label: str):
+              rows = []
+              counts = Counter()
+              for path in paths(base, head):
+                  t = blob(target, path)
+                  r = blob(release, path)
+                  b = blob(base, path)
+                  h = blob(head, path)
+                  f = blob(fork, path)
+
+                  if t == h:
+                      category = "upstream_main_matches_final"
+                  elif t == b and h != b:
+                      category = "clean_patch_over_upstream_main"
+                  elif b is None and t is None and h is not None:
+                      category = "clean_add_over_upstream_main"
+                  elif h is None and t == b:
+                      category = "clean_delete_over_upstream_main"
+                  elif b == h:
+                      category = "no_effect"
+                  else:
+                      category = "overlap_requires_review"
+
+                  release_relation = (
+                      "release_matches_target" if r == t else
+                      "release_matches_pr_head" if r == h else
+                      "release_matches_pr_base" if r == b else
+                      "release_differs"
+                  )
+                  counts[category] += 1
+                  rows.append({
+                      "path": path,
+                      "category": category,
+                      "release_relation": release_relation,
+                      "target_blob": t or "MISSING",
+                      "release_blob": r or "MISSING",
+                      "base_blob": b or "MISSING",
+                      "head_blob": h or "MISSING",
+                      "fork_blob": f or "MISSING",
+                      "fork_matches_head": f == h,
+                  })
+
+              fieldnames = list(rows[0]) if rows else ["path"]
+              with (report / f"{label}.csv").open("w", newline="", encoding="utf-8") as fh:
+                  w = csv.DictWriter(fh, fieldnames=fieldnames)
+                  w.writeheader(); w.writerows(rows)
+
+              summary = {
+                  "changed_files": len(rows),
+                  "categories": dict(sorted(counts.items())),
+                  "paths": {cat: [r["path"] for r in rows if r["category"] == cat] for cat in sorted(counts)},
+              }
+              (report / f"{label}.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+              with (report / f"{label}.md").open("w", encoding="utf-8") as fh:
+                  fh.write(f"# {label}\n\nChanged files: {len(rows)}\n\n")
+                  for cat, count in sorted(counts.items()):
+                      fh.write(f"## {cat} ({count})\n\n")
+                      for row in rows:
+                          if row["category"] == cat:
+                              fh.write(f"- `{row['path']}` ({row['release_relation']})\n")
+                      fh.write("\n")
+
+          classify(pr19_base, pr19_head, "pr19-vs-upstream-main")
+          classify(pr20_base, pr20_head, "pr20-vs-upstream-main")
+          PY
+
+          git worktree add --detach "$WT" "$FORK_SNAPSHOT"
+          git -C "$WT" config user.name "Hermes Main Probe"
+          git -C "$WT" config user.email "main-probe@invalid.local"
+          set +e
+          GIT_MERGE_AUTOEDIT=no git -C "$WT" merge --no-commit --no-ff "$UPSTREAM_MAIN" > "$REPORT/merge.log" 2>&1
+          EXIT=$?
+          set -e
+          git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/conflicts.txt" || true
+          git -C "$WT" status --short > "$REPORT/merge-status.txt" || true
+          {
+            echo "merge_exit=$EXIT"
+            echo "conflict_files=$(wc -l < "$REPORT/conflicts.txt" | tr -d ' ')"
+          } | tee "$REPORT/merge-summary.txt"
+          git worktree remove --force "$WT"
+
+          {
+            echo "# Upstream main 21b2095 analysis"
+            echo
+            cat "$REPORT/refs.txt"
+            cat "$REPORT/versions.txt"
+            echo
+            echo "## Tree difference"
+            cat "$REPORT/main-vs-fork-shortstat.txt"
+            echo
+            echo "## Merge probe"
+            cat "$REPORT/merge-summary.txt"
+            echo
+            cat "$REPORT/pr19-vs-upstream-main.md"
+            echo
+            cat "$REPORT/pr20-vs-upstream-main.md"
+          } > "$REPORT/REPORT.md"
+
+      - name: Upload upstream-main evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-main-analysis
+          path: ${{ runner.temp }}/hermes-v021-main-analysis/**
+          if-no-files-found: error
+          retention-days: 14
