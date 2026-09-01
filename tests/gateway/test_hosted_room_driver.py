@@ -588,7 +588,7 @@ def test_stop_intent_fences_pending_approval_decision(db):
         clock=clock,
     )
 
-    with pytest.raises(driver.StaleTaskError, match="running task"):
+    with pytest.raises(driver.StaleTaskError, match="no longer running"):
         driver.decide_approval_request(
             db,
             identity,
