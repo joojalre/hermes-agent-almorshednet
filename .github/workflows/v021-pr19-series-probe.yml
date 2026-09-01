@@ -1,0 +1,174 @@
+name: Hermes v0.21.0 PR19 series probe
+
+on:
+  push:
+    branches:
+      - codex/v021-pr19-series-probe-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-pr19-series-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Replay only PR19 commits absent from release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork history without credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify and replay PR19 series
+        shell: bash
+        env:
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+          UPSTREAM_CUTOFF: a9c783f21995723c812dcb2f8ae58bc6a4323e2f
+          PR19_BASE: 4d0cc9d325566ba6441cabbd9dc441a7e0e95ca5
+          PR19_HEAD: 20d0a6a42365b2b2351e1dca819022b6ec477b39
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-pr19-series"
+          WT="$RUNNER_TEMP/hermes-v021-pr19-series-worktree"
+          mkdir -p "$REPORT/conflicts"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-head
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          FETCHED_HEAD="$(git rev-parse refs/remotes/origin/pr19-head)"
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          test "$FETCHED_HEAD" = "$PR19_HEAD"
+          git merge-base --is-ancestor "$PR19_BASE" "$PR19_HEAD"
+          git merge-base --is-ancestor "$UPSTREAM_CUTOFF" "$RELEASE"
+
+          patch_id() {
+            local commit="$1"
+            if [ "$(git rev-list --parents -n1 "$commit" | wc -w | tr -d ' ')" -ne 2 ]; then
+              return 0
+            fi
+            git show --pretty=format: --binary "$commit" | git patch-id --stable | awk '{print $1}'
+          }
+
+          declare -A RELEASE_PATCHES=()
+          while IFS= read -r commit; do
+            pid="$(patch_id "$commit" || true)"
+            if [ -n "$pid" ]; then
+              RELEASE_PATCHES["$pid"]="$commit"
+            fi
+          done < <(git rev-list --reverse --no-merges "$UPSTREAM_CUTOFF..$RELEASE")
+
+          printf 'ordinal\tcommit\tparents\tfiles\tinsertions\tdeletions\tpatch_id\tclassification\trelease_match\tsubject\n' > "$REPORT/series.tsv"
+          : > "$REPORT/local-candidates.txt"
+          : > "$REPORT/already-in-release.txt"
+          : > "$REPORT/sync-anchors.txt"
+
+          ordinal=0
+          while IFS= read -r commit; do
+            ordinal=$((ordinal + 1))
+            subject="$(git show -s --format=%s "$commit")"
+            parents=$(( $(git rev-list --parents -n1 "$commit" | wc -w) - 1 ))
+            stats="$(git show --numstat --format= "$commit" | awk 'BEGIN{f=0;i=0;d=0} NF>=3{f++; if($1~/^[0-9]+$/)i+=$1; if($2~/^[0-9]+$/)d+=$2} END{printf "%d\t%d\t%d",f,i,d}')"
+            pid="$(patch_id "$commit" || true)"
+            classification="local_candidate"
+            release_match=""
+
+            case "$subject" in
+              chore:\ sync\ fork*|chore:\ reconcile\ fork*)
+                classification="sync_anchor"
+                ;;
+              *)
+                if [ -n "$pid" ] && [ -n "${RELEASE_PATCHES[$pid]:-}" ]; then
+                  classification="already_in_release"
+                  release_match="${RELEASE_PATCHES[$pid]}"
+                fi
+                ;;
+            esac
+
+            safe_subject="${subject//$'\t'/ }"
+            printf '%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n' \
+              "$ordinal" "$commit" "$parents" "$stats" "${pid:-}" "$classification" "$release_match" "$safe_subject" \
+              >> "$REPORT/series.tsv"
+
+            case "$classification" in
+              local_candidate) echo "$commit" >> "$REPORT/local-candidates.txt" ;;
+              already_in_release) echo "$commit $release_match" >> "$REPORT/already-in-release.txt" ;;
+              sync_anchor) echo "$commit" >> "$REPORT/sync-anchors.txt" ;;
+            esac
+          done < <(git rev-list --reverse --ancestry-path "$PR19_BASE..$PR19_HEAD")
+
+          git worktree add --detach "$WT" "$RELEASE"
+          git -C "$WT" config user.name "Hermes PR19 Series Probe"
+          git -C "$WT" config user.email "pr19-series-probe@invalid.local"
+
+          : > "$REPORT/applied.txt"
+          : > "$REPORT/skipped-empty.txt"
+          : > "$REPORT/replay-summary.txt"
+          replay_exit=0
+          failed_commit=""
+
+          while IFS= read -r commit; do
+            [ -n "$commit" ] || continue
+            set +e
+            git -C "$WT" cherry-pick --no-commit "$commit" > "$REPORT/replay-$commit.log" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              failed_commit="$commit"
+              replay_exit="$rc"
+              git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/conflicts/$commit.txt" || true
+              git -C "$WT" status --short > "$REPORT/failed-status.txt" || true
+              break
+            fi
+
+            if git -C "$WT" diff --cached --quiet && git -C "$WT" diff --quiet; then
+              echo "$commit" >> "$REPORT/skipped-empty.txt"
+              git -C "$WT" cherry-pick --abort >/dev/null 2>&1 || true
+              continue
+            fi
+
+            git -C "$WT" add -A
+            git -C "$WT" commit --no-gpg-sign --no-verify -C "$commit" >/dev/null
+            echo "$commit $(git -C "$WT" rev-parse HEAD)" >> "$REPORT/applied.txt"
+          done < "$REPORT/local-candidates.txt"
+
+          {
+            echo "release=$RELEASE"
+            echo "pr19_base=$PR19_BASE"
+            echo "pr19_head=$PR19_HEAD"
+            echo "series_commits=$(($(wc -l < "$REPORT/series.tsv") - 1))"
+            echo "local_candidates=$(wc -l < "$REPORT/local-candidates.txt" | tr -d ' ')"
+            echo "already_in_release=$(wc -l < "$REPORT/already-in-release.txt" | tr -d ' ')"
+            echo "sync_anchors=$(wc -l < "$REPORT/sync-anchors.txt" | tr -d ' ')"
+            echo "applied=$(wc -l < "$REPORT/applied.txt" | tr -d ' ')"
+            echo "empty=$(wc -l < "$REPORT/skipped-empty.txt" | tr -d ' ')"
+            echo "replay_exit=$replay_exit"
+            echo "failed_commit=$failed_commit"
+          } | tee "$REPORT/replay-summary.txt"
+
+          if [ "$replay_exit" -eq 0 ]; then
+            echo "candidate_head=$(git -C "$WT" rev-parse HEAD)" > "$REPORT/candidate.txt"
+            echo "candidate_tree=$(git -C "$WT" rev-parse HEAD^{tree})" >> "$REPORT/candidate.txt"
+            sed -n 's/^version = "\([^"]*\)"/project_version=\1/p' "$WT/pyproject.toml" | head -1 >> "$REPORT/candidate.txt"
+            sed -n 's/^__version__ = "\([^"]*\)"/cli_version=\1/p' "$WT/hermes_cli/__init__.py" | head -1 >> "$REPORT/candidate.txt"
+            set +e
+            git -C "$WT" diff "$RELEASE..HEAD" --check > "$REPORT/candidate-diff-check.txt" 2>&1
+            echo "$?" > "$REPORT/candidate-diff-check.exit"
+            set -e
+          fi
+
+          git worktree remove --force "$WT"
+
+      - name: Upload series evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-pr19-series-probe
+          path: ${{ runner.temp }}/hermes-v021-pr19-series/**
+          if-no-files-found: error
+          retention-days: 14
