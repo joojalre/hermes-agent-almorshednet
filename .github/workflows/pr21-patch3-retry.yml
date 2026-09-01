@@ -17,13 +17,14 @@ concurrency:
 
 jobs:
   apply:
-    name: RED GREEN replica correctness retry
+    name: RED GREEN replica correctness and demotion RPC
     runs-on: ubuntu-latest
     timeout-minutes: 70
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: c4ba628bfc3733e53032b0529100e3c5d0794c17
-      REPORT_DIR: /tmp/pr21-patch3-replica-v3
+      EXPECTED_PARENT: c9762fa3fca4e94954a0d6976161c5100cbb4548
+      REPORT_DIR: /tmp/pr21-patch3-replica-v4
+      SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -43,7 +44,7 @@ jobs:
           test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
           test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$GITHUB_SHA"
           git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
-          test "$(git rev-parse refs/remotes/origin/pr19-final)" = "20d0a6a42365b2b2351e1dca819022b6ec477b39"
+          test "$(git rev-parse refs/remotes/origin/pr19-final)" = "$SOURCE_FINAL"
           git status --short | tee "$REPORT_DIR/start-status.txt"
 
       - name: Install uv
@@ -62,7 +63,7 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Verify baseline and write focused tests only
+      - name: Verify replica baseline and write focused tests only
         shell: bash
         run: |
           set -euo pipefail
@@ -74,7 +75,7 @@ jobs:
           git diff -- gateway/hosted_room_replicas.py > "$REPORT_DIR/pre-red-production.diff"
           test ! -s "$REPORT_DIR/pre-red-production.diff"
 
-      - name: Prove RED cases before production change
+      - name: Prove RED replica cases before production change
         shell: bash
         run: |
           set -euo pipefail
@@ -103,12 +104,15 @@ jobs:
           from pathlib import Path
 
           path = Path("gateway/hosted_room_replicas.py")
-          path.write_text(path.read_text(encoding="utf-8").rstrip() + "\n", encoding="utf-8")
+          path.write_text(
+              path.read_text(encoding="utf-8").rstrip() + "\n",
+              encoding="utf-8",
+          )
           PY
           python -m py_compile gateway/hosted_room_replicas.py
           git diff --check
 
-      - name: Verify focused and existing replica suites
+      - name: GREEN focused and existing replica suites
         shell: bash
         run: |
           set -euo pipefail
@@ -116,6 +120,108 @@ jobs:
             -q --tb=short | tee "$REPORT_DIR/green-focused.log"
           uv run python -m pytest tests/gateway/test_hosted_room_replicas.py \
             -q --tb=short | tee "$REPORT_DIR/green-existing-replicas.log"
+
+      - name: Prove RED groups.demote domain mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          uv run python -m pytest \
+            tests/tui_gateway/test_groups_replication_methods.py::test_demote_preserves_domain_validation_errors \
+            -q --tb=short > "$REPORT_DIR/red-demote-rpc.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$REPORT_DIR/red-demote-rpc.exit"
+          test "$rc" = "1"
+          grep -F "5119" "$REPORT_DIR/red-demote-rpc.log"
+
+      - name: Restore exact PR19 groups.demote contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import ast
+          import os
+          import subprocess
+          from pathlib import Path
+
+          path = Path("tui_gateway/methods_groups.py")
+          current = path.read_text(encoding="utf-8")
+          final = subprocess.check_output(
+              ["git", "show", f"{os.environ['SOURCE_FINAL']}:{path.as_posix()}"],
+              text=True,
+          )
+
+          def handler(text: str) -> ast.FunctionDef:
+              tree = ast.parse(text)
+              matches = []
+              for node in tree.body:
+                  if not isinstance(node, ast.FunctionDef):
+                      continue
+                  for decorator in node.decorator_list:
+                      if (
+                          isinstance(decorator, ast.Call)
+                          and isinstance(decorator.func, ast.Name)
+                          and decorator.func.id == "method"
+                          and decorator.args
+                          and isinstance(decorator.args[0], ast.Constant)
+                          and decorator.args[0].value == "groups.demote"
+                      ):
+                          matches.append(node)
+              if len(matches) != 1:
+                  raise RuntimeError(
+                      f"expected one groups.demote handler, found {len(matches)}"
+                  )
+              return matches[0]
+
+          def offsets(text: str) -> tuple[list[int], int]:
+              values = []
+              total = 0
+              for line in text.splitlines(keepends=True):
+                  values.append(total)
+                  total += len(line)
+              return values, total
+
+          def span(text: str, node: ast.FunctionDef) -> tuple[int, int]:
+              lines = text.splitlines(keepends=True)
+              values, total = offsets(text)
+              start_line = min(
+                  [node.lineno, *(item.lineno for item in node.decorator_list)]
+              )
+              start = values[start_line - 1]
+              end = values[node.end_lineno] if node.end_lineno < len(lines) else total
+              return start, end
+
+          current_node = handler(current)
+          final_node = handler(final)
+          current_start, current_end = span(current, current_node)
+          final_start, final_end = span(final, final_node)
+          replacement = final[final_start:final_end].rstrip()
+          merged = (
+              current[:current_start]
+              + replacement
+              + "\n\n"
+              + current[current_end:].lstrip("\n")
+          ).rstrip() + "\n"
+          ast.parse(merged, filename=str(path))
+          merged_node = handler(merged)
+          if ast.dump(merged_node, include_attributes=False) != ast.dump(
+              final_node, include_attributes=False
+          ):
+              raise RuntimeError("groups.demote handler differs from final PR19 source")
+          path.write_text(merged, encoding="utf-8")
+          PY
+          python -m py_compile tui_gateway/methods_groups.py
+          git diff --check
+
+      - name: GREEN groups replication RPC suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest tests/tui_gateway/test_groups_replication_methods.py \
+            -q --tb=short | tee "$REPORT_DIR/green-replication-methods.log"
 
       - name: Verify storage driver and room integration
         shell: bash
@@ -126,20 +232,24 @@ jobs:
             tests/gateway/test_hosted_room_driver.py \
             tests/gateway/test_hosted_rooms.py \
             -q --tb=short | tee "$REPORT_DIR/green-storage-driver-rooms.log"
-          uv run python -m pytest tests/tui_gateway/test_groups_replication_methods.py \
-            -q --tb=short | tee "$REPORT_DIR/green-replication-methods.log"
 
       - name: Static verification
         shell: bash
         run: |
           set -euo pipefail
-          uv run ruff check gateway/hosted_room_replicas.py \
+          uv run ruff check \
+            gateway/hosted_room_replicas.py \
+            tui_gateway/methods_groups.py \
             tests/gateway/test_hosted_room_replicas_patch3.py \
             | tee "$REPORT_DIR/ruff-check.log"
-          uv run ruff format --check gateway/hosted_room_replicas.py \
+          uv run ruff format --check \
+            gateway/hosted_room_replicas.py \
+            tui_gateway/methods_groups.py \
             tests/gateway/test_hosted_room_replicas_patch3.py \
             | tee "$REPORT_DIR/ruff-format.log"
-          python -m py_compile gateway/hosted_room_replicas.py \
+          python -m py_compile \
+            gateway/hosted_room_replicas.py \
+            tui_gateway/methods_groups.py \
             tests/gateway/test_hosted_room_replicas_patch3.py
           git diff --check
 
@@ -162,13 +272,17 @@ jobs:
               ".github/workflows/pr21-patch3-apply.yml",
               ".github/workflows/pr21-patch3-retry.yml",
               "gateway/hosted_room_replicas.py",
+              "tui_gateway/methods_groups.py",
               "tests/gateway/test_hosted_room_replicas_patch3.py",
           }
           required = {
               "gateway/hosted_room_replicas.py",
+              "tui_gateway/methods_groups.py",
               "tests/gateway/test_hosted_room_replicas_patch3.py",
           }
-          rows = subprocess.check_output(["git", "status", "--porcelain"], text=True).splitlines()
+          rows = subprocess.check_output(
+              ["git", "status", "--porcelain"], text=True
+          ).splitlines()
           paths = {row[3:] for row in rows if len(row) >= 4}
           if paths - allowed:
               raise SystemExit(f"unexpected changed paths: {sorted(paths - allowed)}")
@@ -184,7 +298,8 @@ jobs:
           git config user.email "pr21-reconciler@invalid.local"
           git add -A
           git diff --cached --check
-          git commit --no-gpg-sign --no-verify -m "fix(hosted-rooms): restore replica correctness"
+          git commit --no-gpg-sign --no-verify \
+            -m "fix(hosted-rooms): restore replica correctness"
           new_head="$(git rev-parse HEAD)"
           test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$GITHUB_SHA"
           git merge-base --is-ancestor "$GITHUB_SHA" "$new_head"
@@ -198,7 +313,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch3-replica-evidence-v3
-          path: /tmp/pr21-patch3-replica-v3/**
+          name: pr21-patch3-replica-evidence-v4
+          path: /tmp/pr21-patch3-replica-v4/**
           if-no-files-found: warn
           retention-days: 14
