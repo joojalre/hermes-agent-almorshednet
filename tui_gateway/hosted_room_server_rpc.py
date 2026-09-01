@@ -16,13 +16,14 @@ from typing import Any, Callable
 
 from gateway import hosted_room_driver as state
 from tui_gateway.hosted_room_driver import HostedRoomProfileUnavailableError
-from tui_gateway.transport import bind_transport, reset_transport
+from tui_gateway.transport import Transport, bind_transport, reset_transport
 
 
 class _InternalDropTransport:
     """Accept internal frames without publishing private room traffic."""
 
-    def write(self, _obj: dict) -> bool:
+    def write(self, obj: dict) -> bool:
+        del obj
         return True
 
     def close(self) -> None:
@@ -36,6 +37,7 @@ class HostedRoomSessionError(RuntimeError):
         super().__init__(f"{method} failed: {message}")
         self.method = method
         self.code = code
+        self.not_admitted = False
 
 
 class HostedRoomServerRPC:
@@ -50,7 +52,7 @@ class HostedRoomServerRPC:
         self.server = server
         self.profile_available = profile_available or (lambda _profile: True)
         self._ids = itertools.count(1)
-        self._transport = _InternalDropTransport()
+        self._transport: Transport = _InternalDropTransport()
 
     def _require_profile_available(self, profile: str) -> None:
         try:
@@ -378,12 +380,36 @@ class HostedRoomServerRPC:
             result.get("status") == "interrupted"
         )
         if not interrupted:
+            observed = self._find_admitted_session(
+                task=task,
+                execution_generation=execution_generation,
+                source=source,
+            )
+            if observed is None:
+                return {
+                    "status": "absent",
+                    "acknowledged": False,
+                    "active": False,
+                    "interrupted": False,
+                    "session_id": None,
+                }
+            observed_session_id, observed_active = observed
+            if observed_active:
+                # Another exact Stop can own the process-local interrupt claim.
+                # A negative signal result is not proof that the turn stopped.
+                return {
+                    "status": "pending",
+                    "acknowledged": False,
+                    "active": True,
+                    "interrupted": False,
+                    "session_id": observed_session_id,
+                }
             return {
                 "status": "inactive",
                 "acknowledged": True,
                 "active": False,
                 "interrupted": False,
-                "session_id": session_id,
+                "session_id": observed_session_id,
             }
         return {
             **result,

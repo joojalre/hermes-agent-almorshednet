@@ -36,10 +36,12 @@ from gateway.hosted_rooms import (
     HostedRoomError,
     RoomConflictError,
     _CRITICAL_CONTROL_EVENT_KINDS,
-    _TERMINAL_COMPLETION_EVENT_KINDS,
     _assert_event_capacity,
     _canonical_json,
     _connect,
+    _is_terminal_recovery_plan,
+    _released_terminal_task_ids,
+    _terminal_publication_liabilities,
     _transaction,
     _validate_identifier,
     _validate_members,
@@ -445,56 +447,88 @@ def promote_replica(
                 now,
             ),
         )
-        replica_events = conn.execute(
-            """SELECT room_id, seq, event_id, kind, actor_json,
-                      authority_epoch, payload_json, created_at
-                 FROM hosted_room_replica_events
-                WHERE room_id=? ORDER BY seq""",
-            (room_id,),
+        replica_events = iter(
+            conn.execute(
+                """SELECT room_id, seq, event_id, kind, actor_json,
+                          authority_epoch, payload_json, created_at
+                     FROM hosted_room_replica_events
+                    WHERE room_id=? ORDER BY seq""",
+                (room_id,),
+            )
         )
         replay_bytes = 0
         next_seq = 1
-        for event in replica_events:
-            if int(event["seq"]) != next_seq:
-                raise ReplicaGapError("replica history is not contiguous")
-            event_bytes = len(
-                (
-                    str(event["event_id"])
-                    + str(event["kind"])
-                    + str(event["actor_json"])
-                    + str(event["payload_json"])
-                ).encode("utf-8")
-            )
-            kind = str(event["kind"])
+        event = next(replica_events, None)
+        while event is not None:
+            batch = [event]
+            following = next(replica_events, None)
+            if following is not None and str(event["kind"]) == "message.member":
+                candidate = [(0, dict(event)), (1, dict(following))]
+                if _is_terminal_recovery_plan(candidate):
+                    batch.append(following)
+                    following = next(replica_events, None)
+
+            batch_bytes: list[int] = []
+            for batch_event in batch:
+                if int(batch_event["seq"]) != next_seq + len(batch_bytes):
+                    raise ReplicaGapError("replica history is not contiguous")
+                batch_bytes.append(
+                    len(
+                        (
+                            str(batch_event["event_id"])
+                            + str(batch_event["kind"])
+                            + str(batch_event["actor_json"])
+                            + str(batch_event["payload_json"])
+                        ).encode("utf-8")
+                    )
+                )
             promoted_room = conn.execute(
                 "SELECT next_seq, event_bytes FROM hosted_rooms WHERE room_id=?",
                 (room_id,),
             ).fetchone()
+            batch_plan = [
+                (index, dict(batch_event))
+                for index, batch_event in enumerate(batch)
+            ]
+            terminal_recovery = _is_terminal_recovery_plan(batch_plan)
             _assert_event_capacity(
                 conn,
+                room_id=room_id,
                 room=promoted_room,
-                additional_bytes=event_bytes,
-                allow_control=kind in _CRITICAL_CONTROL_EVENT_KINDS,
-                allow_stop=kind == "room.stop_requested",
-                allow_terminal_recovery=(
-                    kind in _TERMINAL_COMPLETION_EVENT_KINDS
+                additional_bytes=sum(batch_bytes),
+                additional_events=len(batch),
+                allow_control=all(
+                    str(batch_event["kind"]) in _CRITICAL_CONTROL_EVENT_KINDS
+                    for batch_event in batch
+                ),
+                allow_stop=all(
+                    str(batch_event["kind"]) == "room.stop_requested"
+                    for batch_event in batch
+                ),
+                allow_terminal_recovery=terminal_recovery,
+                released_task_ids=(
+                    _released_terminal_task_ids(batch_plan)
+                    if terminal_recovery
+                    else frozenset()
                 ),
             )
-            conn.execute(
-                """INSERT INTO hosted_room_events
-                   (room_id, seq, event_id, kind, actor_json, authority_epoch,
-                    payload_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                tuple(event),
-            )
-            replay_bytes += event_bytes
-            next_seq += 1
+            for batch_event, event_bytes in zip(batch, batch_bytes, strict=True):
+                conn.execute(
+                    """INSERT INTO hosted_room_events
+                       (room_id, seq, event_id, kind, actor_json, authority_epoch,
+                        payload_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    tuple(batch_event),
+                )
+                replay_bytes += event_bytes
+                next_seq += 1
             conn.execute(
                 """UPDATE hosted_rooms
                       SET next_seq=?, event_bytes=?, updated_at=?
                     WHERE room_id=?""",
                 (next_seq, replay_bytes, now, room_id),
             )
+            event = following
         if next_seq != claim_seq or replay_bytes != replica_bytes:
             raise ReplicaError("replica history metadata does not match stored events")
         promoted_room = conn.execute(
@@ -503,6 +537,7 @@ def promote_replica(
         ).fetchone()
         _assert_event_capacity(
             conn,
+            room_id=room_id,
             room=promoted_room,
             additional_bytes=claim_bytes,
             additional_events=1,
@@ -623,6 +658,13 @@ def demote_room(
             raise ReplicaError(
                 "room is not locally authoritative; nothing to demote"
             )
+        if any(
+            liability_room_id == room_id
+            for liability_room_id, _ in _terminal_publication_liabilities(conn)
+        ):
+            raise ReplicaError(
+                "room has unpublished terminal work; publish it before demotion"
+            )
         seq = int(row["next_seq"])
         lost_actor_json = _canonical_json(
             {"kind": "system", "id": "authority-control"},
@@ -647,9 +689,11 @@ def demote_room(
         )
         _assert_event_capacity(
             conn,
+            room_id=room_id,
             room=row,
             additional_bytes=lost_bytes,
             allow_control=True,
+            remaining_demotion_control_events=0,
         )
         conn.execute(
             """INSERT INTO hosted_room_events

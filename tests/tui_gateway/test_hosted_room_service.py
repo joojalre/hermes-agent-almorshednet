@@ -206,6 +206,65 @@ def _approve_room_task_process(
         results.put({"result": dict(result)})
 
 
+def _append_admit_and_start_room_task_process(
+    db_path: str,
+    room_id: str,
+    gateway_id: str,
+    authority_epoch: int,
+    results,
+) -> None:
+    """Try the unsafe post-Stop admission from a distinct spawned process."""
+
+    try:
+        event = hosted_rooms.append_event(
+            db_path,
+            room_id=room_id,
+            event_id="user-during-demotion",
+            kind="message.user",
+            actor={"kind": "user", "id": "desktop"},
+            payload={"text": "@ops race demotion", "thread_id": "thread-race"},
+            authority_gateway_id=gateway_id,
+            authority_epoch=authority_epoch,
+            require_open_admissions=True,
+        )
+        identity = driver.TaskIdentity(
+            room_id=room_id,
+            task_id="task-during-demotion",
+            thread_id="thread-race",
+            turn_id="turn-race",
+        )
+        driver.admit_task(
+            db_path,
+            identity,
+            payload={
+                "target_profile": "ops",
+                "prompt": "race demotion",
+                "source_event_seq": event["seq"],
+            },
+            clock=time.time,
+        )
+        lease = driver.acquire_lease(
+            db_path,
+            room_id=room_id,
+            gateway_id=gateway_id,
+            authority_epoch=authority_epoch,
+            process_generation="demotion-racer",
+            ttl_seconds=30,
+            clock=time.time,
+        )
+        started = driver.start_task(
+            db_path,
+            identity,
+            lease,
+            expected_cancel_generation=0,
+            clock=time.time,
+        )
+    except Exception as exc:
+        results.put({"error": type(exc).__name__})
+    else:
+        results.put({"status": "started", "generation": started.execution_generation})
+
+
 def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path: Path):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)
@@ -1511,6 +1570,362 @@ def test_stop_fence_prevents_the_next_room_member_from_starting(
     )
 
 
+def test_restart_reconciles_crash_after_stop_before_queued_cancel(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-before-crash",
+        payload={"text": "@ops inspect", "thread_id": "thread-before-crash"},
+    )
+    stale_identity = driver.list_tasks(db, room_id="room-1", status="queued")[0][
+        "identity"
+    ]
+    hosted_rooms.request_room_stop(
+        db,
+        room_id="room-1",
+        cancel_id="stop-before-crash",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+    )
+
+    restarted = HostedRoomService(_server(), db_path=db)
+    restarted.local_profiles = lambda: ("default", "ops")
+    restarted.prepare_room(restarted.bindings()[0])
+
+    stale = driver.get_task(db, stale_identity)
+    assert stale["status"] == "cancelled"
+    assert stale["cancel_id"] == "stop-before-crash"
+    current_event = restarted.send(
+        room_id="room-1",
+        event_id="user-after-restart",
+        payload={"text": "@ops inspect again", "thread_id": "thread-after-restart"},
+    )
+    queued = driver.list_tasks(db, room_id="room-1", status="queued")
+    assert len(queued) == 1
+    assert queued[0]["payload"]["source_event_seq"] == current_event["seq"]
+
+
+def test_restart_resumes_crash_after_demotion_barrier_before_stop(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-before-demotion-crash",
+        payload={"text": "@ops inspect", "thread_id": "thread-before-crash"},
+    )
+    stale_identity = driver.list_tasks(db, room_id="room-1", status="queued")[0][
+        "identity"
+    ]
+    observed_gateway = "install:" + "b" * 32
+    driver.begin_room_demotion(
+        db,
+        room_id="room-1",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+        observed_gateway_id=observed_gateway,
+        observed_epoch=2,
+        cancel_id="demotion-before-crash",
+        clock=time.time,
+    )
+
+    restarted = HostedRoomService(_server(), db_path=db)
+    restarted.local_profiles = lambda: ("default", "ops")
+    restarted.prepare_room(restarted.bindings()[0])
+
+    state = hosted_rooms.room_state(db, room_id="room-1")
+    assert state["authority_gateway_id"] == observed_gateway
+    assert state["authority_epoch"] == 2
+    stale = driver.get_task(db, stale_identity)
+    assert stale["status"] == "cancelled"
+    assert stale["cancel_id"] == "demotion-before-crash"
+    assert driver.pending_room_demotion(db, room_id="room-1") is None
+    events = restarted._events("room-1")
+    event_kinds = [event["kind"] for event in events]
+    assert "room.stop_requested" in event_kinds
+    assert "turn.cancelled" in event_kinds
+    assert "authority.lost" in event_kinds
+    assert event_kinds.index("turn.cancelled") < event_kinds.index("authority.lost")
+
+
+def test_restart_publishes_settled_task_before_resumed_demotion(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-before-settled-crash",
+        payload={"text": "@ops inspect", "thread_id": "thread-before-crash"},
+    )
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    binding = service.bindings()[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="crashed",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    attempt = driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    driver.settle_task(
+        db,
+        attempt,
+        settlement_id="reply-before-crash",
+        status="settled",
+        result={"text": "done"},
+        clock=time.time,
+    )
+    observed_gateway = "install:" + "b" * 32
+    driver.begin_room_demotion(
+        db,
+        room_id="room-1",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+        observed_gateway_id=observed_gateway,
+        observed_epoch=2,
+        cancel_id="demotion-after-settle",
+        clock=time.time,
+    )
+
+    restarted = HostedRoomService(_server(), db_path=db)
+    restarted.local_profiles = lambda: ("default", "ops")
+    restarted.prepare_room(restarted.bindings()[0])
+
+    events = restarted._events("room-1")
+    event_kinds = [event["kind"] for event in events]
+    assert "message.member" in event_kinds
+    assert "turn.settled" in event_kinds
+    assert event_kinds.index("turn.settled") < event_kinds.index("authority.lost")
+    state = hosted_rooms.room_state(db, room_id="room-1")
+    assert state["authority_gateway_id"] == observed_gateway
+    assert state["authority_epoch"] == 2
+
+
+def test_demotion_stop_uses_control_headroom_after_terminal_recovery(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    state = hosted_rooms.room_state(db, room_id="room-1")
+    monkeypatch.setattr(hosted_rooms, "MAX_EVENTS_PER_ROOM", state["latest_seq"])
+    monkeypatch.setattr(hosted_rooms, "STOP_EVENT_COUNT_RESERVE", 1)
+    monkeypatch.setattr(hosted_rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
+    monkeypatch.setattr(hosted_rooms, "CONTROL_EVENT_COUNT_RESERVE", 4)
+    hosted_rooms.append_events(
+        db,
+        events=[
+            {
+                "room_id": "room-1",
+                "event_id": f"terminal-before-demotion-{index}",
+                "kind": "turn.cancelled",
+                "actor": {"kind": "gateway", "id": room["authority_gateway_id"]},
+                "payload": {"task_id": f"historical-task-{index}"},
+                "authority_gateway_id": room["authority_gateway_id"],
+                "authority_epoch": room["authority_epoch"],
+            }
+            for index in range(2)
+        ],
+        allow_terminal_recovery=True,
+    )
+    observed_gateway = "install:" + "b" * 32
+
+    result = service.demote_room(
+        "room-1",
+        observed_gateway_id=observed_gateway,
+        observed_epoch=2,
+    )
+
+    assert result["authority_gateway_id"] == observed_gateway
+    assert result["authority_epoch"] == 2
+    assert [event["kind"] for event in service._events("room-1")][-2:] == [
+        "room.stop_requested",
+        "authority.lost",
+    ]
+
+
+def test_concurrent_demotion_completion_does_not_republish_under_new_authority(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from gateway.hosted_room_replicas import demote_room as commit_demotion
+
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-before-concurrent-demotion",
+        payload={"text": "@ops inspect", "thread_id": "thread-before-demotion"},
+    )
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    binding = service.bindings()[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="settling-process",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    attempt = driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    driver.settle_task(
+        db,
+        attempt,
+        settlement_id="reply-before-concurrent-demotion",
+        status="settled",
+        result={"text": "done"},
+        clock=time.time,
+    )
+    observed_gateway = "install:" + "b" * 32
+    original_stop = service.stop_room
+
+    def finish_in_competing_process(
+        room_id: str,
+        *,
+        cancel_id: str,
+        require_acknowledged: bool = False,
+    ) -> int:
+        cancelled = original_stop(
+            room_id,
+            cancel_id=cancel_id,
+            require_acknowledged=require_acknowledged,
+        )
+        old_room = hosted_rooms.room_state(db, room_id=room_id)
+        assert service._publish_terminal_tasks(old_room) is True
+        commit_demotion(
+            db,
+            room_id=room_id,
+            observed_gateway_id=observed_gateway,
+            observed_epoch=2,
+        )
+        return cancelled
+
+    monkeypatch.setattr(service, "stop_room", finish_in_competing_process)
+
+    result = service.demote_room(
+        "room-1",
+        observed_gateway_id=observed_gateway,
+        observed_epoch=2,
+    )
+
+    assert result["authority_gateway_id"] == observed_gateway
+    assert result["authority_epoch"] == 2
+    events = service._events("room-1")
+    assert sum(event["kind"] == "turn.settled" for event in events) == 1
+    assert sum(event["kind"] == "authority.lost" for event in events) == 1
+
+
+def test_stop_between_planning_and_admission_blocks_a_second_runtime(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    planner = HostedRoomService(_server(), db_path=db)
+    stopper = HostedRoomService(_server(), db_path=db)
+    planner.local_profiles = lambda: ("default", "ops")
+    stopper.local_profiles = lambda: ("default", "ops")
+    planner.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    planned = threading.Event()
+    release = threading.Event()
+    real_admit = driver.admit_task
+
+    def pause_before_admission(*args, **kwargs):
+        planned.set()
+        assert release.wait(timeout=5)
+        return real_admit(*args, **kwargs)
+
+    monkeypatch.setattr(driver, "admit_task", pause_before_admission)
+    outcome: dict[str, object] = {}
+
+    def send() -> None:
+        try:
+            outcome["event"] = planner.send(
+                room_id="room-1",
+                event_id="user-1",
+                payload={"text": "@ops inspect", "thread_id": "thread-1"},
+            )
+        except Exception as exc:
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=send)
+    worker.start()
+    assert planned.wait(timeout=5)
+    assert stopper.stop_room("room-1", cancel_id="stop-1") == 0
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert "error" not in outcome
+    assert outcome["event"]["kind"] == "message.user"
+    assert driver.list_tasks(db, room_id="room-1") == []
+
+
 def test_retrying_old_stop_id_does_not_cancel_newer_room_work(
     tmp_path: Path,
     monkeypatch,
@@ -1609,7 +2024,7 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
     assert stopping["cancel_id"] == "stop-1"
 
 
-def test_demote_retry_stops_newer_turn_before_authority_transfer(
+def test_demote_retry_keeps_newer_turn_behind_admission_barrier(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -1724,34 +2139,34 @@ def test_demote_retry_stops_newer_turn_before_authority_transfer(
     )
     assert first_cancelled["status"] == "cancelled"
 
-    service.send(
-        room_id="room-1",
-        event_id="user-2",
-        payload={"text": "@ops inspect again", "thread_id": "thread-2"},
+    original = next(
+        event for event in service._events("room-1") if event["event_id"] == "user-1"
     )
-    newer_task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
-    driver.start_task(
+    replayed = hosted_rooms.append_event(
         db,
-        newer_task["identity"],
-        lease,
-        expected_cancel_generation=0,
-        clock=time.time,
+        room_id="room-1",
+        event_id=original["event_id"],
+        kind=original["kind"],
+        actor=original["actor"],
+        payload=original["payload"],
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+        require_open_admissions=True,
     )
-    rpc.active_task_id = newer_task["identity"].task_id
+    assert replayed["idempotent"] is True
 
-    with pytest.raises(RuntimeError, match="still stopping"):
-        service.demote_room(
-            "room-1",
-            observed_gateway_id=observation["authority_gateway_id"],
-            observed_epoch=observation["authority_epoch"],
+    with pytest.raises(hosted_rooms.RoomAdmissionBlockedError):
+        service.send(
+            room_id="room-1",
+            event_id="user-2",
+            payload={"text": "@ops inspect again", "thread_id": "thread-2"},
         )
+    assert driver.list_tasks(db, room_id="room-1", status="queued") == []
+    assert not any(
+        event["event_id"] == "user-2" and event["kind"] == "message.user"
+        for event in service._events("room-1")
+    )
 
-    still_local = hosted_rooms.room_state(db, room_id="room-1")
-    assert still_local["authority_gateway_id"] == room["authority_gateway_id"]
-    assert still_local["authority_epoch"] == room["authority_epoch"]
-    assert driver.get_task(db, newer_task["identity"])["status"] == "stopping"
-
-    rpc.acknowledge = True
     result = service.demote_room(
         "room-1",
         observed_gateway_id=observation["authority_gateway_id"],
@@ -1763,19 +2178,87 @@ def test_demote_retry_stops_newer_turn_before_authority_transfer(
     assert rpc.expected_task_ids == [
         task["identity"].task_id,
         task["identity"].task_id,
-        newer_task["identity"].task_id,
-        newer_task["identity"].task_id,
     ]
     stop_ids = [
         event["payload"]["cancel_id"]
         for event in service._events("room-1")
         if event["kind"] == "room.stop_requested"
     ]
-    assert len(stop_ids) == 3
-    assert len(set(stop_ids)) == 3
+    assert len(stop_ids) == 1
+    assert stop_ids[0].startswith("authority-demote:2:")
     assert any(
         event["kind"] == "authority.lost" for event in service._events("room-1")
     )
+
+
+def test_demote_barrier_blocks_post_stop_admission_from_another_process(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    observed_gateway = "install:" + "b" * 32
+    process_result: dict[str, object] = {}
+
+    def stop_then_race(room_id, *, cancel_id, require_acknowledged=False):
+        assert require_acknowledged is True
+        stop = hosted_rooms.request_room_stop(
+            db,
+            room_id=room_id,
+            cancel_id=cancel_id,
+            expected_gateway_id=room["authority_gateway_id"],
+            expected_epoch=room["authority_epoch"],
+        )
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        racer = context.Process(
+            target=_append_admit_and_start_room_task_process,
+            args=(
+                str(db),
+                room_id,
+                room["authority_gateway_id"],
+                room["authority_epoch"],
+                results,
+            ),
+        )
+        racer.start()
+        racer.join(timeout=60)
+        try:
+            assert not racer.is_alive()
+            assert racer.exitcode == 0
+            process_result.update(results.get(timeout=5))
+        finally:
+            if racer.is_alive():
+                racer.terminate()
+                racer.join(timeout=5)
+            results.close()
+            results.join_thread()
+        assert not any(
+            event["event_id"] == "user-during-demotion"
+            for event in service._events(room_id)
+        )
+        return 0
+
+    monkeypatch.setattr(service, "stop_room", stop_then_race)
+    result = service.demote_room(
+        "room-1",
+        observed_gateway_id=observed_gateway,
+        observed_epoch=2,
+    )
+
+    assert process_result == {"error": "RoomAdmissionBlockedError"}
+    assert driver.list_tasks(db, room_id="room-1") == []
+    assert result["authority_gateway_id"] == observed_gateway
+    assert result["authority_epoch"] == 2
 
 
 def test_cross_process_pending_approval_requires_exact_generation_and_owner_consumes(

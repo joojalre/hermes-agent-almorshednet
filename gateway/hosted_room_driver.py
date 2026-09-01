@@ -1,9 +1,10 @@
 """Durable execution state for a same-gateway hosted room driver.
 
 This module owns only the driver lease and task state machine. It does not
-invoke models, touch sessions, or depend on the hosted-room event log. Callers
-provide both the database path and clock so recovery and fencing behavior can
-be tested without process-global state.
+invoke models or touch sessions. Admission reads the co-located hosted-room
+event log so Stop and authority-demotion fences are atomic with task creation.
+Callers provide both the database path and clock so recovery and fencing
+behavior can be tested without process-global state.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
+
+from gateway import hosted_rooms
 
 
 Clock = Callable[[], float]
@@ -167,6 +170,24 @@ _APPROVAL_REQUEST_COLUMN_ORDER = (
     "updated_at",
     "consumed_at",
 )
+_ADMISSION_BARRIER_COLUMNS = frozenset({
+    "room_id",
+    "gateway_id",
+    "authority_epoch",
+    "reason",
+    "created_at",
+})
+_ADMISSION_BARRIER_PRIMARY_KEY = ("room_id", "gateway_id", "authority_epoch")
+_DEMOTION_INTENT_COLUMNS = frozenset({
+    "room_id",
+    "gateway_id",
+    "authority_epoch",
+    "observed_gateway_id",
+    "observed_epoch",
+    "cancel_id",
+    "created_at",
+})
+_DEMOTION_INTENT_PRIMARY_KEY = ("room_id", "gateway_id", "authority_epoch")
 
 
 class DriverStateError(ValueError):
@@ -191,6 +212,10 @@ class StaleLeaseError(DriverStateError):
 
 class TaskConflictError(DriverStateError):
     """Raised when an idempotency key is reused for different task state."""
+
+
+class TaskAdmissionBlockedError(DriverStateError):
+    """Raised when a durable Stop or authority fence rejects a new task."""
 
 
 class StaleTaskError(DriverStateError):
@@ -455,6 +480,143 @@ def _create_approval_request_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _create_admission_barrier_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_driver_admission_barriers (
+            room_id TEXT NOT NULL,
+            gateway_id TEXT NOT NULL,
+            authority_epoch INTEGER NOT NULL CHECK (authority_epoch >= 1),
+            reason TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (room_id, gateway_id, authority_epoch),
+            FOREIGN KEY (room_id) REFERENCES hosted_rooms(room_id)
+                ON DELETE CASCADE
+        )"""
+    )
+
+
+def _create_demotion_intent_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_driver_demotion_intents (
+            room_id TEXT NOT NULL,
+            gateway_id TEXT NOT NULL,
+            authority_epoch INTEGER NOT NULL CHECK (authority_epoch >= 1),
+            observed_gateway_id TEXT NOT NULL,
+            observed_epoch INTEGER NOT NULL CHECK (
+                observed_epoch > authority_epoch
+            ),
+            cancel_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (room_id, gateway_id, authority_epoch),
+            FOREIGN KEY (room_id, gateway_id, authority_epoch)
+                REFERENCES hosted_room_driver_admission_barriers(
+                    room_id, gateway_id, authority_epoch
+                ) ON DELETE CASCADE
+        )"""
+    )
+
+
+def _demotion_intent_table_exists(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type='table'
+                 AND name='hosted_room_driver_demotion_intents'"""
+        ).fetchone()
+        is not None
+    )
+
+
+def _raise_if_legacy_demotion_barrier_is_unrecoverable(
+    conn: sqlite3.Connection,
+) -> None:
+    if _demotion_intent_table_exists(conn):
+        return
+    orphan = conn.execute(
+        """SELECT 1
+             FROM hosted_room_driver_admission_barriers AS barrier
+             JOIN hosted_rooms AS room ON room.room_id=barrier.room_id
+            WHERE barrier.reason='authority-demotion'
+              AND room.disbanded_at IS NULL
+              AND room.authority_gateway_id=barrier.gateway_id
+              AND room.authority_epoch=barrier.authority_epoch
+            LIMIT 1"""
+    ).fetchone()
+    if orphan is not None:
+        raise DriverStateError(
+            "unpublished authority-demotion barrier lacks resumable target metadata; "
+            "restore the pre-update state snapshot or recreate the unpublished "
+            "driver tables"
+        )
+
+
+def _raise_if_pending_demotion_intent_lacks_stop(
+    conn: sqlite3.Connection,
+) -> None:
+    if not _demotion_intent_table_exists(conn):
+        return
+    intents = conn.execute(
+        """SELECT intent.room_id, intent.gateway_id,
+                  intent.authority_epoch, intent.cancel_id
+             FROM hosted_room_driver_demotion_intents AS intent
+             JOIN hosted_rooms AS room ON room.room_id=intent.room_id
+            WHERE room.disbanded_at IS NULL
+              AND room.authority_gateway_id=intent.gateway_id
+              AND room.authority_epoch=intent.authority_epoch"""
+    ).fetchall()
+    for intent in intents:
+        stop = conn.execute(
+            """SELECT kind, actor_json, authority_epoch, payload_json
+                 FROM hosted_room_events
+                WHERE room_id=? AND event_id=?""",
+            (
+                str(intent["room_id"]),
+                hosted_rooms._stop_event_id(str(intent["cancel_id"])),
+            ),
+        ).fetchone()
+        try:
+            actor = json.loads(stop["actor_json"]) if stop is not None else None
+            payload = json.loads(stop["payload_json"]) if stop is not None else None
+            stop_epoch = (
+                int(stop["authority_epoch"]) if stop is not None else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            actor = None
+            payload = None
+            stop_epoch = None
+        if (
+            stop is None
+            or str(stop["kind"]) != "room.stop_requested"
+            or stop_epoch != int(intent["authority_epoch"])
+            or actor
+            != {"kind": "gateway", "id": str(intent["gateway_id"])}
+            or payload != {"cancel_id": str(intent["cancel_id"])}
+        ):
+            raise DriverStateError(
+                "unpublished authority-demotion intent lacks its atomic Stop "
+                "fence; restore the pre-update state snapshot or recreate the "
+                "unpublished driver tables"
+            )
+
+
+def _raise_if_terminal_recovery_headroom_is_unrecoverable(
+    conn: sqlite3.Connection,
+) -> None:
+    liabilities = hosted_rooms._terminal_publication_liabilities(conn)
+    for room_id in sorted({room_id for room_id, _ in liabilities}):
+        try:
+            hosted_rooms._assert_terminal_recovery_headroom(
+                conn,
+                room_id=room_id,
+            )
+        except hosted_rooms.HostedRoomError as exc:
+            raise DriverStateError(
+                "unpublished hosted-room tasks exceed durable terminal recovery "
+                "headroom; restore the pre-update state snapshot or drain the "
+                "unpublished driver state before starting this version"
+            ) from exc
+
+
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_driver_leases (
@@ -479,6 +641,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     _create_task_table(conn)
     _create_terminal_receipt_table(conn)
     _create_approval_request_table(conn)
+    _create_admission_barrier_table(conn)
+    _create_demotion_intent_table(conn)
     _validate_schema(conn)
     conn.execute(
         """CREATE INDEX IF NOT EXISTS idx_hosted_room_driver_tasks_status
@@ -503,11 +667,33 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
         row[1]
         for row in conn.execute("PRAGMA table_info(hosted_room_approval_requests)")
     )
+    barrier_info = conn.execute(
+        "PRAGMA table_info(hosted_room_driver_admission_barriers)"
+    ).fetchall()
+    barrier_columns = frozenset(row[1] for row in barrier_info)
+    barrier_primary_key = tuple(
+        row[1]
+        for row in sorted(barrier_info, key=lambda row: int(row[5]))
+        if int(row[5]) > 0
+    )
+    intent_info = conn.execute(
+        "PRAGMA table_info(hosted_room_driver_demotion_intents)"
+    ).fetchall()
+    intent_columns = frozenset(row[1] for row in intent_info)
+    intent_primary_key = tuple(
+        row[1]
+        for row in sorted(intent_info, key=lambda row: int(row[5]))
+        if int(row[5]) > 0
+    )
     if (
         lease_columns != _LEASE_COLUMNS
         or task_columns != _TASK_COLUMNS
         or receipt_columns != _TERMINAL_RECEIPT_COLUMNS
         or approval_columns != _APPROVAL_REQUEST_COLUMNS
+        or barrier_columns != _ADMISSION_BARRIER_COLUMNS
+        or barrier_primary_key != _ADMISSION_BARRIER_PRIMARY_KEY
+        or intent_columns != _DEMOTION_INTENT_COLUMNS
+        or intent_primary_key != _DEMOTION_INTENT_PRIMARY_KEY
     ):
         raise DriverStateError(
             "unsupported unpublished hosted-room driver schema; "
@@ -545,6 +731,34 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
         raise DriverStateError(
             "hosted_room_approval_requests is missing its task foreign key"
         )
+    barrier_foreign_keys = conn.execute(
+        "PRAGMA foreign_key_list(hosted_room_driver_admission_barriers)"
+    ).fetchall()
+    if not any(
+        row[2] == "hosted_rooms"
+        and row[3] == "room_id"
+        and row[4] == "room_id"
+        for row in barrier_foreign_keys
+    ):
+        raise DriverStateError(
+            "hosted_room_driver_admission_barriers is missing its room foreign key"
+        )
+    intent_foreign_keys = conn.execute(
+        "PRAGMA foreign_key_list(hosted_room_driver_demotion_intents)"
+    ).fetchall()
+    intent_mapping = {
+        (str(row[3]), str(row[4]))
+        for row in intent_foreign_keys
+        if row[2] == "hosted_room_driver_admission_barriers"
+    }
+    if intent_mapping != {
+        ("room_id", "room_id"),
+        ("gateway_id", "gateway_id"),
+        ("authority_epoch", "authority_epoch"),
+    }:
+        raise DriverStateError(
+            "hosted_room_driver_demotion_intents is missing its barrier foreign key"
+        )
 
 
 def _schema_objects_exist(conn: sqlite3.Connection) -> bool:
@@ -579,13 +793,17 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         """SELECT name FROM sqlite_master
            WHERE type='table' AND name IN (
-               'hosted_room_terminal_receipts',
-               'hosted_room_approval_requests'
-           )"""
+                'hosted_room_terminal_receipts',
+                'hosted_room_approval_requests',
+                'hosted_room_driver_admission_barriers',
+                'hosted_room_driver_demotion_intents'
+            )"""
     ).fetchall()
     if {str(row[0]) for row in rows} != {
         "hosted_room_terminal_receipts",
         "hosted_room_approval_requests",
+        "hosted_room_driver_admission_barriers",
+        "hosted_room_driver_demotion_intents",
     }:
         return False
     lease_columns = frozenset(
@@ -597,6 +815,8 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     if lease_columns != _LEASE_COLUMNS or task_columns != _TASK_COLUMNS:
         return False
     _validate_schema(conn)
+    _raise_if_pending_demotion_intent_lacks_stop(conn)
+    _raise_if_terminal_recovery_headroom_is_unrecoverable(conn)
     return True
 
 
@@ -703,8 +923,11 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
     try:
         apply_wal_with_fallback(conn, db_label="state.db (hosted_room_driver)")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN")
         if _schema_is_current(conn):
+            conn.commit()
             return conn
+        conn.rollback()
         conn.execute("BEGIN IMMEDIATE")
         if _schema_is_current(conn):
             conn.commit()
@@ -715,7 +938,12 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
                 _migrate_task_status_constraint(conn)
             _create_terminal_receipt_table(conn)
             _create_approval_request_table(conn)
+            _create_admission_barrier_table(conn)
+            _raise_if_legacy_demotion_barrier_is_unrecoverable(conn)
+            _create_demotion_intent_table(conn)
             _validate_schema(conn)
+            _raise_if_pending_demotion_intent_lacks_stop(conn)
+            _raise_if_terminal_recovery_headroom_is_unrecoverable(conn)
             conn.commit()
             return conn
         # Schema creation is one database-wide transaction. The driver schema
@@ -1132,6 +1360,308 @@ def release_lease(
         return {"lease": _lease_from_row(current), "idempotent": False}
 
 
+def _ensure_admission_barrier(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+    reason: str,
+    gateway_id: str,
+    authority_epoch: int,
+    created_at: float,
+) -> dict[str, Any]:
+    existing = conn.execute(
+        """SELECT room_id, gateway_id, authority_epoch, reason, created_at
+             FROM hosted_room_driver_admission_barriers
+            WHERE room_id=? AND gateway_id=? AND authority_epoch=?""",
+        (room_id, gateway_id, authority_epoch),
+    ).fetchone()
+    if existing is not None:
+        return {**dict(existing), "idempotent": True}
+    conn.execute(
+        """INSERT INTO hosted_room_driver_admission_barriers
+           (room_id, gateway_id, authority_epoch, reason, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (room_id, gateway_id, authority_epoch, reason, created_at),
+    )
+    return {
+        "room_id": room_id,
+        "gateway_id": gateway_id,
+        "authority_epoch": authority_epoch,
+        "reason": reason,
+        "created_at": created_at,
+        "idempotent": False,
+    }
+
+
+def block_room_admissions(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    reason: Any,
+    expected_gateway_id: Any,
+    expected_epoch: Any,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Permanently fence new tasks for one superseded room authority epoch."""
+
+    room_id = _identifier(room_id, label="room_id")
+    reason = _identifier(reason, label="admission barrier reason")
+    gateway_id = _identifier(expected_gateway_id, label="gateway_id")
+    authority_epoch = _authority_epoch(expected_epoch)
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        _require_room_authority(
+            conn,
+            room_id=room_id,
+            gateway_id=gateway_id,
+            authority_epoch=authority_epoch,
+        )
+        return _ensure_admission_barrier(
+            conn,
+            room_id=room_id,
+            reason=reason,
+            gateway_id=gateway_id,
+            authority_epoch=authority_epoch,
+            created_at=now,
+        )
+
+
+def begin_room_demotion(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    expected_gateway_id: Any,
+    expected_epoch: Any,
+    observed_gateway_id: Any,
+    observed_epoch: Any,
+    cancel_id: Any,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Atomically fence one authority epoch and persist its demotion intent."""
+
+    room_id = _identifier(room_id, label="room_id")
+    gateway_id = _identifier(expected_gateway_id, label="gateway_id")
+    authority_epoch = _authority_epoch(expected_epoch)
+    observed_gateway_id = _identifier(
+        observed_gateway_id, label="observed_gateway_id"
+    )
+    observed_epoch = _authority_epoch(observed_epoch)
+    cancel_id = _identifier(cancel_id, label="cancel_id")
+    if observed_epoch <= authority_epoch:
+        raise DriverValidationError(
+            "observed_epoch must supersede the current authority epoch"
+        )
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        _require_room_authority(
+            conn,
+            room_id=room_id,
+            gateway_id=gateway_id,
+            authority_epoch=authority_epoch,
+        )
+        barrier = _ensure_admission_barrier(
+            conn,
+            room_id=room_id,
+            reason="authority-demotion",
+            gateway_id=gateway_id,
+            authority_epoch=authority_epoch,
+            created_at=now,
+        )
+        if barrier["reason"] != "authority-demotion":
+            raise TaskConflictError(
+                "room authority epoch is blocked for a different reason"
+            )
+        existing = conn.execute(
+            """SELECT room_id, gateway_id, authority_epoch,
+                      observed_gateway_id, observed_epoch, cancel_id, created_at
+                 FROM hosted_room_driver_demotion_intents
+                WHERE room_id=? AND gateway_id=? AND authority_epoch=?""",
+            (room_id, gateway_id, authority_epoch),
+        ).fetchone()
+        expected_identity = {
+            "room_id": room_id,
+            "gateway_id": gateway_id,
+            "authority_epoch": authority_epoch,
+            "observed_gateway_id": observed_gateway_id,
+            "observed_epoch": observed_epoch,
+        }
+        if existing is not None:
+            current = dict(existing)
+            if any(
+                current[key] != value for key, value in expected_identity.items()
+            ):
+                raise TaskConflictError(
+                    "room authority epoch already has a different demotion intent"
+                )
+            hosted_rooms._request_room_stop_locked(
+                conn,
+                room_id=room_id,
+                cancel_id=str(current["cancel_id"]),
+                expected_gateway_id=gateway_id,
+                expected_epoch=authority_epoch,
+                now=now,
+                demotion_control=True,
+            )
+            return {**current, "idempotent": True}
+        conn.execute(
+            """INSERT INTO hosted_room_driver_demotion_intents
+               (room_id, gateway_id, authority_epoch, observed_gateway_id,
+                observed_epoch, cancel_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                room_id,
+                gateway_id,
+                authority_epoch,
+                observed_gateway_id,
+                observed_epoch,
+                cancel_id,
+                now,
+            ),
+        )
+        hosted_rooms._request_room_stop_locked(
+            conn,
+            room_id=room_id,
+            cancel_id=cancel_id,
+            expected_gateway_id=gateway_id,
+            expected_epoch=authority_epoch,
+            now=now,
+            demotion_control=True,
+        )
+        return {
+            **expected_identity,
+            "cancel_id": cancel_id,
+            "created_at": now,
+            "idempotent": False,
+        }
+
+
+def pending_room_demotion(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+) -> dict[str, Any] | None:
+    """Return the resumable demotion intent for the room's current authority."""
+
+    room_id = _identifier(room_id, label="room_id")
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """SELECT intent.room_id, intent.gateway_id,
+                      intent.authority_epoch, intent.observed_gateway_id,
+                      intent.observed_epoch, intent.cancel_id, intent.created_at
+                 FROM hosted_room_driver_demotion_intents AS intent
+                 JOIN hosted_rooms AS room ON room.room_id=intent.room_id
+                WHERE intent.room_id=? AND room.disbanded_at IS NULL
+                  AND room.authority_gateway_id=intent.gateway_id
+                  AND room.authority_epoch=intent.authority_epoch""",
+            (room_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row is not None else None
+
+
+def _raise_if_task_fenced(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+    source_event_seq: int,
+) -> None:
+    barrier = conn.execute(
+        """SELECT 1
+             FROM hosted_room_driver_admission_barriers AS barrier
+             JOIN hosted_rooms AS room ON room.room_id=barrier.room_id
+            WHERE barrier.room_id=?
+              AND barrier.gateway_id=room.authority_gateway_id
+              AND barrier.authority_epoch=room.authority_epoch""",
+        (room_id,),
+    ).fetchone()
+    if barrier is not None:
+        raise TaskAdmissionBlockedError(
+            "task admission or start is blocked by a durable room admission barrier"
+        )
+    stop = conn.execute(
+        """SELECT MAX(seq) AS stop_seq FROM hosted_room_events
+           WHERE room_id=? AND kind='room.stop_requested'""",
+        (room_id,),
+    ).fetchone()
+    stop_seq = stop["stop_seq"] if stop is not None else None
+    if stop_seq is not None and source_event_seq <= int(stop_seq):
+        raise TaskAdmissionBlockedError(
+            "task source event is behind the current Stop fence"
+        )
+
+
+def _stop_fenced_inactive_rows(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+) -> tuple[str, list[sqlite3.Row]] | None:
+    _load_active_room(conn, room_id)
+    stop = conn.execute(
+        """SELECT seq, payload_json FROM hosted_room_events
+           WHERE room_id=? AND kind='room.stop_requested'
+           ORDER BY seq DESC LIMIT 1""",
+        (room_id,),
+    ).fetchone()
+    if stop is None:
+        return None
+    try:
+        payload = json.loads(stop["payload_json"])
+        cancel_id = _identifier(payload.get("cancel_id"), label="cancel_id")
+    except (AttributeError, json.JSONDecodeError, DriverValidationError) as exc:
+        raise DriverStateError("latest Stop event payload is invalid") from exc
+    rows = conn.execute(
+        """SELECT * FROM hosted_room_driver_tasks
+           WHERE room_id=? AND status IN ('queued', 'deferred')
+             AND source_event_seq <= ?
+           ORDER BY source_event_seq, created_at, task_id""",
+        (room_id, int(stop["seq"])),
+    ).fetchall()
+    return cancel_id, rows
+
+
+def reconcile_stop_fenced_inactive_tasks(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    clock: Clock,
+) -> list[TaskIdentity]:
+    """Cancel inactive work stranded by a durable Stop before process exit."""
+
+    room_id = _identifier(room_id, label="room_id")
+    preflight = _connect(db_path)
+    try:
+        candidate = _stop_fenced_inactive_rows(preflight, room_id=room_id)
+    finally:
+        preflight.close()
+    if candidate is None or not candidate[1]:
+        return []
+
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        current = _stop_fenced_inactive_rows(conn, room_id=room_id)
+        if current is None or not current[1]:
+            return []
+        cancel_id, rows = current
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='cancelled', cancel_generation=cancel_generation+1,
+                   cancel_id=?, terminal_at=?, updated_at=?
+               WHERE room_id=? AND status IN ('queued', 'deferred')
+                 AND source_event_seq <= (
+                     SELECT MAX(seq) FROM hosted_room_events
+                     WHERE room_id=? AND kind='room.stop_requested'
+                 )""",
+            (cancel_id, now, now, room_id, room_id),
+        )
+        if updated.rowcount != len(rows):
+            raise StaleTaskError(
+                "stop-fenced inactive tasks changed during reconciliation"
+            )
+        return [_task_identity_from_row(row) for row in rows]
+
+
 def admit_task(
     db_path: Path | str,
     identity: TaskIdentity,
@@ -1168,6 +1698,37 @@ def admit_task(
         ).fetchone()
         if turn is not None:
             raise TaskConflictError("thread_id and turn_id are already bound to a task")
+
+        _raise_if_task_fenced(
+            conn,
+            room_id=identity.room_id,
+            source_event_seq=normalized_payload["source_event_seq"],
+        )
+        discussion_liability_key = (
+            hosted_rooms._pending_discussion_liability_key_for_source(
+                conn,
+                room_id=identity.room_id,
+                source_event_seq=normalized_payload["source_event_seq"],
+                thread_id=identity.thread_id,
+            )
+        )
+        try:
+            hosted_rooms._assert_terminal_recovery_headroom(
+                conn,
+                room_id=identity.room_id,
+                released_liability_keys=(
+                    frozenset({discussion_liability_key})
+                    if discussion_liability_key is not None
+                    else frozenset()
+                ),
+                prospective_liability_keys=frozenset(
+                    {(identity.room_id, identity.task_id)}
+                ),
+            )
+        except hosted_rooms.HostedRoomError as exc:
+            raise TaskAdmissionBlockedError(
+                "task admission is blocked to preserve terminal recovery headroom"
+            ) from exc
 
         conn.execute(
             """INSERT INTO hosted_room_driver_tasks (
@@ -1218,6 +1779,11 @@ def start_task(
             raise InvalidTaskTransitionError(
                 f"cannot start task in state '{row['status']}'"
             )
+        _raise_if_task_fenced(
+            conn,
+            room_id=identity.room_id,
+            source_event_seq=int(row["source_event_seq"]),
+        )
         unresolved = conn.execute(
             """SELECT task_id, status FROM hosted_room_driver_tasks
                WHERE room_id=? AND status IN ('running', 'indeterminate', 'stopping')
@@ -1558,6 +2124,11 @@ def requeue_indeterminate_task(
             or int(row["cancel_generation"]) != expected_cancel_generation
         ):
             raise StaleTaskError("indeterminate task generation changed")
+        _raise_if_task_fenced(
+            conn,
+            room_id=identity.room_id,
+            source_event_seq=int(row["source_event_seq"]),
+        )
         updated = conn.execute(
             """UPDATE hosted_room_driver_tasks
                SET status='queued', run_gateway_id=NULL,
@@ -1687,6 +2258,11 @@ def requeue_deferred_task(
             or int(row["cancel_generation"]) != expected_cancel_generation
         ):
             raise StaleTaskError("deferred task generation changed")
+        _raise_if_task_fenced(
+            conn,
+            room_id=identity.room_id,
+            source_event_seq=int(row["source_event_seq"]),
+        )
         if require_active_source_event_seq is not None:
             active_source = conn.execute(
                 """SELECT 1

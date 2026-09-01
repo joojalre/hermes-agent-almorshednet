@@ -180,6 +180,107 @@ def _assert_retired_identity_stays_reserved(db, room_id, *, fresh_id):
     assert _create(db, fresh_id)["room_id"] == fresh_id
 
 
+def test_control_reserve_proves_stop_terminal_and_demotion_headroom():
+    assert rooms.CONTROL_EVENT_COUNT_RESERVE >= (
+        rooms.STOP_EVENT_COUNT_RESERVE
+        + rooms.TERMINAL_RECOVERY_COUNT_RESERVE
+        + rooms.DEMOTION_CONTROL_EVENT_COUNT_RESERVE
+    )
+    assert rooms.CONTROL_EVENT_BYTE_RESERVE >= (
+        rooms.STOP_EVENT_BYTE_RESERVE
+        + rooms.TERMINAL_RECOVERY_BYTE_RESERVE
+        + rooms.DEMOTION_CONTROL_EVENT_BYTE_RESERVE
+    )
+
+
+def test_open_admission_reservation_is_durable_across_transactions(
+    tmp_path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    _create(db)
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
+
+    _append(
+        db,
+        room_id="room-1",
+        event_id="discussion-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "first", "thread_id": "thread-1"},
+        require_open_admissions=True,
+    )
+    _append(
+        db,
+        room_id="room-1",
+        event_id="discussion-1-follow-up",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "replace", "thread_id": "thread-1"},
+        require_open_admissions=True,
+    )
+
+    with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == {
+            rooms._discussion_liability_key("room-1", "thread-1")
+        }
+    _append(
+        db,
+        room_id="room-1",
+        event_id="unrelated-terminal",
+        kind="turn.cancelled",
+        actor=GATEWAY_A,
+        payload={
+            "task_id": "unrelated-task",
+            "discussion_event_id": "discussion-1-follow-up",
+        },
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+    )
+    with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == {
+            rooms._discussion_liability_key("room-1", "thread-1")
+        }
+    with pytest.raises(rooms.HostedRoomError, match="unpublished terminal work"):
+        _append(
+            db,
+            room_id="room-1",
+            event_id="discussion-2",
+            kind="message.user",
+            actor=USER,
+            payload={"text": "second", "thread_id": "thread-2"},
+            require_open_admissions=True,
+        )
+
+    replay = rooms.read_events(db, room_id="room-1", since_seq=0, limit=10)
+    assert "discussion-2" not in {event["event_id"] for event in replay["events"]}
+
+
+def test_ordinary_control_event_cannot_consume_exclusive_demotion_slots(
+    tmp_path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    _create(db)
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 0)
+    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 2)
+
+    with pytest.raises(rooms.HostedRoomError, match="preserve terminal recovery"):
+        rooms.claim_authority(
+            db,
+            room_id="room-1",
+            expected_gateway_id="gateway-a",
+            expected_epoch=1,
+            new_gateway_id="gateway-b",
+            event_id="control-would-consume-demotion-slot",
+            now=11,
+        )
+
+    state = rooms.room_state(db, room_id="room-1")
+    assert state["authority_gateway_id"] == "gateway-a"
+    assert state["authority_epoch"] == 1
+
+
 def test_create_room_is_idempotent_but_conflicts_fail_closed(tmp_path):
     db = tmp_path / "state.db"
     first = _create(db)
@@ -788,6 +889,7 @@ def test_room_log_pages_are_bounded_by_serialized_event_bytes(tmp_path, monkeypa
             kind="message.user",
             actor=USER,
             payload={"text": "x" * 180, "index": index},
+            now=20.0,
         )
 
     one_event = rooms.read_events(db, room_id="room-1", limit=1)
@@ -988,7 +1090,7 @@ def test_stop_reserve_cannot_exhaust_critical_control_capacity(tmp_path, monkeyp
     )
     monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 1)
     monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 1)
-    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 2)
+    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 4)
     state = rooms.room_state(db, room_id="room-1")
 
     rooms.request_room_stop(

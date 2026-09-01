@@ -95,6 +95,19 @@ def _open_driver_schema(path: str) -> int:
     return len(driver.list_tasks(path, room_id="room-1"))
 
 
+def _begin_demotion_from_process(path: str, cancel_id: str) -> dict[str, object]:
+    return driver.begin_room_demotion(
+        path,
+        room_id="room-1",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        observed_gateway_id="gateway-b",
+        observed_epoch=2,
+        cancel_id=cancel_id,
+        clock=FakeClock(),
+    )
+
+
 def test_driver_lease_preserves_legacy_positional_reclaimed_argument():
     lease = driver.DriverLease(
         "room-1",
@@ -422,6 +435,438 @@ def test_task_admission_is_idempotent_and_identity_conflicts_fail(db):
             payload=_payload(),
             clock=clock,
         )
+
+
+def test_task_admission_is_atomically_fenced_by_latest_stop(db):
+    clock = FakeClock()
+    room = rooms.room_state(db, room_id="room-1")
+    first = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-before-stop",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect"},
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+    )
+    stop = rooms.request_room_stop(
+        db,
+        room_id="room-1",
+        cancel_id="stop-1",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+    )
+
+    with pytest.raises(driver.TaskAdmissionBlockedError, match="Stop fence"):
+        _admit(
+            db,
+            _identity(),
+            clock,
+            payload=_payload(source_event_seq=first["seq"]),
+        )
+
+    with pytest.raises(driver.TaskAdmissionBlockedError, match="Stop fence"):
+        _admit(
+            db,
+            _identity("task-at-stop", turn_id="turn-at-stop"),
+            clock,
+            payload=_payload(source_event_seq=stop["seq"]),
+        )
+
+    newer = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-after-stop",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect again"},
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+    )
+    admitted = _admit(
+        db,
+        _identity("task-2", turn_id="turn-2"),
+        clock,
+        payload=_payload(source_event_seq=newer["seq"]),
+    )
+    assert admitted["status"] == "queued"
+
+
+def test_durable_admission_barrier_blocks_new_tasks_idempotently(db):
+    clock = FakeClock()
+    existing_identity = _identity()
+    _admit(db, existing_identity, clock)
+    lease = _lease(db, clock)
+
+    first = driver.block_room_admissions(
+        db,
+        room_id="room-1",
+        reason="authority-demotion",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        clock=clock,
+    )
+    repeated = driver.block_room_admissions(
+        db,
+        room_id="room-1",
+        reason="authority-demotion",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        clock=clock,
+    )
+
+    assert first["idempotent"] is False
+    assert repeated["idempotent"] is True
+    with pytest.raises(driver.TaskAdmissionBlockedError, match="admission barrier"):
+        _admit(db, _identity("task-2", turn_id="turn-2"), clock)
+    with pytest.raises(driver.TaskAdmissionBlockedError, match="admission barrier"):
+        driver.start_task(
+            db,
+            existing_identity,
+            lease,
+            expected_cancel_generation=0,
+            clock=clock,
+        )
+
+
+def test_room_demotion_intent_is_atomic_idempotent_and_conflict_checked(db):
+    clock = FakeClock()
+    first = driver.begin_room_demotion(
+        db,
+        room_id="room-1",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        observed_gateway_id="gateway-b",
+        observed_epoch=2,
+        cancel_id="demotion-1",
+        clock=clock,
+    )
+    repeated = driver.begin_room_demotion(
+        db,
+        room_id="room-1",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        observed_gateway_id="gateway-b",
+        observed_epoch=2,
+        cancel_id="demotion-racing-process",
+        clock=clock,
+    )
+
+    assert first["idempotent"] is False
+    assert repeated["idempotent"] is True
+    assert repeated["cancel_id"] == "demotion-1"
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        stop = conn.execute(
+            """SELECT kind, actor_json, authority_epoch, payload_json
+                 FROM hosted_room_events
+                WHERE room_id='room-1' AND event_id=?""",
+            (rooms._stop_event_id("demotion-1"),),
+        ).fetchone()
+    assert stop is not None
+    assert stop["kind"] == "room.stop_requested"
+    assert stop["authority_epoch"] == 1
+    assert stop["actor_json"] == '{"id":"gateway-a","kind":"gateway"}'
+    assert stop["payload_json"] == '{"cancel_id":"demotion-1"}'
+    assert driver.pending_room_demotion(db, room_id="room-1") == {
+        key: first[key] for key in first if key != "idempotent"
+    }
+    with pytest.raises(driver.TaskConflictError, match="different demotion intent"):
+        driver.begin_room_demotion(
+            db,
+            room_id="room-1",
+            expected_gateway_id="gateway-a",
+            expected_epoch=1,
+            observed_gateway_id="gateway-c",
+            observed_epoch=3,
+            cancel_id="demotion-2",
+            clock=clock,
+        )
+
+
+def test_demotion_intent_and_barrier_roll_back_when_atomic_stop_fails(
+    db,
+    monkeypatch,
+):
+    def fail_stop(*args, **kwargs):
+        raise rooms.HostedRoomError("no reserved Stop capacity")
+
+    monkeypatch.setattr(rooms, "_request_room_stop_locked", fail_stop)
+
+    with pytest.raises(rooms.HostedRoomError, match="reserved Stop capacity"):
+        driver.begin_room_demotion(
+            db,
+            room_id="room-1",
+            expected_gateway_id="gateway-a",
+            expected_epoch=1,
+            observed_gateway_id="gateway-b",
+            observed_epoch=2,
+            cancel_id="demotion-without-capacity",
+            clock=FakeClock(),
+        )
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM hosted_room_driver_admission_barriers"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM hosted_room_driver_demotion_intents"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            """SELECT COUNT(*) FROM hosted_room_events
+               WHERE kind='room.stop_requested'"""
+        ).fetchone()[0] == 0
+
+
+def test_identical_demotion_race_reuses_the_winning_process_cancel_id(db):
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                _begin_demotion_from_process,
+                [str(db), str(db)],
+                ["demotion-process-a", "demotion-process-b"],
+            )
+        )
+
+    assert sorted(result["idempotent"] for result in results) == [False, True]
+    assert len({result["cancel_id"] for result in results}) == 1
+    assert results[0]["observed_gateway_id"] == "gateway-b"
+    assert results[1]["observed_gateway_id"] == "gateway-b"
+
+
+def test_queued_task_cannot_start_after_stop_fence(db):
+    clock = FakeClock()
+    room = rooms.room_state(db, room_id="room-1")
+    source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-before-stop",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect"},
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+    )
+    identity = _identity()
+    _admit(
+        db,
+        identity,
+        clock,
+        payload=_payload(source_event_seq=source["seq"]),
+    )
+    lease = _lease(db, clock)
+    rooms.request_room_stop(
+        db,
+        room_id="room-1",
+        cancel_id="stop-1",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+    )
+
+    with pytest.raises(driver.TaskAdmissionBlockedError, match="Stop fence"):
+        driver.start_task(
+            db,
+            identity,
+            lease,
+            expected_cancel_generation=0,
+            clock=clock,
+        )
+    assert driver.get_task(db, identity)["status"] == "queued"
+
+
+def test_reconcile_stop_fenced_inactive_tasks_cancels_only_superseded_work(db):
+    clock = FakeClock()
+    room = rooms.room_state(db, room_id="room-1")
+    stale_source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-before-crash-stop",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect"},
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+    )
+    stale_identity = _identity()
+    _admit(
+        db,
+        stale_identity,
+        clock,
+        payload=_payload(source_event_seq=stale_source["seq"]),
+    )
+    rooms.request_room_stop(
+        db,
+        room_id="room-1",
+        cancel_id="stop-before-crash",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+    )
+    current_source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-after-crash-stop",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect again"},
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+    )
+    current_identity = _identity("task-2", turn_id="turn-2")
+    _admit(
+        db,
+        current_identity,
+        clock,
+        payload=_payload(source_event_seq=current_source["seq"]),
+    )
+
+    reconciled = driver.reconcile_stop_fenced_inactive_tasks(
+        db,
+        room_id="room-1",
+        clock=clock,
+    )
+    repeated = driver.reconcile_stop_fenced_inactive_tasks(
+        db,
+        room_id="room-1",
+        clock=clock,
+    )
+
+    assert reconciled == [stale_identity]
+    assert repeated == []
+    stale = driver.get_task(db, stale_identity)
+    assert stale["status"] == "cancelled"
+    assert stale["cancel_id"] == "stop-before-crash"
+    assert stale["cancel_generation"] == 1
+    assert driver.get_task(db, current_identity)["status"] == "queued"
+
+
+def test_reconcile_stop_fenced_inactive_tasks_cancels_deferred_work(db):
+    clock = FakeClock()
+    room = rooms.room_state(db, room_id="room-1")
+    source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-before-deferred-stop",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect"},
+        authority_gateway_id=room["authority_gateway_id"],
+        authority_epoch=room["authority_epoch"],
+    )
+    identity = _identity()
+    first_lease = _lease(db, clock, ttl=5)
+    _admit(
+        db,
+        identity,
+        clock,
+        payload=_payload(source_event_seq=source["seq"]),
+    )
+    attempt = driver.start_task(
+        db,
+        identity,
+        first_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    clock.advance(5)
+    recovered_lease = _lease(db, clock, process="process-b")
+    driver.recover_room(db, recovered_lease, clock=clock)
+    driver.defer_indeterminate_task(
+        db,
+        identity,
+        recovered_lease,
+        expected_execution_generation=attempt.execution_generation,
+        expected_cancel_generation=attempt.cancel_generation,
+        reason="member_unavailable",
+        clock=clock,
+    )
+    rooms.request_room_stop(
+        db,
+        room_id="room-1",
+        cancel_id="stop-deferred",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+    )
+
+    assert driver.reconcile_stop_fenced_inactive_tasks(
+        db,
+        room_id="room-1",
+        clock=clock,
+    ) == [identity]
+    cancelled = driver.get_task(db, identity)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["cancel_id"] == "stop-deferred"
+
+
+def test_admission_barrier_is_scoped_to_superseded_authority_epoch(db):
+    clock = FakeClock()
+    driver.block_room_admissions(
+        db,
+        room_id="room-1",
+        reason="authority-demotion",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        clock=clock,
+    )
+    rooms.claim_authority(
+        db,
+        room_id="room-1",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        new_gateway_id="gateway-b",
+        event_id="claim-gateway-b",
+        now=clock(),
+    )
+    current = rooms.claim_authority(
+        db,
+        room_id="room-1",
+        expected_gateway_id="gateway-b",
+        expected_epoch=2,
+        new_gateway_id="gateway-a",
+        event_id="claim-gateway-a",
+        now=clock(),
+    )
+    source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="user-after-repromotion",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect after repromotion", "thread_id": "thread-1"},
+        authority_gateway_id=current["authority_gateway_id"],
+        authority_epoch=current["authority_epoch"],
+        require_open_admissions=True,
+    )
+    identity = _identity()
+    admitted = _admit(
+        db,
+        identity,
+        clock,
+        payload=_payload(source_event_seq=source["seq"]),
+    )
+    lease = _lease(db, clock, authority_epoch=3, process="process-epoch-3")
+
+    assert admitted["status"] == "queued"
+    assert (
+        driver.start_task(
+            db,
+            identity,
+            lease,
+            expected_cancel_generation=0,
+            clock=clock,
+        ).identity
+        == identity
+    )
+    next_barrier = driver.block_room_admissions(
+        db,
+        room_id="room-1",
+        reason="authority-demotion",
+        expected_gateway_id="gateway-a",
+        expected_epoch=3,
+        clock=clock,
+    )
+    assert next_barrier["idempotent"] is False
+    assert next_barrier["authority_epoch"] == 3
 
 
 def test_concurrent_task_start_has_one_winner(db):
@@ -1229,6 +1674,230 @@ def test_indeterminate_task_can_be_deferred_retried_and_cancelled(db):
     assert cancelled["status"] == "cancelled"
 
 
+def test_stop_fence_blocks_requeue_of_an_indeterminate_task(db):
+    clock = FakeClock()
+    identity = _identity()
+    first = _lease(db, clock, ttl=5)
+    _admit(db, identity, clock)
+    attempt = driver.start_task(
+        db,
+        identity,
+        first,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    clock.advance(5)
+    recovered = _lease(db, clock, process="recovered-process", ttl=30)
+    driver.recover_room(db, recovered, clock=clock)
+    room = rooms.room_state(db, room_id="room-1")
+    rooms.request_room_stop(
+        db,
+        room_id="room-1",
+        cancel_id="stop-before-indeterminate-requeue",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+    )
+
+    with pytest.raises(driver.TaskAdmissionBlockedError, match="Stop fence"):
+        driver.requeue_indeterminate_task(
+            db,
+            identity,
+            recovered,
+            expected_execution_generation=attempt.execution_generation,
+            expected_cancel_generation=attempt.cancel_generation,
+            clock=clock,
+        )
+
+    assert driver.get_task(db, identity)["status"] == "indeterminate"
+
+
+def test_stop_fence_blocks_requeue_of_a_deferred_task(db):
+    clock = FakeClock()
+    identity = _identity()
+    lease = _lease(db, clock)
+    _admit(db, identity, clock)
+    attempt = driver.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    driver.defer_running_task(
+        db,
+        attempt,
+        reason="member_unavailable",
+        clock=clock,
+    )
+    room = rooms.room_state(db, room_id="room-1")
+    rooms.request_room_stop(
+        db,
+        room_id="room-1",
+        cancel_id="stop-before-deferred-requeue",
+        expected_gateway_id=room["authority_gateway_id"],
+        expected_epoch=room["authority_epoch"],
+    )
+
+    with pytest.raises(driver.TaskAdmissionBlockedError, match="Stop fence"):
+        driver.requeue_deferred_task(
+            db,
+            identity,
+            lease,
+            expected_execution_generation=attempt.execution_generation,
+            expected_cancel_generation=attempt.cancel_generation,
+            clock=clock,
+        )
+
+    assert driver.get_task(db, identity)["status"] == "deferred"
+
+
+def test_admission_is_bounded_by_terminal_recovery_liability(db, monkeypatch):
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
+    clock = FakeClock()
+    _admit(db, _identity("task-1", turn_id="turn-1"), clock)
+
+    with pytest.raises(driver.TaskAdmissionBlockedError, match="recovery headroom"):
+        _admit(db, _identity("task-2", turn_id="turn-2"), clock)
+
+    assert len(driver.list_tasks(db, room_id="room-1")) == 1
+
+
+def test_admission_atomically_swaps_discussion_reservation_for_task(
+    db,
+    monkeypatch,
+):
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
+    source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="discussion-1",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect", "thread_id": "thread-1"},
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+        require_open_admissions=True,
+    )
+
+    admitted = _admit(
+        db,
+        _identity(),
+        FakeClock(),
+        payload=_payload(source_event_seq=source["seq"]),
+    )
+
+    assert admitted["status"] == "queued"
+    with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == {
+            ("room-1", "task-1")
+        }
+
+    driver.cancel_task(
+        db,
+        _identity(),
+        cancel_id="cancel-discussion-1",
+        expected_cancel_generation=0,
+        clock=FakeClock(),
+    )
+    rooms.append_events(
+        db,
+        events=[
+            {
+                "room_id": "room-1",
+                "event_id": "terminal-discussion-1",
+                "kind": "turn.cancelled",
+                "actor": {"kind": "gateway", "id": "gateway-a"},
+                "payload": {
+                    "task_id": "task-1",
+                    "discussion_event_id": "discussion-1",
+                },
+                "authority_gateway_id": "gateway-a",
+                "authority_epoch": 1,
+            }
+        ],
+        allow_terminal_recovery=True,
+    )
+    with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == set()
+
+
+def test_unrelated_terminal_event_cannot_consume_existing_liability_headroom(
+    db,
+    monkeypatch,
+):
+    _admit(db, _identity(), FakeClock())
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 0)
+    monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 1)
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
+    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 4)
+
+    with pytest.raises(rooms.HostedRoomError, match="preserve terminal recovery"):
+        rooms.append_events(
+            db,
+            events=[
+                {
+                    "room_id": "room-1",
+                    "event_id": "terminal-for-unrelated-task",
+                    "kind": "turn.cancelled",
+                    "actor": {"kind": "gateway", "id": "gateway-a"},
+                    "payload": {"task_id": "unrelated-task"},
+                    "authority_gateway_id": "gateway-a",
+                    "authority_epoch": 1,
+                }
+            ],
+            allow_terminal_recovery=True,
+        )
+
+
+def test_durable_terminal_publication_releases_liability_at_exact_boundary(
+    db,
+    monkeypatch,
+):
+    clock = FakeClock()
+    identity = _identity()
+    _admit(db, identity, clock)
+    driver.cancel_task(
+        db,
+        identity,
+        cancel_id="cancel-at-boundary",
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 0)
+    monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 1)
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
+    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 4)
+
+    appended = rooms.append_events(
+        db,
+        events=[
+            {
+                "room_id": "room-1",
+                "event_id": "terminal-for-task-1",
+                "kind": "turn.cancelled",
+                "actor": {"kind": "gateway", "id": "gateway-a"},
+                "payload": {"task_id": "task-1"},
+                "authority_gateway_id": "gateway-a",
+                "authority_epoch": 1,
+            }
+        ],
+        allow_terminal_recovery=True,
+    )
+
+    assert appended[0]["kind"] == "turn.cancelled"
+    with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == set()
+
+
+def test_existing_liabilities_over_recovery_reserve_fail_loudly(db, monkeypatch):
+    identity = _identity()
+    _admit(db, identity, FakeClock())
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 0)
+
+    with pytest.raises(driver.DriverStateError, match="exceed durable terminal"):
+        driver.get_task(db, identity)
+
+
 def test_state_survives_sqlite_reopen_and_concurrent_duplicate_admission(db):
     clock = FakeClock()
     identity = _identity()
@@ -1250,6 +1919,116 @@ def test_state_survives_sqlite_reopen_and_concurrent_duplicate_admission(db):
     assert reopened["identity"] == identity
     assert reopened["payload"] == _payload()
     assert listed[0]["payload"] == _payload()
+
+
+def test_pre_admission_barrier_schema_is_migrated_without_losing_work(db):
+    identity = _identity()
+    _admit(db, identity, FakeClock())
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE hosted_room_driver_admission_barriers")
+
+    assert driver.get_task(db, identity)["status"] == "queued"
+    with sqlite3.connect(db) as conn:
+        table = conn.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type='table'
+                 AND name='hosted_room_driver_admission_barriers'"""
+        ).fetchone()
+        task_count = conn.execute(
+            "SELECT COUNT(*) FROM hosted_room_driver_tasks"
+        ).fetchone()[0]
+
+    assert table == ("hosted_room_driver_admission_barriers",)
+    assert task_count == 1
+
+
+def test_pre_demotion_intent_schema_is_migrated_without_losing_work(db):
+    identity = _identity()
+    _admit(db, identity, FakeClock())
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE hosted_room_driver_demotion_intents")
+
+    assert driver.get_task(db, identity)["status"] == "queued"
+    with sqlite3.connect(db) as conn:
+        table = conn.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type='table'
+                 AND name='hosted_room_driver_demotion_intents'"""
+        ).fetchone()
+        task_count = conn.execute(
+            "SELECT COUNT(*) FROM hosted_room_driver_tasks"
+        ).fetchone()[0]
+
+    assert table == ("hosted_room_driver_demotion_intents",)
+    assert task_count == 1
+
+
+def test_barrier_only_demotion_schema_fails_loudly_instead_of_wedging(db):
+    driver.block_room_admissions(
+        db,
+        room_id="room-1",
+        reason="authority-demotion",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        clock=FakeClock(),
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE hosted_room_driver_demotion_intents")
+
+    with pytest.raises(driver.DriverStateError, match="lacks resumable target"):
+        driver.pending_room_demotion(db, room_id="room-1")
+
+
+def test_completed_legacy_demotion_barrier_does_not_block_schema_migration(db):
+    driver.block_room_admissions(
+        db,
+        room_id="room-1",
+        reason="authority-demotion",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        clock=FakeClock(),
+    )
+    rooms.claim_authority(
+        db,
+        room_id="room-1",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        new_gateway_id="gateway-b",
+        event_id="authority-claimed-by-gateway-b",
+        now=101.0,
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP TABLE hosted_room_driver_demotion_intents")
+
+    assert driver.pending_room_demotion(db, room_id="room-1") is None
+    with sqlite3.connect(db) as conn:
+        table = conn.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type='table'
+                 AND name='hosted_room_driver_demotion_intents'"""
+        ).fetchone()
+    assert table == ("hosted_room_driver_demotion_intents",)
+
+
+def test_current_demotion_intent_without_atomic_stop_fails_loudly(db):
+    driver.begin_room_demotion(
+        db,
+        room_id="room-1",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        observed_gateway_id="gateway-b",
+        observed_epoch=2,
+        cancel_id="demotion-lost-stop",
+        clock=FakeClock(),
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "DELETE FROM hosted_room_events WHERE room_id='room-1' AND event_id=?",
+            (rooms._stop_event_id("demotion-lost-stop"),),
+        )
+
+    with pytest.raises(driver.DriverStateError, match="lacks its atomic Stop"):
+        driver.pending_room_demotion(db, room_id="room-1")
 
 
 def test_prune_removes_only_old_published_terminal_tasks(db):

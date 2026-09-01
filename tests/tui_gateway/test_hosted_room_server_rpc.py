@@ -236,6 +236,71 @@ def test_interrupt_admitted_acknowledges_inactive_and_absent_tasks():
     assert not any(method == "session.interrupt" for method, _ in calls)
 
 
+def test_concurrent_interrupt_claim_stays_pending_until_signal_is_proven():
+    server, _calls = _server()
+    task = TaskIdentity("room", "task", "thread", "turn")
+    server._sessions["runtime"] = _admitted_session(task)
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    call_lock = threading.Lock()
+    call_count = 0
+
+    def interrupt(rid, _params):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            current = call_count
+        if current == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+            return {"id": rid, "result": {"status": "interrupted"}}
+        return {"id": rid, "result": {"status": "not_interrupted"}}
+
+    server._methods["session.interrupt"] = interrupt
+    rpc = HostedRoomServerRPC(server)
+    first_result: list[dict] = []
+    first = threading.Thread(
+        target=lambda: first_result.append(
+            dict(
+                rpc.interrupt_admitted(
+                    task=task,
+                    execution_generation=2,
+                    source="bot_room",
+                )
+            )
+        )
+    )
+    first.start()
+    assert first_entered.wait(timeout=5)
+
+    try:
+        overlapping = rpc.interrupt_admitted(
+            task=task,
+            execution_generation=2,
+            source="bot_room",
+        )
+        assert overlapping == {
+            "status": "pending",
+            "acknowledged": False,
+            "active": True,
+            "interrupted": False,
+            "session_id": "runtime",
+        }
+    finally:
+        release_first.set()
+        first.join(timeout=5)
+    assert not first.is_alive()
+    assert first_result == [
+        {
+            "status": "interrupted",
+            "acknowledged": True,
+            "active": True,
+            "interrupted": True,
+            "session_id": "runtime",
+        }
+    ]
+
+
 def test_interrupt_admitted_fails_closed_on_ambiguous_admission():
     server, calls = _server()
     task = TaskIdentity("room", "task", "thread", "turn")

@@ -6,6 +6,7 @@ import sqlite3
 
 import pytest
 
+import gateway.hosted_room_driver as driver
 import gateway.hosted_room_replicas as replicas
 import gateway.hosted_rooms as rooms
 
@@ -322,6 +323,83 @@ def test_promote_replays_history_that_validly_used_stop_reserve(
     ]
 
 
+def test_promote_replays_correlated_terminal_pair_with_its_reserve(
+    tmp_path, monkeypatch
+):
+    adb = _authority_db(tmp_path)
+    rooms.create_room(
+        adb,
+        room_id="room-1",
+        name="Field Room",
+        members=MEMBERS,
+        authority_gateway_id=AUTH_A,
+    )
+    rooms.append_event(
+        adb,
+        room_id="room-1",
+        event_id="ordinary-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "at the ordinary limit"},
+        authority_gateway_id=AUTH_A,
+        authority_epoch=1,
+    )
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 1)
+    monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 0)
+    monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
+    correlation = {
+        "task_id": "task-1",
+        "discussion_event_id": "discussion-1",
+        "member_id": "planner",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+    }
+    rooms.append_events(
+        adb,
+        events=[
+            {
+                "room_id": "room-1",
+                "event_id": "member-terminal-1",
+                "kind": "message.member",
+                "actor": {"kind": "member", "id": "planner"},
+                "payload": correlation,
+                "authority_gateway_id": AUTH_A,
+                "authority_epoch": 1,
+            },
+            {
+                "room_id": "room-1",
+                "event_id": "settled-terminal-1",
+                "kind": "turn.settled",
+                "actor": {"kind": "gateway", "id": AUTH_A},
+                "payload": {
+                    **correlation,
+                    "message_event_id": "member-terminal-1",
+                    "passed": False,
+                },
+                "authority_gateway_id": AUTH_A,
+                "authority_epoch": 1,
+            },
+        ],
+        allow_terminal_recovery=True,
+    )
+    page = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)
+    rdb = _replica_db(tmp_path)
+    replicas.ingest_page(
+        rdb, room_id="room-1", room_name="Field Room", members=MEMBERS, page=page
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_B)
+
+    replicas.promote_replica(rdb, room_id="room-1")
+
+    replay = rooms.read_events(rdb, room_id="room-1", since_seq=0, limit=100)
+    assert [event["kind"] for event in replay["events"]] == [
+        "message.user",
+        "message.member",
+        "turn.settled",
+        "authority.claimed",
+    ]
+
+
 def test_promote_refuses_when_active_room_capacity_is_full(tmp_path, monkeypatch):
     page = _seed_room(_authority_db(tmp_path), n_events=1)
     rdb = _replica_db(tmp_path)
@@ -415,6 +493,39 @@ def test_demote_fences_stale_local_authority(tmp_path, monkeypatch):
         adb, room_id="room-1", observed_gateway_id=AUTH_B, observed_epoch=2
     )
     assert again["idempotent"] is True
+
+
+def test_demote_rejects_unpublished_terminal_liability_without_mutation(
+    tmp_path, monkeypatch
+):
+    adb = _authority_db(tmp_path)
+    _seed_room(adb, n_events=1)
+    driver.admit_task(
+        adb,
+        driver.TaskIdentity(
+            room_id="room-1",
+            task_id="task-unpublished",
+            thread_id="thread-1",
+            turn_id="turn-1",
+        ),
+        payload={
+            "target_profile": "planner",
+            "prompt": "Publish this task's terminal result before demotion.",
+            "source_event_seq": 1,
+        },
+        clock=lambda: 100.0,
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_A)
+    before = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)
+
+    with pytest.raises(replicas.ReplicaError, match="unpublished terminal"):
+        replicas.demote_room(
+            adb, room_id="room-1", observed_gateway_id=AUTH_B, observed_epoch=2
+        )
+
+    after = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)
+    assert after["authority"] == before["authority"]
+    assert after["events"] == before["events"]
 
 
 def test_demote_preflights_authority_lost_control_capacity(tmp_path, monkeypatch):

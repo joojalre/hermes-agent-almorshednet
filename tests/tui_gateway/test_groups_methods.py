@@ -307,8 +307,16 @@ def test_foreign_authority_cannot_send_or_disband(home):
     assert list_rooms(default_db_path())[0]["room_id"] == "room-1"
 
 
-def test_client_event_id_cannot_squat_disband_receipt(home):
+def test_client_event_id_cannot_squat_disband_receipt(home, monkeypatch):
     _create_room()
+    service = methods_groups.get_hosted_room_service()
+    assert service is not None
+
+    def skip_planning(_binding):
+        return None
+
+    monkeypatch.setattr(service, "prepare_room", skip_planning)
+    monkeypatch.setattr(service.runtime, "prepare_room", skip_planning)
     sent = _result(
         srv._methods["groups.send"](
             2,

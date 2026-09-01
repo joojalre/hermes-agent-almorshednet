@@ -311,9 +311,69 @@ class HostedRoomService:
             expected_latest_seq=int(room["latest_seq"]),
         )
 
+    def _finish_room_demotion(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        from gateway.hosted_room_replicas import demote_room
+
+        room_id = str(intent["room_id"])
+        gateway_id = str(intent["gateway_id"])
+        authority_epoch = int(intent["authority_epoch"])
+        stopped_locally = True
+        try:
+            self.stop_room(
+                room_id,
+                cancel_id=str(intent["cancel_id"]),
+                require_acknowledged=True,
+            )
+        except hosted_rooms.AuthorityConflictError:
+            # Another process may have completed the same durable intent after
+            # this runtime read it. The replica primitive verifies that the
+            # current lineage exactly matches the intended target.
+            stopped_locally = False
+        if stopped_locally:
+            room = hosted_rooms.room_state(
+                self.db_path,
+                room_id=room_id,
+            )
+            if (
+                str(room["authority_gateway_id"]) == gateway_id
+                and int(room["authority_epoch"]) == authority_epoch
+            ):
+                try:
+                    published = self._publish_terminal_tasks(room)
+                except hosted_rooms.AuthorityConflictError:
+                    # A competing process crossed the authority CAS after our
+                    # old-lineage snapshot. The replica primitive below still
+                    # verifies that it reached this exact intended target.
+                    pass
+                else:
+                    if published:
+                        refreshed = hosted_rooms.room_state(
+                            self.db_path,
+                            room_id=room_id,
+                        )
+                        self._policy_snapshot(refreshed)
+        return demote_room(
+            self.db_path,
+            room_id=room_id,
+            observed_gateway_id=str(intent["observed_gateway_id"]),
+            observed_epoch=int(intent["observed_epoch"]),
+        )
+
     def prepare_room(self, binding: HostedRoomBinding) -> None:
         with self._policy_lock:
+            pending_demotion = driver.pending_room_demotion(
+                self.db_path,
+                room_id=binding.room_id,
+            )
+            if pending_demotion is not None:
+                self._finish_room_demotion(pending_demotion)
+                return
             room = hosted_rooms.room_state(self.db_path, room_id=binding.room_id)
+            driver.reconcile_stop_fenced_inactive_tasks(
+                self.db_path,
+                room_id=binding.room_id,
+                clock=self.runtime.clock,
+            )
             snapshot = self._policy_snapshot(room)
             events = list(snapshot.events)
             if self._publish_terminal_tasks(room):
@@ -395,12 +455,17 @@ class HostedRoomService:
                         expected_latest_seq=int(room["latest_seq"]),
                     )
                     return
-                driver.admit_task(
-                    self.db_path,
-                    decision.task.identity,
-                    payload=decision.task.payload,
-                    clock=time.time,
-                )
+                try:
+                    driver.admit_task(
+                        self.db_path,
+                        decision.task.identity,
+                        payload=decision.task.payload,
+                        clock=time.time,
+                    )
+                except driver.TaskAdmissionBlockedError:
+                    # The user event remains durable, but this runtime lost the
+                    # atomic Stop or authority-demotion admission race.
+                    return
                 # A stop can race the policy read from another process. Re-read
                 # after admission and cancel before the runtime can execute a
                 # task whose source event is now behind the room stop fence.
@@ -475,6 +540,7 @@ class HostedRoomService:
             payload=normalized,
             authority_gateway_id=str(room["authority_gateway_id"]),
             authority_epoch=int(room["authority_epoch"]),
+            require_open_admissions=True,
         )
         binding = next(
             (
@@ -589,17 +655,31 @@ class HostedRoomService:
                     observed_epoch=observed_epoch,
                 )
 
-            self.stop_room(
-                room_id,
-                cancel_id=f"authority-demote:{observed_epoch}:{uuid.uuid4().hex}",
-                require_acknowledged=True,
-            )
-            return demote_room(
+            pending_demotion = driver.pending_room_demotion(
                 self.db_path,
                 room_id=room_id,
+            )
+            if pending_demotion is not None:
+                if (
+                    pending_demotion["observed_gateway_id"] != observed_gateway_id
+                    or int(pending_demotion["observed_epoch"]) != observed_epoch
+                ):
+                    raise driver.TaskConflictError(
+                        "room already has a different pending demotion intent"
+                    )
+                return self._finish_room_demotion(pending_demotion)
+
+            intent = driver.begin_room_demotion(
+                self.db_path,
+                room_id=room_id,
+                expected_gateway_id=current_gateway,
+                expected_epoch=current_epoch,
                 observed_gateway_id=observed_gateway_id,
                 observed_epoch=observed_epoch,
+                cancel_id=f"authority-demote:{observed_epoch}:{uuid.uuid4().hex}",
+                clock=time.time,
             )
+            return self._finish_room_demotion(intent)
 
     def retry_room_task(self, room_id: str, *, task_id: str) -> dict[str, Any]:
         """Retry one uncertain or deferred task only after explicit user action."""

@@ -45,12 +45,39 @@ MAX_ROOM_EVENT_BYTES = 256 * 1024 * 1024
 # logical budget must stay well below the physical-file limit.
 MAX_GATEWAY_EVENT_BYTES = 16 * 1024 * 1024
 CONTROL_EVENT_COUNT_RESERVE = 64
-CONTROL_EVENT_BYTE_RESERVE = 1024 * 1024
-STOP_EVENT_COUNT_RESERVE = 32
+CONTROL_EVENT_BYTE_RESERVE = 10 * 1024 * 1024
+STOP_EVENT_COUNT_RESERVE = 16
 STOP_EVENT_BYTE_RESERVE = 512 * 1024
-TERMINAL_RECOVERY_COUNT_RESERVE = 16
-TERMINAL_RECOVERY_BYTE_RESERVE = 256 * 1024
+# A driver task can publish a visible member event plus one terminal event.
+# Thirty-two event slots therefore cover the atomic admission ceiling of
+# sixteen unpublished task outcomes, while leaving control headroom for Stop
+# and authority.lost.
+TERMINAL_RECOVERY_COUNT_RESERVE = 32
+TERMINAL_RECOVERY_BYTE_RESERVE = TERMINAL_RECOVERY_COUNT_RESERVE * (
+    MAX_EVENT_JSON_BYTES + 4096
+)
+DEMOTION_CONTROL_EVENT_COUNT_RESERVE = 2
+MAX_DEMOTION_CONTROL_EVENT_BYTES = MAX_EVENT_JSON_BYTES + 4096
+DEMOTION_CONTROL_EVENT_BYTE_RESERVE = (
+    DEMOTION_CONTROL_EVENT_COUNT_RESERVE * MAX_DEMOTION_CONTROL_EVENT_BYTES
+)
+MAX_TERMINAL_PUBLICATION_EVENTS = 2
+MAX_TERMINAL_PUBLICATION_BYTES = 2 * (MAX_EVENT_JSON_BYTES + 4096)
+if CONTROL_EVENT_COUNT_RESERVE < (
+    STOP_EVENT_COUNT_RESERVE
+    + TERMINAL_RECOVERY_COUNT_RESERVE
+    + DEMOTION_CONTROL_EVENT_COUNT_RESERVE
+):
+    raise RuntimeError("hosted-room count reserves cannot close a demotion")
+if CONTROL_EVENT_BYTE_RESERVE < (
+    STOP_EVENT_BYTE_RESERVE
+    + TERMINAL_RECOVERY_BYTE_RESERVE
+    + DEMOTION_CONTROL_EVENT_BYTE_RESERVE
+):
+    raise RuntimeError("hosted-room byte reserves cannot close a demotion")
 _JOURNAL_MODE_LOCK_RETRIES = 8
+
+_DISCUSSION_LIABILITY_PREFIX = "\x00discussion:"
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _EVENT_KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
@@ -113,6 +140,11 @@ _TERMINAL_COMPLETION_EVENT_KINDS = frozenset({
     "turn.cancelled",
     "turn.deferred",
 })
+_FINAL_TERMINAL_EVENT_KINDS = frozenset({
+    "turn.settled",
+    "turn.failed",
+    "turn.cancelled",
+})
 _ACTOR_FIELDS = frozenset({"kind", "id", "display_name", "profile", "connection_id"})
 
 
@@ -146,6 +178,12 @@ class AuthorityConflictError(HostedRoomError):
     """Raised when a stale room authority attempts to mutate hosted state."""
 
     reason = "authority_conflict"
+
+
+class RoomAdmissionBlockedError(HostedRoomError):
+    """Raised when the current authority is fenced against new user work."""
+
+    reason = "room_admissions_blocked"
 
 
 class AuthoritySupersededError(AuthorityConflictError):
@@ -557,15 +595,310 @@ def _event_storage_bytes(
     return len((event_id + kind + actor_json + payload_json).encode("utf-8"))
 
 
+def _stop_event_id(cancel_id: str) -> str:
+    digest = hashlib.sha256(cancel_id.encode()).hexdigest()[:32]
+    return f"room-stop:{digest}"
+
+
+def _remaining_demotion_control_events(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+) -> int:
+    """Reserve Stop plus authority.lost, or only authority.lost after Stop."""
+
+    if not _table_exists(
+        conn, "hosted_room_driver_demotion_intents"
+    ) or not _table_exists(conn, "hosted_room_driver_admission_barriers"):
+        return DEMOTION_CONTROL_EVENT_COUNT_RESERVE
+    intent = conn.execute(
+        """SELECT intent.cancel_id, intent.gateway_id, intent.authority_epoch
+             FROM hosted_room_driver_demotion_intents AS intent
+             JOIN hosted_rooms AS room ON room.room_id=intent.room_id
+            WHERE intent.room_id=? AND room.disbanded_at IS NULL
+              AND room.authority_gateway_id=intent.gateway_id
+              AND room.authority_epoch=intent.authority_epoch""",
+        (room_id,),
+    ).fetchone()
+    if intent is None:
+        return DEMOTION_CONTROL_EVENT_COUNT_RESERVE
+    cancel_id = str(intent["cancel_id"])
+    stop = conn.execute(
+        """SELECT kind, actor_json, authority_epoch, payload_json
+             FROM hosted_room_events
+            WHERE room_id=? AND event_id=?""",
+        (room_id, _stop_event_id(cancel_id)),
+    ).fetchone()
+    if stop is None:
+        return DEMOTION_CONTROL_EVENT_COUNT_RESERVE
+    expected_actor_json = _canonical_json(
+        {"kind": "gateway", "id": str(intent["gateway_id"])},
+        label="actor",
+        max_bytes=4 * 1024,
+    )
+    expected_payload_json = _canonical_json(
+        {"cancel_id": cancel_id},
+        label="payload",
+        max_bytes=MAX_EVENT_JSON_BYTES,
+    )
+    try:
+        stop_epoch = int(stop["authority_epoch"])
+    except (TypeError, ValueError):
+        return DEMOTION_CONTROL_EVENT_COUNT_RESERVE
+    if (
+        str(stop["kind"]) != "room.stop_requested"
+        or str(stop["actor_json"]) != expected_actor_json
+        or stop_epoch != int(intent["authority_epoch"])
+        or str(stop["payload_json"]) != expected_payload_json
+    ):
+        return DEMOTION_CONTROL_EVENT_COUNT_RESERVE
+    return DEMOTION_CONTROL_EVENT_COUNT_RESERVE - 1
+
+
+def _discussion_liability_key(room_id: str, thread_id: str) -> tuple[str, str]:
+    return room_id, f"{_DISCUSSION_LIABILITY_PREFIX}{thread_id}"
+
+
+def _pending_discussion_sources(
+    conn: sqlite3.Connection,
+    *,
+    consumed_task_sources: set[tuple[str, int, str]],
+) -> dict[tuple[str, str], int]:
+    latest_by_thread: dict[tuple[str, str], tuple[int, str]] = {}
+    stopped_through: dict[str, int] = {}
+    completed: set[tuple[str, str]] = set()
+    rows = conn.execute(
+        """SELECT event.room_id, event.seq, event.event_id, event.kind,
+                  event.payload_json
+             FROM hosted_room_events AS event
+             JOIN hosted_rooms AS room ON room.room_id=event.room_id
+            WHERE room.disbanded_at IS NULL
+              AND event.kind IN (
+                  'message.user', 'room.activity', 'room.stop_requested'
+              )
+            ORDER BY event.room_id, event.seq"""
+    ).fetchall()
+    for row in rows:
+        room_id = str(row["room_id"])
+        seq = int(row["seq"])
+        kind = str(row["kind"])
+        if kind == "room.stop_requested":
+            stopped_through[room_id] = max(stopped_through.get(room_id, 0), seq)
+            continue
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if kind == "room.activity":
+            discussion_event_id = payload.get("discussion_event_id")
+            if (
+                payload.get("status") in {"settled", "bounded"}
+                and isinstance(discussion_event_id, str)
+                and discussion_event_id
+            ):
+                completed.add((room_id, discussion_event_id))
+            continue
+        thread_id = payload.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            latest_by_thread[(room_id, thread_id)] = (
+                seq,
+                str(row["event_id"]),
+            )
+
+    pending: dict[tuple[str, str], int] = {}
+    for (room_id, thread_id), (seq, event_id) in latest_by_thread.items():
+        if seq <= stopped_through.get(room_id, 0):
+            continue
+        if (room_id, event_id) in completed:
+            continue
+        if (room_id, seq, thread_id) in consumed_task_sources:
+            continue
+        pending[_discussion_liability_key(room_id, thread_id)] = seq
+    return pending
+
+
+def _pending_discussion_liability_key_for_source(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+    source_event_seq: int,
+    thread_id: str,
+) -> tuple[str, str] | None:
+    key = _discussion_liability_key(room_id, thread_id)
+    pending = _pending_discussion_sources(conn, consumed_task_sources=set())
+    return key if pending.get(key) == source_event_seq else None
+
+
+def _terminal_publication_liabilities(
+    conn: sqlite3.Connection,
+) -> set[tuple[str, str]]:
+    publications_exist = _table_exists(conn, "hosted_room_policy_publications")
+    published: set[tuple[str, str]] = set()
+    if publications_exist:
+        published = {
+            (str(row["room_id"]), str(row["task_id"]))
+            for row in conn.execute(
+                """SELECT room_id, task_id FROM hosted_room_policy_publications
+                   WHERE kind IN (
+                       'turn.settled', 'turn.failed', 'turn.cancelled'
+                   )"""
+            ).fetchall()
+        }
+    for row in conn.execute(
+        """SELECT room_id, payload_json FROM hosted_room_events
+           WHERE kind IN ('turn.settled', 'turn.failed', 'turn.cancelled')"""
+    ).fetchall():
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            continue
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        if isinstance(task_id, str) and task_id:
+            published.add((str(row["room_id"]), task_id))
+    liabilities: set[tuple[str, str]] = set()
+    consumed_task_sources: set[tuple[str, int, str]] = set()
+    if _table_exists(conn, "hosted_room_driver_tasks"):
+        for row in conn.execute(
+            """SELECT task.room_id, task.task_id, task.thread_id,
+                      task.source_event_seq, task.status
+                 FROM hosted_room_driver_tasks AS task
+                 JOIN hosted_rooms AS room ON room.room_id=task.room_id
+                WHERE room.disbanded_at IS NULL"""
+        ).fetchall():
+            room_id = str(row["room_id"])
+            key = (room_id, str(row["task_id"]))
+            if str(row["status"]) not in {"settled", "failed", "cancelled"}:
+                liabilities.add(key)
+            elif key not in published:
+                liabilities.add(key)
+            consumed_task_sources.add(
+                (room_id, int(row["source_event_seq"]), str(row["thread_id"]))
+            )
+    liabilities.update(
+        _pending_discussion_sources(
+            conn,
+            consumed_task_sources=consumed_task_sources,
+        )
+    )
+    return liabilities
+
+
+def _assert_terminal_recovery_headroom(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+    additional_events: int = 0,
+    additional_bytes: int = 0,
+    released_task_ids: frozenset[str] = frozenset(),
+    released_liability_keys: frozenset[tuple[str, str]] = frozenset(),
+    prospective_liability_keys: frozenset[tuple[str, str]] = frozenset(),
+    remaining_demotion_control_events: int | None = None,
+) -> None:
+    liabilities = _terminal_publication_liabilities(conn)
+    liabilities.difference_update((room_id, task_id) for task_id in released_task_ids)
+    liabilities.difference_update(released_liability_keys)
+    liabilities.update(prospective_liability_keys)
+    room_liabilities = sum(key[0] == room_id for key in liabilities)
+    gateway_liabilities = len(liabilities)
+    if remaining_demotion_control_events is None:
+        remaining_demotion_control_events = _remaining_demotion_control_events(
+            conn,
+            room_id=room_id,
+        )
+    if not 0 <= remaining_demotion_control_events <= (
+        DEMOTION_CONTROL_EVENT_COUNT_RESERVE
+    ):
+        raise HostedRoomError("invalid demotion control reserve")
+    room_liability_events = (
+        room_liabilities * MAX_TERMINAL_PUBLICATION_EVENTS
+    )
+    gateway_liability_bytes = (
+        gateway_liabilities * MAX_TERMINAL_PUBLICATION_BYTES
+    )
+    room_liability_bytes = room_liabilities * MAX_TERMINAL_PUBLICATION_BYTES
+    if room_liability_events > TERMINAL_RECOVERY_COUNT_RESERVE:
+        raise HostedRoomError(
+            "This Group Chat has more unpublished terminal work than its "
+            "recovery reserve can guarantee."
+        )
+    if (
+        room_liability_bytes > TERMINAL_RECOVERY_BYTE_RESERVE
+        or gateway_liability_bytes > TERMINAL_RECOVERY_BYTE_RESERVE
+    ):
+        raise HostedRoomError(
+            "This host has more unpublished terminal work than its recovery "
+            "storage reserve can guarantee."
+        )
+    room = conn.execute(
+        """SELECT next_seq, event_bytes FROM hosted_rooms
+           WHERE room_id=? AND disbanded_at IS NULL""",
+        (room_id,),
+    ).fetchone()
+    if room is None:
+        _raise_room_not_found(conn, room_id)
+    control_event_limit = MAX_EVENTS_PER_ROOM + CONTROL_EVENT_COUNT_RESERVE
+    control_room_byte_limit = MAX_ROOM_EVENT_BYTES + CONTROL_EVENT_BYTE_RESERVE
+    control_gateway_byte_limit = (
+        MAX_GATEWAY_EVENT_BYTES + CONTROL_EVENT_BYTE_RESERVE
+    )
+    remaining_demotion_bytes = (
+        remaining_demotion_control_events * MAX_DEMOTION_CONTROL_EVENT_BYTES
+    )
+    used_events = int(room["next_seq"]) - 1 + additional_events
+    if (
+        used_events
+        + room_liability_events
+        + remaining_demotion_control_events
+        > control_event_limit
+    ):
+        raise HostedRoomError(
+            "This Group Chat must preserve terminal recovery headroom. "
+            "Finish pending member turns before continuing."
+        )
+    room_bytes = int(room["event_bytes"]) + additional_bytes
+    if (
+        room_bytes
+        + room_liability_bytes
+        + remaining_demotion_bytes
+        > control_room_byte_limit
+    ):
+        raise HostedRoomError(
+            "This Group Chat must preserve terminal recovery storage. "
+            "Finish pending member turns before continuing."
+        )
+    gateway_bytes = int(
+        conn.execute(
+            "SELECT COALESCE(SUM(event_bytes), 0) FROM hosted_rooms"
+        ).fetchone()[0]
+    ) + additional_bytes
+    if (
+        gateway_bytes
+        + gateway_liability_bytes
+        + remaining_demotion_bytes
+        > control_gateway_byte_limit
+    ):
+        raise HostedRoomError(
+            "This host must preserve terminal recovery storage. "
+            "Finish pending member turns before continuing."
+        )
+
+
 def _assert_event_capacity(
     conn: sqlite3.Connection,
     *,
+    room_id: str,
     room: sqlite3.Row,
     additional_bytes: int,
     additional_events: int = 1,
     allow_control: bool = False,
     allow_stop: bool = False,
     allow_terminal_recovery: bool = False,
+    released_task_ids: frozenset[str] = frozenset(),
+    released_liability_keys: frozenset[tuple[str, str]] = frozenset(),
+    prospective_liability_keys: frozenset[tuple[str, str]] = frozenset(),
+    remaining_demotion_control_events: int | None = None,
 ) -> None:
     if allow_control:
         count_reserve = CONTROL_EVENT_COUNT_RESERVE
@@ -613,6 +946,16 @@ def _assert_event_capacity(
         raise HostedRoomError(
             "Group Chat storage is full on this host. Delete an old Group Chat and try again."
         )
+    _assert_terminal_recovery_headroom(
+        conn,
+        room_id=room_id,
+        additional_events=additional_events,
+        additional_bytes=additional_bytes,
+        released_task_ids=released_task_ids,
+        released_liability_keys=released_liability_keys,
+        prospective_liability_keys=prospective_liability_keys,
+        remaining_demotion_control_events=remaining_demotion_control_events,
+    )
 
 
 def _is_terminal_recovery_plan(
@@ -669,6 +1012,27 @@ def _is_terminal_recovery_plan(
         and bool(message_event_id.strip())
         and message_event_id == member_event_id
     )
+
+
+def _released_terminal_task_ids(
+    plan: list[tuple[int, dict[str, Any]]],
+) -> frozenset[str]:
+    released: set[str] = set()
+    for _, event in plan:
+        if event.get("kind") not in _FINAL_TERMINAL_EVENT_KINDS:
+            continue
+        payload = event.get("payload")
+        if payload is None:
+            try:
+                payload = json.loads(str(event.get("payload_json", "")))
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        task_id = payload.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            released.add(task_id)
+    return frozenset(released)
 
 
 def _prune_disbanded_rooms_locked(
@@ -852,6 +1216,7 @@ def create_room(
                 )
                 _assert_event_capacity(
                     conn,
+                    room_id=room_id,
                     room=existing,
                     additional_bytes=claim_bytes,
                     allow_control=True,
@@ -993,6 +1358,7 @@ def append_event(
     payload: Any,
     authority_gateway_id: Any = None,
     authority_epoch: Any = None,
+    require_open_admissions: bool = False,
     now: float | None = None,
 ) -> dict[str, Any]:
     """Append one immutable event and allocate its per-room sequence atomically.
@@ -1000,6 +1366,8 @@ def append_event(
     Repeating the same ``event_id`` and immutable content returns the original
     event. Reusing the id for different content fails closed.
     """
+    if not isinstance(require_open_admissions, bool):
+        raise HostedRoomError("require_open_admissions must be a boolean")
     room_id = _validate_identifier(
         room_id,
         label="room_id",
@@ -1012,6 +1380,10 @@ def append_event(
     )
     kind = _validate_event_kind(kind)
     normalized_actor, actor_json = _validate_actor(actor, kind=kind)
+    if require_open_admissions and kind != "message.user":
+        raise HostedRoomError(
+            "require_open_admissions is only valid for message.user events"
+        )
     authority_scoped = normalized_actor["kind"] in {
         "user",
         "member",
@@ -1044,6 +1416,13 @@ def append_event(
         )
     if not isinstance(payload, dict):
         raise HostedRoomError("payload must be an object")
+    admission_thread_id: str | None = None
+    if require_open_admissions:
+        admission_thread_id = _validate_identifier(
+            payload.get("thread_id"),
+            label="payload.thread_id",
+            max_chars=MAX_EVENT_ID_CHARS,
+        )
     payload_json = _canonical_json(
         payload,
         label="payload",
@@ -1083,6 +1462,22 @@ def append_event(
             or int(room["authority_epoch"]) != normalized_authority_epoch
         ):
             raise AuthorityConflictError("stale hosted room authority")
+        if require_open_admissions and _table_exists(
+            conn, "hosted_room_driver_admission_barriers"
+        ):
+            barrier = conn.execute(
+                """SELECT 1 FROM hosted_room_driver_admission_barriers
+                   WHERE room_id=? AND gateway_id=? AND authority_epoch=?""",
+                (
+                    room_id,
+                    str(room["authority_gateway_id"]),
+                    int(room["authority_epoch"]),
+                ),
+            ).fetchone()
+            if barrier is not None:
+                raise RoomAdmissionBlockedError(
+                    "new user events are blocked while room authority is demoting"
+                )
         seq = int(room["next_seq"])
         event_bytes = _event_storage_bytes(
             event_id=event_id,
@@ -1090,12 +1485,29 @@ def append_event(
             actor_json=actor_json,
             payload_json=payload_json,
         )
+        released_task_ids = frozenset(
+            {str(payload["task_id"])}
+            if kind in _FINAL_TERMINAL_EVENT_KINDS
+            and isinstance(payload.get("task_id"), str)
+            and payload["task_id"]
+            else set()
+        )
         _assert_event_capacity(
             conn,
+            room_id=room_id,
             room=room,
             additional_bytes=event_bytes,
             allow_control=kind in _CRITICAL_CONTROL_EVENT_KINDS,
             allow_stop=kind == "room.stop_requested",
+            allow_terminal_recovery=(
+                kind in _TERMINAL_COMPLETION_EVENT_KINDS
+            ),
+            released_task_ids=released_task_ids,
+            prospective_liability_keys=(
+                frozenset({_discussion_liability_key(room_id, admission_thread_id)})
+                if admission_thread_id is not None
+                else frozenset()
+            ),
         )
         conn.execute(
             """INSERT INTO hosted_room_events
@@ -1246,6 +1658,7 @@ def append_events(
                 "kind": kind,
                 "normalized_actor": normalized_actor,
                 "actor_json": actor_json,
+                "payload": payload,
                 "payload_json": payload_json,
                 "authority_scoped": authority_scoped,
                 "authority_gateway_id": normalized_gateway_id,
@@ -1263,7 +1676,7 @@ def append_events(
     if len(room_ids) != 1:
         raise HostedRoomError("an event batch must target exactly one room")
 
-    results: list[dict[str, Any] | None] = [None] * len(prepared)
+    results: list[dict[str, Any] | None] = [None for _ in prepared]
     with _transaction(db_path, immediate=True) as conn:
         pending: list[tuple[int, dict[str, Any]]] = []
         for index, event in enumerate(prepared):
@@ -1326,8 +1739,14 @@ def append_events(
             terminal_recovery = allow_terminal_recovery and _is_terminal_recovery_plan(
                 list(enumerate(prepared))
             )
+            released_task_ids = (
+                _released_terminal_task_ids(pending)
+                if terminal_recovery
+                else frozenset()
+            )
             _assert_event_capacity(
                 conn,
+                room_id=room_id,
                 room=room,
                 additional_bytes=additional_bytes,
                 additional_events=len(pending),
@@ -1339,6 +1758,7 @@ def append_events(
                     event["kind"] == "room.stop_requested" for _, event in pending
                 ),
                 allow_terminal_recovery=terminal_recovery,
+                released_task_ids=released_task_ids,
             )
             first_seq = int(room["next_seq"])
             next_seq = first_seq
@@ -1472,6 +1892,131 @@ def room_state(
     return state
 
 
+def _request_room_stop_locked(
+    conn: sqlite3.Connection,
+    *,
+    room_id: Any,
+    cancel_id: Any,
+    expected_gateway_id: Any,
+    expected_epoch: Any,
+    now: float,
+    demotion_control: bool = False,
+) -> dict[str, Any]:
+    """Append one Stop while participating in the caller's write transaction."""
+
+    room_id = _validate_identifier(
+        room_id,
+        label="room_id",
+        max_chars=MAX_ROOM_ID_CHARS,
+    )
+    cancel_id = _validate_identifier(
+        cancel_id,
+        label="cancel_id",
+        max_chars=MAX_EVENT_ID_CHARS,
+    )
+    gateway_id = _validate_identifier(
+        expected_gateway_id,
+        label="expected_gateway_id",
+        max_chars=MAX_ACTOR_ID_CHARS,
+    )
+    if (
+        isinstance(expected_epoch, bool)
+        or not isinstance(expected_epoch, int)
+        or expected_epoch < 1
+    ):
+        raise HostedRoomError("expected_epoch must be a positive integer")
+    event_id = _stop_event_id(cancel_id)
+    actor_json = _canonical_json(
+        {"kind": "gateway", "id": gateway_id},
+        label="actor",
+        max_bytes=4 * 1024,
+    )
+    payload_json = _canonical_json(
+        {"cancel_id": cancel_id},
+        label="payload",
+        max_bytes=MAX_EVENT_JSON_BYTES,
+    )
+    existing = conn.execute(
+        """SELECT room_id, seq, event_id, kind, actor_json, authority_epoch,
+                  payload_json, created_at
+             FROM hosted_room_events WHERE room_id=? AND event_id=?""",
+        (room_id, event_id),
+    ).fetchone()
+    if existing is not None:
+        if (
+            str(existing["kind"]) != "room.stop_requested"
+            or str(existing["actor_json"]) != actor_json
+            or int(existing["authority_epoch"]) != expected_epoch
+            or str(existing["payload_json"]) != payload_json
+        ):
+            raise EventConflictError(
+                "event_id already exists with different content"
+            )
+        return _event_from_row(existing, idempotent=True)
+
+    room = conn.execute(
+        """SELECT next_seq, event_bytes, authority_gateway_id, authority_epoch
+             FROM hosted_rooms
+            WHERE room_id=? AND disbanded_at IS NULL""",
+        (room_id,),
+    ).fetchone()
+    if room is None:
+        _raise_room_not_found(conn, room_id)
+    if (
+        str(room["authority_gateway_id"]) != gateway_id
+        or int(room["authority_epoch"]) != expected_epoch
+    ):
+        raise AuthorityConflictError("stale hosted room authority")
+    event_bytes = _event_storage_bytes(
+        event_id=event_id,
+        kind="room.stop_requested",
+        actor_json=actor_json,
+        payload_json=payload_json,
+    )
+    _assert_event_capacity(
+        conn,
+        room_id=room_id,
+        room=room,
+        additional_bytes=event_bytes,
+        allow_control=demotion_control,
+        allow_stop=not demotion_control,
+        remaining_demotion_control_events=(1 if demotion_control else None),
+    )
+    seq = int(room["next_seq"])
+    conn.execute(
+        """INSERT INTO hosted_room_events
+           (room_id, seq, event_id, kind, actor_json, authority_epoch,
+            payload_json, created_at)
+           VALUES (?, ?, ?, 'room.stop_requested', ?, ?, ?, ?)""",
+        (
+            room_id,
+            seq,
+            event_id,
+            actor_json,
+            expected_epoch,
+            payload_json,
+            now,
+        ),
+    )
+    advanced = conn.execute(
+        """UPDATE hosted_rooms
+              SET next_seq=?, event_bytes=event_bytes+?, updated_at=?
+            WHERE room_id=? AND next_seq=?""",
+        (seq + 1, event_bytes, now, room_id, seq),
+    )
+    if advanced.rowcount != 1:
+        raise RuntimeError("hosted room sequence advance lost its write fence")
+    row = conn.execute(
+        """SELECT room_id, seq, event_id, kind, actor_json, authority_epoch,
+                  payload_json, created_at
+             FROM hosted_room_events WHERE room_id=? AND seq=?""",
+        (room_id, seq),
+    ).fetchone()
+    if row is None:  # pragma: no cover - guarded by the insert above
+        raise RuntimeError("Stop event could not be reloaded")
+    return _event_from_row(row)
+
+
 def request_room_stop(
     db_path: Path | str,
     *,
@@ -1482,22 +2027,15 @@ def request_room_stop(
 ) -> dict[str, Any]:
     """Append an idempotent fence that supersedes earlier user turns."""
 
-    cancel_id = _validate_identifier(
-        cancel_id,
-        label="cancel_id",
-        max_chars=MAX_EVENT_ID_CHARS,
-    )
-    digest = hashlib.sha256(cancel_id.encode()).hexdigest()[:32]
-    return append_event(
-        db_path,
-        room_id=room_id,
-        event_id=f"room-stop:{digest}",
-        kind="room.stop_requested",
-        actor={"kind": "gateway", "id": expected_gateway_id},
-        payload={"cancel_id": cancel_id},
-        authority_gateway_id=expected_gateway_id,
-        authority_epoch=expected_epoch,
-    )
+    with _transaction(db_path, immediate=True) as conn:
+        return _request_room_stop_locked(
+            conn,
+            room_id=room_id,
+            cancel_id=cancel_id,
+            expected_gateway_id=expected_gateway_id,
+            expected_epoch=expected_epoch,
+            now=time.time(),
+        )
 
 
 def claim_authority(
@@ -1605,6 +2143,7 @@ def claim_authority(
             )
             _assert_event_capacity(
                 conn,
+                room_id=room_id,
                 room=row,
                 additional_bytes=claim_bytes,
                 allow_control=True,
@@ -1762,6 +2301,7 @@ def disband_room(
         )
         _assert_event_capacity(
             conn,
+            room_id=room_id,
             room=room,
             additional_bytes=disband_bytes,
             allow_control=True,
