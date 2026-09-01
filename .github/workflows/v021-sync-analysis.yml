@@ -1,0 +1,267 @@
+name: Hermes v0.21.0 sync analysis
+
+on:
+  push:
+    branches:
+      - codex/v021-sync-analysis-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-sync-analysis-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Compare fork snapshot with v0.21.0 release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout analysis branch without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch immutable refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream \
+            refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31 \
+            refs/heads/main:refs/remotes/upstream/main
+          git fetch --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main \
+            refs/pull/19/head:refs/remotes/origin/pr19-head \
+            refs/heads/codex/harden-knowledge-sync-post-pr18-20260831:refs/remotes/origin/pr20-head
+
+      - name: Build tree, history, and overlap report
+        shell: bash
+        env:
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+          FORK_SNAPSHOT: e6c06033a04d9745ed1efea97ce35401323dbfd7
+          PR19_BASE: 4d0cc9d325566ba6441cabbd9dc441a7e0e95ca5
+          PR19_HEAD: 20d0a6a42365b2b2351e1dca819022b6ec477b39
+          PR20_BASE: 4d0cc9d325566ba6441cabbd9dc441a7e0e95ca5
+          PR20_HEAD: 46904b6a9129c8c8d20ecf5c5d1dabe4152dc604
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-analysis"
+          mkdir -p "$REPORT"
+
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          UPSTREAM_MAIN="$(git rev-parse refs/remotes/upstream/main)"
+          ORIGIN_MAIN="$(git rev-parse refs/remotes/origin/main)"
+          FETCHED_PR19="$(git rev-parse refs/remotes/origin/pr19-head)"
+          FETCHED_PR20="$(git rev-parse refs/remotes/origin/pr20-head)"
+
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          test "$FORK_SNAPSHOT" = "$ORIGIN_MAIN"
+          test "$PR19_HEAD" = "$FETCHED_PR19"
+          test "$PR20_HEAD" = "$FETCHED_PR20"
+          git cat-file -e "$FORK_SNAPSHOT^{commit}"
+          git cat-file -e "$PR19_BASE^{commit}"
+          git cat-file -e "$PR20_BASE^{commit}"
+
+          {
+            echo "release_tag=v2026.8.31"
+            echo "release_commit=$RELEASE"
+            echo "upstream_main=$UPSTREAM_MAIN"
+            echo "fork_snapshot=$FORK_SNAPSHOT"
+            echo "origin_main_at_run=$ORIGIN_MAIN"
+            echo "pr19_base=$PR19_BASE"
+            echo "pr19_head=$PR19_HEAD"
+            echo "pr20_base=$PR20_BASE"
+            echo "pr20_head=$PR20_HEAD"
+            echo "release_to_upstream_main_commits=$(git rev-list --count "$RELEASE..$UPSTREAM_MAIN")"
+            echo "analysis_workflow_commit=$(git rev-parse HEAD)"
+          } | tee "$REPORT/refs.txt"
+
+          {
+            for spec in \
+              "release:$RELEASE" \
+              "upstream_main:$UPSTREAM_MAIN" \
+              "fork_snapshot:$FORK_SNAPSHOT" \
+              "pr19_head:$PR19_HEAD" \
+              "pr20_head:$PR20_HEAD"; do
+              name="${spec%%:*}"
+              ref="${spec#*:}"
+              project_version="$(git show "$ref:pyproject.toml" 2>/dev/null | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1 || true)"
+              cli_version="$(git show "$ref:hermes_cli/__init__.py" 2>/dev/null | sed -n 's/^__version__ = "\([^"]*\)"/\1/p' | head -1 || true)"
+              release_date="$(git show "$ref:hermes_cli/__init__.py" 2>/dev/null | sed -n 's/^__release_date__ = "\([^"]*\)"/\1/p' | head -1 || true)"
+              printf '%s project=%s cli=%s release_date=%s\n' "$name" "${project_version:-missing}" "${cli_version:-missing}" "${release_date:-missing}"
+            done
+          } | tee "$REPORT/versions.txt"
+
+          git diff --find-renames --name-status "$RELEASE" "$FORK_SNAPSHOT" > "$REPORT/release-vs-fork-name-status.txt"
+          git diff --find-renames --numstat "$RELEASE" "$FORK_SNAPSHOT" > "$REPORT/release-vs-fork-numstat.txt"
+          git diff --stat "$RELEASE" "$FORK_SNAPSHOT" > "$REPORT/release-vs-fork-stat.txt"
+          git diff --shortstat "$RELEASE" "$FORK_SNAPSHOT" > "$REPORT/release-vs-fork-shortstat.txt"
+          git diff --dirstat=files,0 "$RELEASE" "$FORK_SNAPSHOT" > "$REPORT/release-vs-fork-dirstat.txt"
+          git log --left-right --cherry-pick --oneline "$RELEASE...$FORK_SNAPSHOT" > "$REPORT/release-vs-fork-cherry-log.txt"
+          git cherry -v "$RELEASE" "$FORK_SNAPSHOT" > "$REPORT/fork-unique-patches.txt" || true
+
+          if git diff --quiet "$PR19_HEAD" "$FORK_SNAPSHOT"; then
+            echo "pr19_head_tree_matches_fork_snapshot=true" | tee "$REPORT/pr19-tree-equivalence.txt"
+          else
+            echo "pr19_head_tree_matches_fork_snapshot=false" | tee "$REPORT/pr19-tree-equivalence.txt"
+            git diff --name-status "$PR19_HEAD" "$FORK_SNAPSHOT" >> "$REPORT/pr19-tree-equivalence.txt"
+          fi
+
+          python - "$REPORT" "$RELEASE" "$FORK_SNAPSHOT" "$PR19_BASE" "$PR19_HEAD" "$PR20_BASE" "$PR20_HEAD" <<'PY'
+          import csv
+          import json
+          import subprocess
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          report = Path(sys.argv[1])
+          release, fork, pr19_base, pr19_head, pr20_base, pr20_head = sys.argv[2:]
+
+          def run(*args: str, check: bool = True) -> str:
+              proc = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if check and proc.returncode:
+                  raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(args)}\n{proc.stderr}")
+              return proc.stdout.strip()
+
+          def changed_files(base: str, head: str) -> list[str]:
+              output = run("git", "diff", "--find-renames", "--name-only", base, head)
+              return [line for line in output.splitlines() if line]
+
+          def blob(ref: str, path: str) -> str | None:
+              proc = subprocess.run(
+                  ["git", "rev-parse", f"{ref}:{path}"],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+              )
+              return proc.stdout.strip() if proc.returncode == 0 else None
+
+          def classify(base: str, head: str, label: str) -> None:
+              rows = []
+              counts: Counter[str] = Counter()
+              for path in changed_files(base, head):
+                  release_blob = blob(release, path)
+                  base_blob = blob(base, path)
+                  head_blob = blob(head, path)
+                  fork_blob = blob(fork, path)
+
+                  if release_blob == head_blob:
+                      category = "upstream_already_matches_final"
+                  elif release_blob == base_blob and head_blob != base_blob:
+                      category = "clean_patch_over_release"
+                  elif base_blob is None and release_blob is None and head_blob is not None:
+                      category = "clean_add_over_release"
+                  elif head_blob is None and release_blob == base_blob:
+                      category = "clean_delete_over_release"
+                  elif base_blob == head_blob:
+                      category = "no_effect"
+                  else:
+                      category = "overlap_requires_review"
+
+                  counts[category] += 1
+                  rows.append(
+                      {
+                          "path": path,
+                          "category": category,
+                          "release_blob": release_blob or "MISSING",
+                          "base_blob": base_blob or "MISSING",
+                          "head_blob": head_blob or "MISSING",
+                          "fork_blob": fork_blob or "MISSING",
+                          "fork_matches_head": fork_blob == head_blob,
+                      }
+                  )
+
+              with (report / f"{label}-file-classification.csv").open("w", newline="", encoding="utf-8") as handle:
+                  writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()) if rows else ["path"])
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+              summary = {
+                  "label": label,
+                  "base": base,
+                  "head": head,
+                  "changed_files": len(rows),
+                  "categories": dict(sorted(counts.items())),
+                  "paths": {
+                      category: [row["path"] for row in rows if row["category"] == category]
+                      for category in sorted(counts)
+                  },
+              }
+              (report / f"{label}-summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+              with (report / f"{label}-summary.md").open("w", encoding="utf-8") as handle:
+                  handle.write(f"# {label} overlap summary\n\n")
+                  handle.write(f"Changed files: {len(rows)}\n\n")
+                  for category, count in sorted(counts.items()):
+                      handle.write(f"## {category} ({count})\n\n")
+                      for row in rows:
+                          if row["category"] == category:
+                              handle.write(f"- `{row['path']}`\n")
+                      handle.write("\n")
+
+          classify(pr19_base, pr19_head, "pr19-vs-release")
+          classify(pr20_base, pr20_head, "pr20-vs-release")
+          PY
+
+          git ls-tree -r --name-only "$FORK_SNAPSHOT" \
+            | grep -E "(^|/)'|/var/folders/|hermes-update-mutex" \
+            > "$REPORT/suspicious-path-names.txt" || true
+
+          git ls-tree -r --name-only "$FORK_SNAPSHOT" \
+            | grep -Ei '(^|/)(\.env$|auth\.json$|credentials($|[./])|secrets?($|[./])|cookies?($|[./])|[^/]+\.(pem|p12|pfx|key|sqlite|sqlite3|db))$' \
+            > "$REPORT/sensitive-looking-path-names.txt" || true
+
+          set +e
+          git diff --check "$RELEASE" "$FORK_SNAPSHOT" > "$REPORT/release-vs-fork-diff-check.txt" 2>&1
+          echo "$?" > "$REPORT/release-vs-fork-diff-check.exit"
+          set -e
+
+          WT="$RUNNER_TEMP/hermes-v021-merge-probe"
+          git worktree add --detach "$WT" "$FORK_SNAPSHOT"
+          set +e
+          GIT_MERGE_AUTOEDIT=no git -C "$WT" merge --no-commit --no-ff "$RELEASE" > "$REPORT/merge-probe.log" 2>&1
+          MERGE_EXIT=$?
+          set -e
+          echo "$MERGE_EXIT" > "$REPORT/merge-probe.exit"
+          git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/merge-conflicts.txt" || true
+          git -C "$WT" status --short > "$REPORT/merge-status.txt" || true
+          printf 'conflict_files=%s\n' "$(wc -l < "$REPORT/merge-conflicts.txt" | tr -d ' ')" > "$REPORT/merge-summary.txt"
+          printf 'merge_exit=%s\n' "$MERGE_EXIT" >> "$REPORT/merge-summary.txt"
+          git worktree remove --force "$WT"
+
+          {
+            echo "# Hermes v0.21.0 synchronization analysis"
+            echo
+            cat "$REPORT/refs.txt"
+            echo
+            cat "$REPORT/versions.txt"
+            echo
+            echo "## Endpoint tree difference"
+            cat "$REPORT/release-vs-fork-shortstat.txt"
+            echo
+            echo "## Direct merge probe"
+            cat "$REPORT/merge-summary.txt"
+            echo
+            echo "## PR #19 classification"
+            cat "$REPORT/pr19-vs-release-summary.md"
+            echo
+            echo "## PR #20 classification"
+            cat "$REPORT/pr20-vs-release-summary.md"
+          } > "$REPORT/REPORT.md"
+
+          tar -C "$REPORT" -czf "$RUNNER_TEMP/hermes-v021-analysis.tgz" .
+
+      - name: Upload analysis evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-sync-analysis
+          path: |
+            ${{ runner.temp }}/hermes-v021-analysis/**
+            ${{ runner.temp }}/hermes-v021-analysis.tgz
+          if-no-files-found: error
+          retention-days: 14
