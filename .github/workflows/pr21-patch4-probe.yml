@@ -1,4 +1,4 @@
-name: PR21 Patch 4 runtime candidate probe
+name: PR21 Patch 4 runtime selective candidate probe
 
 on:
   push:
@@ -17,13 +17,13 @@ concurrency:
 
 jobs:
   probe:
-    name: Probe runtime stop and liveness candidate
+    name: Probe compatible runtime stop and liveness candidate
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 914e730de16f917d4b55c2c7ac3c4d99490112b6
-      REPORT_DIR: /tmp/pr21-patch4-probe-v2
+      EXPECTED_PARENT: 8c928a4e41d11876f7214901f8736bb7e3e7467e
+      REPORT_DIR: /tmp/pr21-patch4-probe-v3
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -60,14 +60,93 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Apply candidate in runner only
+      - name: Apply candidate but preserve current attempt loop
         shell: bash
         run: |
           set -euo pipefail
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/current-runtime.py"
           python .github/scripts/pr21_patch4_probe.py | tee "$REPORT_DIR/apply.txt"
+          python - <<'PY'
+          from __future__ import annotations
+
+          import ast
+          from pathlib import Path
+
+          target = Path("tui_gateway/hosted_room_driver.py")
+          baseline = Path("/tmp/pr21-patch4-probe-v3/current-runtime.py")
+          candidate_text = target.read_text(encoding="utf-8")
+          baseline_text = baseline.read_text(encoding="utf-8")
+
+          def method(text: str, class_name: str, method_name: str) -> ast.AST:
+              tree = ast.parse(text)
+              classes = [
+                  node
+                  for node in tree.body
+                  if isinstance(node, ast.ClassDef) and node.name == class_name
+              ]
+              if len(classes) != 1:
+                  raise RuntimeError(
+                      f"expected one {class_name} class, found {len(classes)}"
+                  )
+              matches = [
+                  node
+                  for node in classes[0].body
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node.name == method_name
+              ]
+              if len(matches) != 1:
+                  raise RuntimeError(
+                      f"expected one {class_name}.{method_name}, found {len(matches)}"
+                  )
+              return matches[0]
+
+          def span(text: str, node: ast.AST) -> tuple[int, int]:
+              lines = text.splitlines(keepends=True)
+              offsets: list[int] = []
+              total = 0
+              for line in lines:
+                  offsets.append(total)
+                  total += len(line)
+              start_line = int(node.lineno)
+              decorators = getattr(node, "decorator_list", None) or ()
+              if decorators:
+                  start_line = min(
+                      start_line, *(int(item.lineno) for item in decorators)
+                  )
+              start = offsets[start_line - 1]
+              end_line = int(node.end_lineno)
+              end = offsets[end_line] if end_line < len(lines) else total
+              return start, end
+
+          current_node = method(
+              candidate_text, "HostedRoomRuntime", "_run_one_task"
+          )
+          baseline_node = method(
+              baseline_text, "HostedRoomRuntime", "_run_one_task"
+          )
+          current_start, current_end = span(candidate_text, current_node)
+          baseline_start, baseline_end = span(baseline_text, baseline_node)
+          replacement = baseline_text[baseline_start:baseline_end].rstrip()
+          merged = (
+              candidate_text[:current_start]
+              + replacement
+              + "\n\n"
+              + candidate_text[current_end:].lstrip("\n")
+          ).rstrip() + "\n"
+          ast.parse(merged, filename=str(target))
+          restored_node = method(merged, "HostedRoomRuntime", "_run_one_task")
+          if ast.dump(restored_node, include_attributes=False) != ast.dump(
+              baseline_node, include_attributes=False
+          ):
+              raise RuntimeError("current _run_one_task was not restored exactly")
+          target.write_text(merged, encoding="utf-8")
+          PY
           python -m py_compile tui_gateway/hosted_room_driver.py
           git diff --check
           git diff --stat | tee "$REPORT_DIR/candidate-stat.txt"
+          git diff -- tui_gateway/hosted_room_driver.py \
+            > "$REPORT_DIR/candidate.patch"
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/candidate-runtime.py"
 
       - name: Prove test runner has no retry plugin
         shell: bash
@@ -78,7 +157,8 @@ jobs:
             echo "unexpected file retry plugin is active" >&2
             exit 1
           fi
-          echo "single_execution_no_retry_plugin=true" | tee "$REPORT_DIR/retry-policy.txt"
+          echo "single_execution_no_retry_plugin=true" \
+            | tee "$REPORT_DIR/retry-policy.txt"
 
       - name: Run exact Patch 4 target suite once
         shell: bash
@@ -102,7 +182,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-probe-v2
-          path: /tmp/pr21-patch4-probe-v2/**
+          name: pr21-patch4-runtime-probe-v3
+          path: /tmp/pr21-patch4-probe-v3/**
           if-no-files-found: warn
           retention-days: 14
