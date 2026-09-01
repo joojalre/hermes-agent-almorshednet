@@ -1,4 +1,4 @@
-name: PR21 Patch 4 admission-fenced runtime and service probe
+name: PR21 Patch 4 peer-safe admission-fenced runtime and service probe
 
 on:
   push:
@@ -17,14 +17,14 @@ concurrency:
 
 jobs:
   probe:
-    name: Stress completion race with Patch4 fences, then inspect service
+    name: Stress completion race, peer Stop, and service integration
     runs-on: ubuntu-latest
     timeout-minutes: 70
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 7c1fe07900f9384fba65618d6d1e979d1b579021
+      EXPECTED_PARENT: 12768cad9ea3d6e298a6af65ac3677791b1f24e1
       SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
-      REPORT_DIR: /tmp/pr21-patch4-probe-v11
+      REPORT_DIR: /tmp/pr21-patch4-probe-v12
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -64,7 +64,7 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Build Runtime hybrid v2 with Patch4 admission fences
+      - name: Build peer-safe Runtime hybrid with Patch4 admission fences
         shell: bash
         run: |
           set -euo pipefail
@@ -84,7 +84,7 @@ jobs:
           python -m py_compile tui_gateway/hosted_room_driver.py
           git diff --check
 
-      - name: Verify hybrid method provenance
+      - name: Verify hybrid method provenance and peer Stop contract
         shell: bash
         run: |
           set -euo pipefail
@@ -92,14 +92,14 @@ jobs:
           from pathlib import Path
           import ast
 
-          report = Path("/tmp/pr21-patch4-probe-v11")
+          report = Path("/tmp/pr21-patch4-probe-v12")
           sources = {
               "current": (report / "current-runtime.py").read_text(encoding="utf-8"),
               "patch4": (report / "full-runtime.py").read_text(encoding="utf-8"),
               "hybrid": (report / "runtime-hybrid.py").read_text(encoding="utf-8"),
           }
 
-          def method_dump(source: str, name: str) -> str:
+          def method_node(source: str, name: str) -> ast.FunctionDef:
               tree = ast.parse(source)
               matches = [
                   node
@@ -108,14 +108,15 @@ jobs:
               ]
               if len(matches) != 1:
                   raise AssertionError(f"{name}: expected one method, found {len(matches)}")
-              return ast.dump(matches[0], include_attributes=False)
+              return matches[0]
 
-          for name in ("cancel", "_retry_stopping_tasks"):
-              assert method_dump(sources["hybrid"], name) == method_dump(
-                  sources["patch4"], name
-              )
-              print(f"{name}=patch4")
+          def method_dump(source: str, name: str) -> str:
+              return ast.dump(method_node(source, name), include_attributes=False)
 
+          assert method_dump(sources["hybrid"], "cancel") == method_dump(
+              sources["patch4"], "cancel"
+          )
+          print("cancel=patch4")
           assert method_dump(sources["hybrid"], "_process_room") == method_dump(
               sources["current"], "_process_room"
           )
@@ -128,10 +129,24 @@ jobs:
               "_unregister_process_admission(submission_key)",
               "if not bool(getattr(exc, \"retryable\", False)):",
               "elif self._interrupt_stopping_task(binding, stopping):",
+              "Exact peer terminal status is already the durable Stop",
+              "self._complete_acknowledged_stop(binding, task, lease)",
           )
           for marker in required:
               assert marker in hybrid, marker
               print(f"marker={marker}")
+
+          retry_node = method_node(hybrid, "_retry_stopping_tasks")
+          retry_source = ast.get_source_segment(hybrid, retry_node)
+          assert retry_source is not None
+          peer_start = retry_source.index(
+              "if self._peer_stop_acknowledged(binding, task):"
+          )
+          peer_end = retry_source.index("continue", peer_start) + len("continue")
+          peer_branch = retry_source[peer_start:peer_end]
+          assert "_settle_stopping_completion" not in peer_branch
+          assert "_complete_acknowledged_stop" in peer_branch
+          print("peer_terminal_branch=no_history_reharvest")
           PY
 
       - name: Stress exact completion versus Stop race before Service changes
@@ -146,6 +161,16 @@ jobs:
               -q --tb=short \
               | tee -a "$REPORT_DIR/race-runtime-only.log"
           done
+
+      - name: Verify exact peer terminal Stop contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py::test_peer_terminal_status_acknowledges_durable_stop_on_retry \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py::test_peer_terminal_status_must_match_exact_task_attempt \
+            -q --tb=short \
+            | tee "$REPORT_DIR/peer-stop-contracts.log"
 
       - name: Build selective Service lifecycle integration
         shell: bash
@@ -190,6 +215,7 @@ jobs:
             | tee "$REPORT_DIR/runtime.log"
 
       - name: Capture Service suite result
+        if: always()
         shell: bash
         run: |
           set +e
@@ -203,7 +229,7 @@ jobs:
           from pathlib import Path
           import json
 
-          report = Path("/tmp/pr21-patch4-probe-v11")
+          report = Path("/tmp/pr21-patch4-probe-v12")
           lines = (report / "service.log").read_text(
               encoding="utf-8", errors="replace"
           ).splitlines()
@@ -223,6 +249,7 @@ jobs:
           PY
 
       - name: Capture remaining integration result
+        if: always()
         shell: bash
         run: |
           set +e
@@ -242,6 +269,7 @@ jobs:
           echo "$rc" | tee "$REPORT_DIR/integration.exit"
 
       - name: Static verification
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
@@ -260,7 +288,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-admission-fenced-probe-v12
-          path: /tmp/pr21-patch4-probe-v11/**
+          name: pr21-patch4-peer-safe-probe-v12
+          path: /tmp/pr21-patch4-probe-v12/**
           if-no-files-found: warn
           retention-days: 14
