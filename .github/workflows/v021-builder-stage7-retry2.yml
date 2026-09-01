@@ -1,0 +1,113 @@
+name: Hermes v0.21.0 candidate builder stage 7 retry 2
+
+on:
+  push:
+    branches:
+      - codex/v021-builder-stage7-retry2-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hermes-v021-candidate-writer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Retry stage 7 with release-relative path guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_REMOTE: c19e98fbf5e0ceb243d066e3e46a4f304fb8d606
+    steps:
+      - name: Checkout pinned stage 7 resolver
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: 527c5be6179c8fe1a89c9b87641f682cc59991f2
+          path: control
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout candidate branch with write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply semantic marker and release-relative path checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("control/.github/scripts/v021_replay_stage7.py")
+          text = path.read_text(encoding="utf-8")
+          replacements = {
+              '"target_type = \\"local\\"",': '"return {\\"kind\\": \\"local\\"",',
+              '"target_type = \\"peer\\"",': '"if kind == \\"peer\\":",',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected one marker in resolver: {old}")
+              text = text.replace(old, new, 1)
+
+          old_guard = '''    tracked = output(repo, "ls-tree", "-r", "--name-only", "HEAD")
+    if "hermes-update-mutex" in tracked or "/var/folders/" in tracked:
+        raise RuntimeError("temporary macOS updater paths leaked into candidate")
+'''
+          new_guard = '''    tracked = set(output(repo, "ls-tree", "-r", "--name-only", "HEAD").splitlines())
+    release_tracked = set(
+        output(repo, "ls-tree", "-r", "--name-only", RELEASE).splitlines()
+    )
+    introduced_temporary_paths = sorted(
+        path
+        for path in tracked - release_tracked
+        if "hermes-update-mutex" in path or "/var/folders/" in path
+    )
+    if introduced_temporary_paths:
+        raise RuntimeError(
+            "candidate introduced temporary macOS updater paths: "
+            + ", ".join(introduced_temporary_paths)
+        )
+'''
+          if text.count(old_guard) != 1:
+              raise SystemExit("expected one temporary-path guard in resolver")
+          text = text.replace(old_guard, new_guard, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+          python -m py_compile control/.github/scripts/v021_replay_stage7.py
+
+      - name: Verify supersession and replay until next conflict
+        shell: bash
+        run: |
+          set -euo pipefail
+          python control/.github/scripts/v021_replay_stage7.py \
+            --repo candidate \
+            --report "$RUNNER_TEMP/hermes-v021-builder-stage7-retry2"
+
+      - name: Fast-forward candidate branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_head="$(git -C candidate ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$EXPECTED_REMOTE"
+          test -z "$(git -C candidate status --porcelain)"
+          git -C candidate merge-base --is-ancestor "$remote_head" HEAD
+          git -C candidate push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          pushed="$(git -C candidate ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$pushed" = "$(git -C candidate rev-parse HEAD)"
+          echo "pushed_head=$pushed" | tee -a "$RUNNER_TEMP/hermes-v021-builder-stage7-retry2/push.txt"
+
+      - name: Upload builder evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-builder-stage7-retry2
+          path: ${{ runner.temp }}/hermes-v021-builder-stage7-retry2/**
+          if-no-files-found: warn
+          retention-days: 14
