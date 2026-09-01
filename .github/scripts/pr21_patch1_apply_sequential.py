@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 PRODUCTION_FILE = Path("gateway/hosted_rooms.py")
+STORAGE_TEST_FILE = Path("tests/gateway/test_hosted_rooms.py")
 SOURCE_BASE = "c19e98fbf5e0ceb243d066e3e46a4f304fb8d606"
 SOURCE_FINAL = "20d0a6a42365b2b2351e1dca819022b6ec477b39"
 
@@ -167,6 +168,20 @@ def _patch_candidate_specific_capacity_calls(text: str) -> str:
     return text[:start] + rename_room + text[end:]
 
 
+def _patch_storage_test_fixture(text: str) -> str:
+    name = "test_stop_reserve_cannot_exhaust_critical_control_capacity"
+    start, end, function = _named_node(text, name)
+    function = _replace_once(
+        function,
+        'monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 2)',
+        'monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 4)',
+        label="control reserve fixture",
+    )
+    updated = text[:start] + function + text[end:]
+    ast.parse(updated, filename=str(STORAGE_TEST_FILE))
+    return updated
+
+
 def _verify_capacity_calls(text: str) -> None:
     tree = ast.parse(text)
     missing: list[int] = []
@@ -282,15 +297,24 @@ def main() -> None:
     merged = semantic_merge(candidate, source)
     PRODUCTION_FILE.write_text(merged, encoding="utf-8")
 
-    git("add", str(PRODUCTION_FILE))
+    storage_tests = STORAGE_TEST_FILE.read_text(encoding="utf-8")
+    STORAGE_TEST_FILE.write_text(
+        _patch_storage_test_fixture(storage_tests),
+        encoding="utf-8",
+    )
+
+    git("add", str(PRODUCTION_FILE), str(STORAGE_TEST_FILE))
     git("diff", "--cached", "--check")
     changed = [
         line
         for line in git("diff", "--cached", "--name-only").stdout.splitlines()
         if line
     ]
-    if changed != [str(PRODUCTION_FILE)]:
-        raise RuntimeError(f"unexpected staged paths: {changed}")
+    expected_changed = [str(PRODUCTION_FILE), str(STORAGE_TEST_FILE)]
+    if changed != expected_changed:
+        raise RuntimeError(
+            f"unexpected staged paths: expected={expected_changed} actual={changed}"
+        )
 
     summary = {
         "source_base": SOURCE_BASE,
@@ -308,6 +332,10 @@ def main() -> None:
     )
     (report_dir / "semantic-storage.diff").write_text(
         git("diff", "--cached", "--", str(PRODUCTION_FILE)).stdout,
+        encoding="utf-8",
+    )
+    (report_dir / "storage-test-fixture.diff").write_text(
+        git("diff", "--cached", "--", str(STORAGE_TEST_FILE)).stdout,
         encoding="utf-8",
     )
     print(json.dumps(summary, sort_keys=True))
