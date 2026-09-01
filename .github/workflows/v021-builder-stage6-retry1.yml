@@ -1,0 +1,90 @@
+name: Hermes v0.21.0 candidate builder stage 6 retry 1
+
+on:
+  push:
+    branches:
+      - codex/v021-builder-stage6-retry1-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hermes-v021-candidate-writer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Retry stage 6 with semantic runtime markers
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_REMOTE: f159e7855ed45c5a4efb8809407c310f7910618c
+    steps:
+      - name: Checkout pinned stage 6 resolver
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: c856b0bc54f8b1625a08cf9935c1907b67b7c482
+          path: control
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout candidate branch with write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Relax formatting-sensitive runtime markers only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("control/.github/scripts/v021_replay_stage6.py")
+          text = path.read_text(encoding="utf-8")
+          replacements = {
+              '"self._requeue_not_admitted_task(attempt)",': '"state.requeue_not_admitted_task(",',
+              '"if submit_attempted and getattr(exc, \\"not_admitted\\", False):",': '"if submit_attempted and bool(getattr(exc, \\"not_admitted\\", False)):",',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected one marker in resolver: {old}")
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+          python -m py_compile control/.github/scripts/v021_replay_stage6.py
+
+      - name: Replay until next conflict
+        shell: bash
+        run: |
+          set -euo pipefail
+          python control/.github/scripts/v021_replay_stage6.py \
+            --repo candidate \
+            --report "$RUNNER_TEMP/hermes-v021-builder-stage6-retry1"
+
+      - name: Fast-forward candidate branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_head="$(git -C candidate ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$EXPECTED_REMOTE"
+          test -z "$(git -C candidate status --porcelain)"
+          git -C candidate merge-base --is-ancestor "$remote_head" HEAD
+          git -C candidate push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          pushed="$(git -C candidate ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$pushed" = "$(git -C candidate rev-parse HEAD)"
+          echo "pushed_head=$pushed" | tee -a "$RUNNER_TEMP/hermes-v021-builder-stage6-retry1/push.txt"
+
+      - name: Upload builder evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-builder-stage6-retry1
+          path: ${{ runner.temp }}/hermes-v021-builder-stage6-retry1/**
+          if-no-files-found: warn
+          retention-days: 14
