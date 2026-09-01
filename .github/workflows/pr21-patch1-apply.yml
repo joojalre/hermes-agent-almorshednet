@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 60
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: d490548ecaa7e89ae1ed639384f5fd93d2e6590d
+      EXPECTED_PARENT: 74a5e77605c6f3886bc1581c0901a9fff66d2589
       REPORT_DIR: /tmp/pr21-patch1-storage
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
@@ -46,14 +46,8 @@ jobs:
           test "$remote_head" = "$GITHUB_SHA"
           git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
           test "$(git rev-parse refs/remotes/origin/pr19-final)" = "20d0a6a42365b2b2351e1dca819022b6ec477b39"
-          for commit in \
-            10618eb0979f4c3af980f8ce380d9c0fb06fc5ca \
-            7c6a0c8e648b441bf89ecdef5e53c8410cd0d174 \
-            6db80964f7c25c99e577f6d550ad0568f833a5dd \
-            b7f1acdef0308ac75f09c3aa41702686e420b599
-          do
-            git cat-file -e "$commit^{commit}"
-          done
+          git cat-file -e c19e98fbf5e0ceb243d066e3e46a4f304fb8d606^{commit}
+          git cat-file -e 20d0a6a42365b2b2351e1dca819022b6ec477b39^{commit}
           git status --short | tee "$REPORT_DIR/start-status.txt"
 
       - name: Install uv
@@ -111,7 +105,7 @@ jobs:
           test "$rc" = "1"
           grep -F "require_open_admissions" "$REPORT_DIR/red-liability.log"
 
-      - name: Apply storage changes commit by commit
+      - name: Apply storage changes with AST-guided semantic merge
         shell: bash
         run: |
           set -euo pipefail
@@ -233,7 +227,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch1-storage-evidence-sequential
+          name: pr21-patch1-storage-evidence-semantic
           path: /tmp/pr21-patch1-storage/**
           if-no-files-found: warn
           retention-days: 14
