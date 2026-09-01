@@ -12,14 +12,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr21-python-failure-capture-${{ github.ref }}
+  group: pr21-python-failure-capture-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
   capture:
-    name: Capture exact Python failure
+    name: Capture Python failure slice ${{ matrix.slice }}/4
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
     steps:
       - name: Checkout exact branch head
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -58,7 +62,7 @@ jobs:
         with:
           command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
-      - name: Capture full suite output
+      - name: Capture slice output
         id: tests
         shell: bash
         env:
@@ -69,11 +73,13 @@ jobs:
         run: |
           set +e
           source .venv/bin/activate
-          evidence="$RUNNER_TEMP/pr21-python-failure"
+          evidence="$RUNNER_TEMP/pr21-python-failure-slice-${{ matrix.slice }}"
           mkdir -p "$evidence"
-          scripts/run_tests.sh 2>&1 | tee "$evidence/full.log"
+          scripts/run_tests.sh --slice "${{ matrix.slice }}/4" 2>&1 \
+            | tee "$evidence/full.log"
           status=${PIPESTATUS[0]}
           {
+            echo "slice=${{ matrix.slice }}/4"
             echo "exit_status=$status"
             echo
             rg -n 'FAILED|ERROR|TIMED OUT|repro:|short test summary|FAILURES' \
@@ -87,8 +93,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-python-failure-evidence
-          path: ${{ runner.temp }}/pr21-python-failure/**
+          name: pr21-python-failure-evidence-slice-${{ matrix.slice }}
+          path: ${{ runner.temp }}/pr21-python-failure-slice-${{ matrix.slice }}/**
           if-no-files-found: error
           retention-days: 3
 
