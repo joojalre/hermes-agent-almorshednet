@@ -988,7 +988,7 @@ def test_stop_reserve_cannot_exhaust_critical_control_capacity(tmp_path, monkeyp
     )
     monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 1)
     monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 1)
-    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 2)
+    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 4)
     state = rooms.room_state(db, room_id="room-1")
 
     rooms.request_room_stop(

@@ -1,21 +1,4 @@
-from __future__ import annotations
-
-import argparse
-import ast
-import subprocess
-from pathlib import Path
-
-SOURCE_BASE = "c19e98fbf5e0ceb243d066e3e46a4f304fb8d606"
-SOURCE_FINAL = "20d0a6a42365b2b2351e1dca819022b6ec477b39"
-PRODUCTION_FILE = Path("gateway/hosted_rooms.py")
-TEST_FILE = Path("tests/gateway/test_hosted_room_storage_reservations.py")
-TEMPORARY_FILES = (
-    Path(".github/scripts/pr21_patch1_apply.py"),
-    Path(".github/workflows/pr21-patch1-apply.yml"),
-    Path(".github/workflows/pr21-patch1-probe.yml"),
-)
-
-TEST_SOURCE = r'''"""Focused storage regressions preserved from the final PR #19 state."""
+"""Focused storage regressions preserved from the final PR #19 state."""
 
 from __future__ import annotations
 
@@ -174,9 +157,7 @@ def test_malformed_terminal_correlation_does_not_consume_reserve(
 
 
 def _require_open_admission_support():
-    assert "require_open_admissions" in inspect.signature(
-        rooms.append_event
-    ).parameters
+    assert "require_open_admissions" in inspect.signature(rooms.append_event).parameters
 
 
 def test_open_admission_reservation_is_durable_across_transactions(
@@ -332,86 +313,3 @@ def test_terminal_recovery_plan_rejects_non_object_payloads():
     ]
 
     assert rooms._is_terminal_recovery_plan(pending) is False
-'''
-
-
-def run(*args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
-    process = subprocess.run(
-        args,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if process.returncode:
-        raise RuntimeError(
-            f"command failed ({process.returncode}): {' '.join(args)}\n"
-            f"stdout:\n{process.stdout}\nstderr:\n{process.stderr}"
-        )
-    return process
-
-
-def write_tests() -> None:
-    if TEST_FILE.exists():
-        raise RuntimeError(f"focused test file already exists: {TEST_FILE}")
-    ast.parse(TEST_SOURCE, filename=str(TEST_FILE))
-    TEST_FILE.write_text(TEST_SOURCE, encoding="utf-8")
-
-
-def apply_production(report_dir: Path) -> None:
-    patch = run(
-        "git",
-        "diff",
-        "--binary",
-        SOURCE_BASE,
-        SOURCE_FINAL,
-        "--",
-        str(PRODUCTION_FILE),
-    ).stdout
-    if not patch.strip():
-        raise RuntimeError("storage delta is empty")
-    patch_path = report_dir / "storage.patch"
-    patch_path.write_text(patch, encoding="utf-8")
-    run("git", "apply", "--3way", "--index", str(patch_path))
-    merged = PRODUCTION_FILE.read_text(encoding="utf-8")
-    ast.parse(merged, filename=str(PRODUCTION_FILE))
-    required_markers = (
-        "_DISCUSSION_LIABILITY_PREFIX",
-        "def _terminal_publication_liabilities(",
-        "def _closing_discussion_liability_keys(",
-        "def _is_terminal_recovery_plan(",
-        "require_open_admissions: bool = False",
-        "prospective_liability_keys",
-        "released_liability_keys",
-    )
-    for marker in required_markers:
-        if marker not in merged:
-            raise RuntimeError(f"missing storage invariant marker: {marker}")
-
-
-def cleanup() -> None:
-    for path in TEMPORARY_FILES:
-        if path.exists():
-            path.unlink()
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("write-tests", "apply-production", "cleanup"))
-    parser.add_argument("--report-dir")
-    args = parser.parse_args()
-
-    if args.action == "write-tests":
-        write_tests()
-    elif args.action == "apply-production":
-        if not args.report_dir:
-            raise RuntimeError("--report-dir is required")
-        report_dir = Path(args.report_dir)
-        report_dir.mkdir(parents=True, exist_ok=True)
-        apply_production(report_dir)
-    else:
-        cleanup()
-
-
-if __name__ == "__main__":
-    main()
