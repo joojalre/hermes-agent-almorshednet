@@ -1,4 +1,4 @@
-name: PR21 Patch 4 compatible runtime hybrid probe
+name: PR21 Patch 4 final compatibility probe
 
 on:
   push:
@@ -17,13 +17,13 @@ concurrency:
 
 jobs:
   probe:
-    name: Probe current architecture with Patch4 liveness additions
+    name: Verify final runtime stop and liveness hybrid
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 0519079141944ca2a035f18859b1153d34a4abcc
-      REPORT_DIR: /tmp/pr21-patch4-probe-v5
+      EXPECTED_PARENT: 8829e77ff8e9c0a26e7345ed222e086840cc79ac
+      REPORT_DIR: /tmp/pr21-patch4-probe-v6
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -60,7 +60,7 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Build compatible hybrid in runner only
+      - name: Build final compatible hybrid in runner only
         shell: bash
         run: |
           set -euo pipefail
@@ -75,7 +75,7 @@ jobs:
           import json
           from pathlib import Path
 
-          report_dir = Path("/tmp/pr21-patch4-probe-v5")
+          report_dir = Path("/tmp/pr21-patch4-probe-v6")
           target = Path("tui_gateway/hosted_room_driver.py")
           baseline_text = (report_dir / "current-runtime.py").read_text(encoding="utf-8")
           hybrid_text = target.read_text(encoding="utf-8")
@@ -139,15 +139,80 @@ jobs:
                   + hybrid_text[target_end:].lstrip("\n")
               ).rstrip() + "\n"
               ast.parse(hybrid_text, filename=str(target))
-              if ast.dump(
-                  class_method(hybrid_text, method_name),
-                  include_attributes=False,
-              ) != ast.dump(source_node, include_attributes=False):
-                  raise RuntimeError(f"failed to restore {method_name}")
 
+          old_owner_gate = '''        owner_state = self._stopping_owner_state(task)
+        if owner_state in {"alive", "unknown"}:
+            return False
+'''
+          new_owner_gate = '''        owner_state = self._stopping_owner_state(task)
+        with self._status_lock:
+            current_attempt_is_local = (
+                self._current_tasks.get(binding.room_id) == task["identity"]
+            )
+        if owner_state in {"alive", "unknown"} and not current_attempt_is_local:
+            return False
+'''
+          if hybrid_text.count(old_owner_gate) != 1:
+              raise RuntimeError("unexpected stopping owner gate shape")
+          hybrid_text = hybrid_text.replace(old_owner_gate, new_owner_gate, 1)
+
+          old_not_admitted = '''            if submit_attempted and bool(getattr(exc, "not_admitted", False)):
+                try:
+                    state.requeue_not_admitted_task(
+                        self.db_path,
+                        attempt,
+                        clock=self.clock,
+                    )
+                except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
+                    self._drop_lease(binding.room_id)
+                    self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
+                    self._record_error(
+                        f"task {attempt.identity.task_id} not-admitted proof lost "
+                        f"its fence: {fence_exc}"
+                    )
+                else:
+                    delay = self._defer_unavailable_route(task)
+                    self._record_error(
+                        f"task {attempt.identity.task_id} was not admitted; "
+                        f"queued for retry in {delay:g}s"
+                    )
+'''
+          new_not_admitted = '''            if submit_attempted and bool(getattr(exc, "not_admitted", False)):
+                if transport is self.rpc:
+                    self._settle_failure_if_current(attempt, exc)
+                else:
+                    try:
+                        state.requeue_not_admitted_task(
+                            self.db_path,
+                            attempt,
+                            clock=self.clock,
+                        )
+                    except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
+                        self._drop_lease(binding.room_id)
+                        self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
+                        self._record_error(
+                            f"task {attempt.identity.task_id} not-admitted proof lost "
+                            f"its fence: {fence_exc}"
+                        )
+                    else:
+                        delay = self._defer_unavailable_route(task)
+                        self._record_error(
+                            f"task {attempt.identity.task_id} was not admitted; "
+                            f"queued for retry in {delay:g}s"
+                        )
+'''
+          if hybrid_text.count(old_not_admitted) != 1:
+              raise RuntimeError("unexpected not-admitted branch shape")
+          hybrid_text = hybrid_text.replace(old_not_admitted, new_not_admitted, 1)
+          ast.parse(hybrid_text, filename=str(target))
           target.write_text(hybrid_text, encoding="utf-8")
+
           payload = {
               "restored_current_methods": list(restored),
+              "compatibility_adjustments": [
+                  "allow_current_runtime_attempt_through_owner_gate",
+                  "settle_local_not_admitted_but_retry_peer_not_admitted",
+              ],
               "baseline_sha256": hashlib.sha256(
                   baseline_text.encode("utf-8")
               ).hexdigest(),
@@ -191,7 +256,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-probe-v5
-          path: /tmp/pr21-patch4-probe-v5/**
+          name: pr21-patch4-runtime-probe-v6
+          path: /tmp/pr21-patch4-probe-v6/**
           if-no-files-found: warn
           retention-days: 14
