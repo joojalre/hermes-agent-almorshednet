@@ -22,8 +22,8 @@ jobs:
     timeout-minutes: 60
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 1585816c8e31886d27f700b429eee6ca2c975c66
-      REPORT_DIR: ${{ runner.temp }}/pr21-patch1-storage
+      EXPECTED_PARENT: 9e2507c13a21f1f26a06a430eb27942df46f2e9d
+      REPORT_DIR: /tmp/pr21-patch1-storage
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -214,6 +214,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr21-patch1-storage-evidence
-          path: ${{ runner.temp }}/pr21-patch1-storage/**
+          path: /tmp/pr21-patch1-storage/**
           if-no-files-found: warn
           retention-days: 14
