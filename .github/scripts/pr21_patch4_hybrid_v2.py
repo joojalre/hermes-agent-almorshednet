@@ -16,7 +16,7 @@ PRESERVED_PATCH4_METHODS = (
 
 
 def build_hybrid(baseline_text: str, candidate_text: str) -> str:
-    """Keep the proven Patch 4 stop fences while restoring current queue flow."""
+    """Keep Patch 4 fences while preserving current peer and queue contracts."""
 
     hybrid_text = base.build_hybrid(baseline_text, candidate_text)
     for method_name in PRESERVED_PATCH4_METHODS:
@@ -75,6 +75,26 @@ def build_hybrid(baseline_text: str, candidate_text: str) -> str:
             "unexpected Patch4 not-admitted branch after method preservation"
         )
     hybrid_text = hybrid_text.replace(old_not_admitted, new_not_admitted, 1)
+
+    old_peer_ack = '''                if self._peer_stop_acknowledged(binding, task):
+                    if not self._settle_stopping_completion(binding, task, lease):
+                        self._complete_acknowledged_stop(binding, task, lease)
+                    continue
+'''
+    new_peer_ack = '''                if self._peer_stop_acknowledged(binding, task):
+                    # Exact peer terminal status is already the durable Stop
+                    # acknowledgement. Do not read peer history afterward: an
+                    # interrupted historical reply can look like a failed turn
+                    # and overwrite the cancellation contract.
+                    self._complete_acknowledged_stop(binding, task, lease)
+                    continue
+'''
+    if hybrid_text.count(old_peer_ack) != 1:
+        raise RuntimeError(
+            "unexpected Patch4 peer acknowledgement branch after preservation"
+        )
+    hybrid_text = hybrid_text.replace(old_peer_ack, new_peer_ack, 1)
+
     ast.parse(hybrid_text)
     return hybrid_text
 
@@ -99,6 +119,7 @@ def main() -> None:
             "allow_current_runtime_attempt_through_owner_liveness_gate",
             "probe_local_admission_before_interrupt_so_completion_wins",
             "retry_retryable_not_admitted_and_fail_proven_local_rejection",
+            "complete_exact_peer_terminal_stop_without_history_reharvest",
         ],
         "baseline_sha256": hashlib.sha256(
             baseline_text.encode("utf-8")
