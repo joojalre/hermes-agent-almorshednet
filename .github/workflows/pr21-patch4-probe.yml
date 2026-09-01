@@ -22,8 +22,8 @@ jobs:
     timeout-minutes: 45
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 7272d34c8cae75e33ca64fa471f27443dbeffcbc
-      REPORT_DIR: /tmp/pr21-patch4-probe
+      EXPECTED_PARENT: 914e730de16f917d4b55c2c7ac3c4d99490112b6
+      REPORT_DIR: /tmp/pr21-patch4-probe-v2
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -69,13 +69,24 @@ jobs:
           git diff --check
           git diff --stat | tee "$REPORT_DIR/candidate-stat.txt"
 
-      - name: Run exact Patch 4 target suite
+      - name: Prove test runner has no retry plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest --help > "$REPORT_DIR/pytest-help.txt"
+          if grep -F -- "--file-retries" "$REPORT_DIR/pytest-help.txt"; then
+            echo "unexpected file retry plugin is active" >&2
+            exit 1
+          fi
+          echo "single_execution_no_retry_plugin=true" | tee "$REPORT_DIR/retry-policy.txt"
+
+      - name: Run exact Patch 4 target suite once
         shell: bash
         run: |
           set -euo pipefail
           uv run python -m pytest \
             tests/tui_gateway/test_hosted_room_driver_runtime.py \
-            -q --tb=short --file-retries 0 \
+            -q --tb=short \
             | tee "$REPORT_DIR/target-suite.log"
 
       - name: Static verification
@@ -91,7 +102,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-probe
-          path: /tmp/pr21-patch4-probe/**
+          name: pr21-patch4-runtime-probe-v2
+          path: /tmp/pr21-patch4-probe-v2/**
           if-no-files-found: warn
           retention-days: 14
