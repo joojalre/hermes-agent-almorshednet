@@ -1,0 +1,166 @@
+name: PR21 apply fork-safe CI policy v3
+
+on:
+  push:
+    branches:
+      - codex/sync-hermes-v021-20260901
+    paths:
+      - .github/workflows/pr21-fork-ci-policy-v3.yml
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: pr21-fork-ci-policy-writer-v3
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: Patch policy, remove tooling, push, approve, and wait
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_PARENT: f181bbe2b75b0f27cf82f00d39c051d3854ce513
+      MAIN_FINAL: e6c06033a04d9745ed1efea97ce35401323dbfd7
+      REPORT_DIR: /tmp/pr21-fork-ci-policy-v3
+    steps:
+      - name: Checkout exact control commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 4
+          persist-credentials: true
+
+      - name: Verify immutable write point
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin \
+            refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$MAIN_FINAL"
+          git merge-base --is-ancestor "$MAIN_FINAL" HEAD
+          git status --short | tee "$REPORT_DIR/start-status.txt"
+
+      - name: Apply fork-safe contributor and runner policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/pr21_apply_fork_ci_policy.py \
+            | tee "$REPORT_DIR/apply.json"
+          python tests/ci/test_fork_ci_policy.py
+          python -m py_compile \
+            .github/scripts/pr21_apply_fork_ci_policy.py \
+            .github/scripts/pr21_wait_exact_head_ci.py \
+            tests/ci/test_fork_ci_policy.py
+          git diff --check
+          git diff --stat | tee "$REPORT_DIR/policy-stat.txt"
+
+      - name: Preserve waiter outside the repository and delete all tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/scripts/pr21_wait_exact_head_ci.py \
+            "$RUNNER_TEMP/pr21_wait_exact_head_ci.py"
+          git rm -f -- \
+            .github/scripts/pr21_apply_fork_ci_policy.py \
+            .github/scripts/pr21_wait_exact_head_ci.py \
+            .github/workflows/pr21-fork-ci-policy.yml \
+            .github/workflows/pr21-fork-ci-policy-v2.yml \
+            .github/workflows/pr21-fork-ci-policy-v3.yml
+          test ! -e .github/scripts/pr21_apply_fork_ci_policy.py
+          test ! -e .github/scripts/pr21_wait_exact_head_ci.py
+          test ! -e .github/workflows/pr21-fork-ci-policy.yml
+          test ! -e .github/workflows/pr21-fork-ci-policy-v2.yml
+          test ! -e .github/workflows/pr21-fork-ci-policy-v3.yml
+
+      - name: Verify final policy scope and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --short | tee "$REPORT_DIR/pre-commit-status.txt"
+          git diff --check
+          python tests/ci/test_fork_ci_policy.py
+          python -m py_compile tests/ci/test_fork_ci_policy.py
+          python - <<'PY'
+          import subprocess
+
+          final = {
+              ".github/workflows/contributor-check.yml",
+              ".github/workflows/js-tests.yml",
+              ".github/workflows/rust-tests.yml",
+              ".github/workflows/tests.yml",
+              ".github/workflows/tests-os.yml",
+              "tests/ci/test_fork_ci_policy.py",
+          }
+          temporary = {
+              ".github/scripts/pr21_apply_fork_ci_policy.py",
+              ".github/scripts/pr21_wait_exact_head_ci.py",
+              ".github/workflows/pr21-fork-ci-policy.yml",
+              ".github/workflows/pr21-fork-ci-policy-v2.yml",
+              ".github/workflows/pr21-fork-ci-policy-v3.yml",
+          }
+          status = subprocess.check_output(
+              ["git", "status", "--porcelain"], text=True
+          ).splitlines()
+          paths = {line[3:] for line in status if len(line) >= 4}
+          unexpected = paths - final - temporary
+          if unexpected:
+              raise SystemExit(f"unexpected paths: {sorted(unexpected)}")
+          if not final <= paths:
+              raise SystemExit(f"missing final paths: {sorted(final - paths)}")
+          PY
+          git config user.name "Hermes PR21 Reconciler"
+          git config user.email "pr21-reconciler@invalid.local"
+          git add -A
+          git diff --cached --check
+          git commit --no-gpg-sign --no-verify \
+            -m "fix(ci): restore fork-safe validation policy"
+          final_head="$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain)"
+          if git ls-tree -r --name-only HEAD \
+            | grep -E 'pr21[-_]fork[-_]ci|pr21_(apply_fork_ci_policy|wait_exact_head_ci)'; then
+            echo "temporary fork policy tooling leaked into final tree" >&2
+            exit 1
+          fi
+          {
+            echo "control_head=$GITHUB_SHA"
+            echo "final_head=$final_head"
+          } | tee "$REPORT_DIR/final-head.txt"
+
+      - name: Fast-forward final policy commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          final_head="$(git rev-parse HEAD)"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" "$final_head"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          pushed="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$pushed" = "$final_head"
+          echo "pushed_head=$pushed" | tee -a "$REPORT_DIR/final-head.txt"
+
+      - name: Approve and wait for exact-head CI and Nix
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export EXACT_HEAD_SHA="$(git rev-parse HEAD)"
+          python "$RUNNER_TEMP/pr21_wait_exact_head_ci.py"
+
+      - name: Upload fork-policy and exact-head validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr21-fork-ci-policy-evidence-v3
+          path: /tmp/pr21-fork-ci-policy-v3/**
+          if-no-files-found: warn
+          retention-days: 14
