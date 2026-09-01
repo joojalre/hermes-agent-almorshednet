@@ -645,6 +645,7 @@ class HostedRoomRuntime:
             return
         payload = task.get("payload") or {}
         target_member_id = payload.get("target_member_id")
+        legacy_member_id: str | None = None
         if target_member_id is None:
             target_profile = str(payload.get("target_profile") or "")
             room = hosted_rooms.room_state(
@@ -662,6 +663,8 @@ class HostedRoomRuntime:
                     "legacy task target profile does not match the frozen room roster"
                 )
             target_member_id = matching_members[0].get("member_id") or target_profile
+            if target_member_id != target_profile:
+                legacy_member_id = target_profile
         member_id = str(target_member_id or "")
         if not member_id:
             raise state.DriverStateError("task target member id is missing")
@@ -686,6 +689,18 @@ class HostedRoomRuntime:
                 "request_id": safe_approval.get("request_id"),
                 "approval": safe_approval,
             }
+        if action is not None and legacy_member_id is not None:
+            state.migrate_legacy_approval_request_member(
+                self.db_path,
+                task["identity"],
+                execution_generation=int(task["execution_generation"]),
+                legacy_member_id=legacy_member_id,
+                member_id=member_id,
+                request_id=str(action.get("request_id") or ""),
+                session_id=session_id,
+                action={**action, "member_id": member_id},
+                clock=self.clock,
+            )
         self.pending_action(task["identity"].room_id, member_id, action)
 
     def _retry_stopping_tasks(

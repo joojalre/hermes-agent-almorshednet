@@ -335,6 +335,20 @@ def _(rid, params: dict) -> dict:
                 expected_epoch=expected_epoch,
                 clock=time.time,
             )
+        except driver.RoomUnavailableError:
+            try:
+                raced = room_state(
+                    service.db_path,
+                    room_id=params.get("room_id"),
+                    include_disbanded=True,
+                )
+            except RoomHistoryExpiredError:
+                tombstone = disband_with_state()
+                return _ok(rid, {"tombstone": tombstone})
+            if raced.get("disbanded_at") is None:
+                raise
+            tombstone = disband_with_state(raced)
+            return _ok(rid, {"tombstone": tombstone})
         except driver.StaleLeaseError as exc:
             raise AuthorityConflictError("stale hosted room authority") from exc
         if (

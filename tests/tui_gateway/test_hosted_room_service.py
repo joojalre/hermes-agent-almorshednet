@@ -2486,3 +2486,152 @@ def test_cross_process_pending_approval_uses_frozen_member_id_and_exact_generati
         ("ops-session", "approval-1", "once"),
     ]
     assert service.status("room-1")["pending_actions"] == []
+
+
+@pytest.mark.parametrize(
+    "corrected_request_exists",
+    [False, True],
+    ids=["migrate-legacy-row", "retire-legacy-duplicate"],
+)
+def test_legacy_published_approval_migrates_selected_request_to_frozen_member(
+    tmp_path: Path,
+    corrected_request_exists: bool,
+):
+    class ApprovalRPC(_FakeRPC):
+        def __init__(self) -> None:
+            super().__init__()
+            self.approvals = []
+
+        def approve(self, *, session_id, request_id, choice):
+            self.approvals.append((session_id, request_id, choice))
+            return {"resolved": 1}
+
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    rpc = ApprovalRPC()
+    service.rpc = rpc
+    service.runtime.rpc = rpc
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "member-ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-1",
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    legacy_payload = dict(task["payload"])
+    legacy_payload.pop("target_member_id")
+    _, payload_json, payload_digest = driver._task_payload(legacy_payload)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE hosted_room_driver_tasks
+                  SET payload_json=?, payload_digest=?
+                WHERE room_id=? AND task_id=?""",
+            (
+                payload_json,
+                payload_digest,
+                task["identity"].room_id,
+                task["identity"].task_id,
+            ),
+        )
+    binding = service.bindings()[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="worker",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    task = driver.get_task(db, task["identity"])
+    approval = {"request_id": "approval-1", "choices": ["once", "deny"]}
+    action = {
+        "kind": "approval",
+        "task_id": task["identity"].task_id,
+        "thread_id": task["identity"].thread_id,
+        "turn_id": task["identity"].turn_id,
+        "execution_generation": 1,
+        "run_id": None,
+        "session_id": "ops-session",
+        "request_id": "approval-1",
+        "approval": approval,
+    }
+    driver.publish_approval_request(
+        db,
+        task["identity"],
+        execution_generation=1,
+        member_id="ops",
+        request_id="approval-1",
+        session_id="ops-session",
+        action={**action, "member_id": "ops"},
+        clock=time.time,
+    )
+    if corrected_request_exists:
+        driver.publish_approval_request(
+            db,
+            task["identity"],
+            execution_generation=1,
+            member_id="member-ops",
+            request_id="approval-1",
+            session_id="ops-session",
+            action={**action, "member_id": "member-ops"},
+            clock=time.time,
+        )
+    driver.decide_approval_request(
+        db,
+        task["identity"],
+        execution_generation=1,
+        member_id="ops",
+        request_id="approval-1",
+        choice="once",
+        clock=time.time,
+    )
+    assert {
+        pending["member_id"]
+        for pending in driver.list_pending_approval_requests(db, room_id="room-1")
+    } == ({"ops", "member-ops"} if corrected_request_exists else {"ops"})
+
+    service.runtime._report_pending_action(
+        task,
+        session_id="ops-session",
+        info={"pending_approval": approval},
+    )
+
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            """SELECT member_id, choice, consumed_at
+                 FROM hosted_room_approval_requests
+                WHERE room_id=? AND task_id=? AND execution_generation=?""",
+            ("room-1", task["identity"].task_id, 1),
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "member-ops"
+    assert rows[0][1] == "once"
+    assert rows[0][2] is not None
+    assert rpc.approvals == [("ops-session", "approval-1", "once")]
+    assert service.status("room-1")["pending_actions"] == []
+    with pytest.raises(driver.StaleTaskError, match="no longer pending"):
+        driver.decide_approval_request(
+            db,
+            task["identity"],
+            execution_generation=1,
+            member_id="ops",
+            request_id="approval-1",
+            choice="once",
+            clock=time.time,
+        )

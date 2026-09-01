@@ -2946,6 +2946,169 @@ def publish_approval_request(
     }
 
 
+def migrate_legacy_approval_request_member(
+    db_path: Path | str,
+    identity: TaskIdentity,
+    *,
+    execution_generation: int,
+    legacy_member_id: Any,
+    member_id: Any,
+    request_id: Any,
+    session_id: Any,
+    action: Any,
+    clock: Clock,
+) -> bool:
+    """Move one pending legacy approval to its frozen roster member identity."""
+
+    legacy_member_id = _identifier(legacy_member_id, label="legacy_member_id")
+    member_id = _identifier(member_id, label="member_id")
+    request_id = _identifier(request_id, label="request_id")
+    session_id = _identifier(session_id, label="session_id")
+    if (
+        isinstance(execution_generation, bool)
+        or not isinstance(execution_generation, int)
+        or execution_generation < 1
+    ):
+        raise DriverValidationError(
+            "execution_generation must be a positive integer"
+        )
+    if legacy_member_id == member_id:
+        return False
+    action_json = _canonical_json(action)
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        task = _load_task(conn, identity)
+        if int(task["execution_generation"]) != execution_generation:
+            raise StaleTaskError("approval request belongs to a stale task generation")
+        if task["status"] != "running":
+            raise InvalidTaskTransitionError(
+                "approval request migration requires a running task generation"
+            )
+        legacy = conn.execute(
+            """SELECT * FROM hosted_room_approval_requests
+               WHERE room_id=? AND task_id=? AND execution_generation=?
+                 AND member_id=? AND request_id=? AND consumed_at IS NULL""",
+            (
+                identity.room_id,
+                identity.task_id,
+                execution_generation,
+                legacy_member_id,
+                request_id,
+            ),
+        ).fetchone()
+        if legacy is None:
+            return False
+        if legacy["session_id"] != session_id:
+            raise TaskConflictError(
+                "legacy approval request has a different session"
+            )
+        try:
+            legacy_action = json.loads(legacy["action_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise TaskConflictError(
+                "legacy approval request has invalid durable content"
+            ) from exc
+        if (
+            not isinstance(legacy_action, dict)
+            or legacy_action.get("member_id") != legacy_member_id
+        ):
+            raise TaskConflictError(
+                "legacy approval request does not match its member identity"
+            )
+        legacy_action["member_id"] = member_id
+        if _canonical_json(legacy_action) != action_json:
+            raise TaskConflictError(
+                "legacy approval request has different content"
+            )
+
+        current = conn.execute(
+            """SELECT * FROM hosted_room_approval_requests
+               WHERE room_id=? AND task_id=? AND execution_generation=?
+                 AND member_id=? AND request_id=?""",
+            (
+                identity.room_id,
+                identity.task_id,
+                execution_generation,
+                member_id,
+                request_id,
+            ),
+        ).fetchone()
+        if current is None:
+            updated = conn.execute(
+                """UPDATE hosted_room_approval_requests
+                   SET member_id=?, action_json=?, updated_at=?
+                   WHERE room_id=? AND task_id=? AND execution_generation=?
+                     AND member_id=? AND request_id=? AND consumed_at IS NULL""",
+                (
+                    member_id,
+                    action_json,
+                    now,
+                    identity.room_id,
+                    identity.task_id,
+                    execution_generation,
+                    legacy_member_id,
+                    request_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleTaskError(
+                    "legacy approval request changed during migration"
+                )
+            return True
+
+        if (
+            current["session_id"] != session_id
+            or current["action_json"] != action_json
+        ):
+            raise TaskConflictError(
+                "corrected approval request already has different content"
+            )
+        legacy_choice = legacy["choice"]
+        current_choice = current["choice"]
+        if (
+            legacy_choice is not None
+            and current_choice is not None
+            and legacy_choice != current_choice
+        ):
+            raise TaskConflictError(
+                "legacy and corrected approval requests have conflicting choices"
+            )
+        merged_choice = current_choice or legacy_choice
+        conn.execute(
+            """UPDATE hosted_room_approval_requests
+               SET choice=?, created_at=?, updated_at=?
+               WHERE room_id=? AND task_id=? AND execution_generation=?
+                 AND member_id=? AND request_id=?""",
+            (
+                merged_choice,
+                min(float(legacy["created_at"]), float(current["created_at"])),
+                max(now, float(legacy["updated_at"]), float(current["updated_at"])),
+                identity.room_id,
+                identity.task_id,
+                execution_generation,
+                member_id,
+                request_id,
+            ),
+        )
+        removed = conn.execute(
+            """DELETE FROM hosted_room_approval_requests
+               WHERE room_id=? AND task_id=? AND execution_generation=?
+                 AND member_id=? AND request_id=? AND consumed_at IS NULL""",
+            (
+                identity.room_id,
+                identity.task_id,
+                execution_generation,
+                legacy_member_id,
+                request_id,
+            ),
+        )
+        if removed.rowcount != 1:
+            raise StaleTaskError(
+                "legacy approval request changed during retirement"
+            )
+    return True
+
+
 def decide_approval_request(
     db_path: Path | str,
     identity: TaskIdentity,

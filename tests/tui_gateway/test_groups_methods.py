@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -249,6 +251,75 @@ def test_groups_disband_blocks_a_second_service_before_stop_and_tombstone(
     assert result["tombstone"]["idempotent"] is False
     events = hosted_rooms.read_events(
         service.db_path,
+        room_id="room-1",
+        include_disbanded=True,
+    )["events"]
+    assert [event["kind"] for event in events] == [
+        "room.stop_requested",
+        "room.disbanded",
+    ]
+
+
+def test_groups_disband_is_idempotent_across_concurrent_services(home, monkeypatch):
+    from gateway import hosted_room_driver as driver
+    from gateway import hosted_rooms
+    from tui_gateway.hosted_room_service import HostedRoomService
+
+    _create_room()
+    first_service = methods_groups.get_hosted_room_service()
+    assert first_service is not None
+    second_service = HostedRoomService(srv, db_path=first_service.db_path)
+    thread_state = threading.local()
+    initial_reads = threading.Barrier(2)
+    second_waiting = threading.Event()
+    first_finished = threading.Event()
+    original_room_state = hosted_rooms.room_state
+    original_block = driver.block_room_admissions
+
+    def service_for_thread():
+        return thread_state.service
+
+    def synchronized_room_state(*args, **kwargs):
+        state = original_room_state(*args, **kwargs)
+        if state.get("disbanded_at") is None:
+            initial_reads.wait(timeout=20.0)
+        return state
+
+    def ordered_block(*args, **kwargs):
+        if thread_state.role == "second":
+            second_waiting.set()
+            assert first_finished.wait(timeout=20.0)
+        else:
+            assert second_waiting.wait(timeout=20.0)
+        return original_block(*args, **kwargs)
+
+    def disband(role, service, rid):
+        thread_state.role = role
+        thread_state.service = service
+        try:
+            return srv._methods["groups.disband"](rid, {"room_id": "room-1"})
+        finally:
+            if role == "first":
+                first_finished.set()
+
+    monkeypatch.setattr(methods_groups, "get_hosted_room_service", service_for_thread)
+    monkeypatch.setattr(hosted_rooms, "room_state", synchronized_room_state)
+    monkeypatch.setattr(driver, "block_room_admissions", ordered_block)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(disband, "first", first_service, 2)
+        second_future = pool.submit(disband, "second", second_service, 3)
+        results = [
+            _result(first_future.result(timeout=30.0)),
+            _result(second_future.result(timeout=30.0)),
+        ]
+
+    assert {result["tombstone"]["idempotent"] for result in results} == {
+        False,
+        True,
+    }
+    events = hosted_rooms.read_events(
+        first_service.db_path,
         room_id="room-1",
         include_disbanded=True,
     )["events"]
