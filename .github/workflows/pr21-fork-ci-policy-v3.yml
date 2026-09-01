@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 120
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: f181bbe2b75b0f27cf82f00d39c051d3854ce513
+      EXPECTED_PARENT: 8ca59920e6e442f3e378e6ac32c3d13efdaf218d
       MAIN_FINAL: e6c06033a04d9745ed1efea97ce35401323dbfd7
       REPORT_DIR: /tmp/pr21-fork-ci-policy-v3
     steps:
@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: codex/sync-hermes-v021-20260901
-          fetch-depth: 4
+          fetch-depth: 32
           persist-credentials: true
 
       - name: Verify immutable write point
