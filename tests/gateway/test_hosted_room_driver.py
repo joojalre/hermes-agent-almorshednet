@@ -51,7 +51,9 @@ def db(tmp_path):
         path,
         room_id="room-1",
         name="Release room",
-        members=[{"profile": "ops", "handle": "ops"}],
+        members=[
+            {"member_id": "member-ops", "profile": "ops", "handle": "ops"}
+        ],
         authority_gateway_id="gateway-a",
         now=90,
     )
@@ -1762,7 +1764,7 @@ def test_admission_is_bounded_by_terminal_recovery_liability(db, monkeypatch):
     assert len(driver.list_tasks(db, room_id="room-1")) == 1
 
 
-def test_admission_atomically_swaps_discussion_reservation_for_task(
+def test_terminal_publication_transfers_reservation_until_room_activity(
     db,
     monkeypatch,
 ):
@@ -1809,6 +1811,12 @@ def test_admission_atomically_swaps_discussion_reservation_for_task(
                 "actor": {"kind": "gateway", "id": "gateway-a"},
                 "payload": {
                     "task_id": "task-1",
+                    "member_id": "member-ops",
+                    "member_index": 0,
+                    "round_index": 0,
+                    "seen_through_seq": source["seq"],
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
                     "discussion_event_id": "discussion-1",
                 },
                 "authority_gateway_id": "gateway-a",
@@ -1818,10 +1826,119 @@ def test_admission_atomically_swaps_discussion_reservation_for_task(
         allow_terminal_recovery=True,
     )
     with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == {
+            rooms._discussion_liability_key("room-1", "thread-1")
+        }
+
+    latest = rooms.room_state(db, room_id="room-1")["latest_seq"]
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", latest)
+    closed = rooms.append_events(
+        db,
+        events=[
+            {
+                "room_id": "room-1",
+                "event_id": "activity-discussion-1",
+                "kind": "room.activity",
+                "actor": {"kind": "gateway", "id": "gateway-a"},
+                "payload": {
+                    "status": "settled",
+                    "reason_code": "complete",
+                    "thread_id": "thread-1",
+                    "discussion_event_id": "discussion-1",
+                },
+                "authority_gateway_id": "gateway-a",
+                "authority_epoch": 1,
+            }
+        ],
+    )
+
+    assert closed[0]["kind"] == "room.activity"
+    with rooms._connect(db) as conn:
         assert rooms._terminal_publication_liabilities(conn) == set()
 
 
-def test_unrelated_terminal_event_cannot_consume_existing_liability_headroom(
+def test_closed_published_deferred_task_releases_liability_and_is_pruned(db):
+    clock = FakeClock()
+    source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="discussion-deferred",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect", "thread_id": "thread-1"},
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+        require_open_admissions=True,
+    )
+    identity = _identity()
+    _admit(
+        db,
+        identity,
+        clock,
+        payload=_payload(source_event_seq=source["seq"]),
+    )
+    lease = _lease(db, clock)
+    attempt = driver.start_task(
+        db,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    deferred = driver.defer_running_task(
+        db,
+        attempt,
+        reason="member_unavailable",
+        clock=clock,
+    )
+    for event_id, kind, payload in (
+        (
+            "deferred-task-1",
+            "turn.deferred",
+            {
+                "task_id": "task-1",
+                "execution_generation": deferred["execution_generation"],
+                "member_id": "member-ops",
+                "member_index": 0,
+                "round_index": 0,
+                "seen_through_seq": source["seq"],
+                "thread_id": "thread-1",
+                "turn_id": "turn-1",
+                "discussion_event_id": "discussion-deferred",
+            },
+        ),
+        (
+            "activity-deferred",
+            "room.activity",
+            {
+                "status": "bounded",
+                "reason_code": "deferred",
+                "thread_id": "thread-1",
+                "discussion_event_id": "discussion-deferred",
+            },
+        ),
+    ):
+        rooms.append_event(
+            db,
+            room_id="room-1",
+            event_id=event_id,
+            kind=kind,
+            actor={"kind": "gateway", "id": "gateway-a"},
+            payload=payload,
+            authority_gateway_id="gateway-a",
+            authority_epoch=1,
+        )
+
+    with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == set()
+    assert (
+        driver.prune_closed_published_deferred_tasks(db, room_id="room-1")
+        == 1
+    )
+    assert driver.list_tasks(db, room_id="room-1") == []
+
+
+def test_uncorrelated_terminal_event_cannot_consume_existing_liability_headroom(
     db,
     monkeypatch,
 ):
@@ -1840,7 +1957,7 @@ def test_unrelated_terminal_event_cannot_consume_existing_liability_headroom(
                     "event_id": "terminal-for-unrelated-task",
                     "kind": "turn.cancelled",
                     "actor": {"kind": "gateway", "id": "gateway-a"},
-                    "payload": {"task_id": "unrelated-task"},
+                    "payload": {"task_id": "task-1"},
                     "authority_gateway_id": "gateway-a",
                     "authority_epoch": 1,
                 }
@@ -1849,13 +1966,82 @@ def test_unrelated_terminal_event_cannot_consume_existing_liability_headroom(
         )
 
 
+def test_room_activity_thread_must_match_before_releasing_discussion_liability(
+    db,
+):
+    source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="discussion-thread-fence",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect", "thread_id": "thread-1"},
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+        require_open_admissions=True,
+    )
+    rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="activity-wrong-thread",
+        kind="room.activity",
+        actor={"kind": "gateway", "id": "gateway-a"},
+        payload={
+            "status": "bounded",
+            "thread_id": "thread-other",
+            "discussion_event_id": source["event_id"],
+        },
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+    )
+
+    with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == {
+            rooms._discussion_liability_key("room-1", "thread-1")
+        }
+
+    rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="activity-exact-thread",
+        kind="room.activity",
+        actor={"kind": "gateway", "id": "gateway-a"},
+        payload={
+            "status": "bounded",
+            "thread_id": "thread-1",
+            "discussion_event_id": source["event_id"],
+        },
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+    )
+
+    with rooms._connect(db) as conn:
+        assert rooms._terminal_publication_liabilities(conn) == set()
+
+
 def test_durable_terminal_publication_releases_liability_at_exact_boundary(
     db,
     monkeypatch,
 ):
     clock = FakeClock()
+    source = rooms.append_event(
+        db,
+        room_id="room-1",
+        event_id="discussion-at-boundary",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "inspect", "thread_id": "thread-1"},
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+        require_open_admissions=True,
+    )
     identity = _identity()
-    _admit(db, identity, clock)
+    _admit(
+        db,
+        identity,
+        clock,
+        payload=_payload(source_event_seq=source["seq"]),
+    )
     driver.cancel_task(
         db,
         identity,
@@ -1863,10 +2049,10 @@ def test_durable_terminal_publication_releases_liability_at_exact_boundary(
         expected_cancel_generation=0,
         clock=clock,
     )
-    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", 0)
+    monkeypatch.setattr(rooms, "MAX_EVENTS_PER_ROOM", source["seq"])
     monkeypatch.setattr(rooms, "STOP_EVENT_COUNT_RESERVE", 1)
     monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 2)
-    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 4)
+    monkeypatch.setattr(rooms, "CONTROL_EVENT_COUNT_RESERVE", 5)
 
     appended = rooms.append_events(
         db,
@@ -1876,7 +2062,17 @@ def test_durable_terminal_publication_releases_liability_at_exact_boundary(
                 "event_id": "terminal-for-task-1",
                 "kind": "turn.cancelled",
                 "actor": {"kind": "gateway", "id": "gateway-a"},
-                "payload": {"task_id": "task-1"},
+                "payload": {
+                    "task_id": "task-1",
+                    "member_id": "member-ops",
+                    "member_index": 0,
+                    "round_index": 0,
+                    "seen_through_seq": source["seq"],
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "discussion_event_id": "discussion-at-boundary",
+                    "reason": "member turn cancelled",
+                },
                 "authority_gateway_id": "gateway-a",
                 "authority_epoch": 1,
             }
@@ -1886,16 +2082,53 @@ def test_durable_terminal_publication_releases_liability_at_exact_boundary(
 
     assert appended[0]["kind"] == "turn.cancelled"
     with rooms._connect(db) as conn:
-        assert rooms._terminal_publication_liabilities(conn) == set()
+        assert rooms._terminal_publication_liabilities(conn) == {
+            rooms._discussion_liability_key("room-1", "thread-1")
+        }
 
 
 def test_existing_liabilities_over_recovery_reserve_fail_loudly(db, monkeypatch):
     identity = _identity()
     _admit(db, identity, FakeClock())
     monkeypatch.setattr(rooms, "TERMINAL_RECOVERY_COUNT_RESERVE", 0)
+    current_pid = driver.os.getpid()
+    monkeypatch.setattr(driver.os, "getpid", lambda: current_pid + 1)
 
     with pytest.raises(driver.DriverStateError, match="exceed durable terminal"):
         driver.get_task(db, identity)
+
+
+def test_terminal_recovery_audit_runs_once_per_process_schema(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    rooms.create_room(
+        db,
+        room_id="room-1",
+        name="Release room",
+        members=[{"profile": "ops", "handle": "ops"}],
+        authority_gateway_id="gateway-a",
+        now=90,
+    )
+    original = driver._raise_if_terminal_recovery_headroom_is_unrecoverable
+    calls = 0
+
+    def counted(conn):
+        nonlocal calls
+        calls += 1
+        return original(conn)
+
+    monkeypatch.setattr(
+        driver,
+        "_raise_if_terminal_recovery_headroom_is_unrecoverable",
+        counted,
+    )
+    identity = _identity()
+    _admit(db, identity, FakeClock())
+
+    for _ in range(5):
+        assert driver.get_task(db, identity)["status"] == "queued"
+        assert len(driver.list_tasks(db, room_id="room-1")) == 1
+
+    assert calls == 1
 
 
 def test_state_survives_sqlite_reopen_and_concurrent_duplicate_admission(db):

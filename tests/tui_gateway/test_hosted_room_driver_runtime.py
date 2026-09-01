@@ -15,6 +15,7 @@ import psutil
 from gateway import hosted_room_driver as state
 from gateway import hosted_rooms
 from gateway import status as gateway_status
+from tui_gateway import hosted_room_driver as driver_runtime
 from tui_gateway.hosted_room_driver import (
     MAX_TERMINAL_TEXT_BYTES,
     ROOM_SESSION_SOURCE,
@@ -1867,6 +1868,84 @@ def test_same_process_runtime_replacement_can_finish_exact_stop(db: Path):
     )
 
     assert runtime.cancel(identity, cancel_id="cancel-same-process")["status"] == "cancelled"
+
+
+def test_same_process_replacement_waits_for_submit_fence_before_cancelling(
+    db: Path,
+):
+    identity = _identity()
+    _admit(db, identity)
+    now = [100.0]
+    clock = lambda: now[0]
+    owner_rpc = FakeSessionRPC(auto_complete=False)
+    owner = _runtime(
+        db,
+        owner_rpc,
+        process_generation="old-runtime",
+        process_pid=3333,
+        process_start_time=9001,
+        owner_liveness=lambda _pid, _started: pytest.fail(
+            "same-process replacement must not require liveness probing"
+        ),
+        clock=clock,
+        lease_ttl_seconds=1.0,
+    )
+    resolve_started = threading.Event()
+    release_resolve = threading.Event()
+    original_resolve = owner_rpc.resolve_exact
+
+    def blocked_resolve(**kwargs):
+        resolve_started.set()
+        assert release_resolve.wait(2.0)
+        return original_resolve(**kwargs)
+
+    owner_rpc.resolve_exact = blocked_resolve
+    owner.start()
+    try:
+        assert resolve_started.wait(1.0)
+        now[0] += 2.0
+        replacement_rpc = FakeSessionRPC(auto_complete=False)
+        replacement = _runtime(
+            db,
+            replacement_rpc,
+            process_generation="new-runtime",
+            process_pid=3333,
+            process_start_time=9001,
+            owner_liveness=lambda _pid, _started: pytest.fail(
+                "same-process replacement must not require liveness probing"
+            ),
+            clock=clock,
+            lease_ttl_seconds=1.0,
+        )
+
+        stopping = replacement.cancel(
+            identity,
+            cancel_id="cancel-during-submit-window",
+        )
+        assert stopping["status"] == "stopping"
+        assert any(call[0] == "interrupt_absent" for call in replacement_rpc.calls)
+
+        release_resolve.set()
+        _wait_for(
+            lambda: not driver_runtime._process_submission_is_registered(
+                driver_runtime._submission_fence_key(
+                    db,
+                    identity,
+                    int(stopping["execution_generation"]),
+                )
+            )
+        )
+        assert not [call for call in owner_rpc.calls if call[0] == "submit"]
+
+        cancelled = replacement.cancel(
+            identity,
+            cancel_id="cancel-during-submit-window",
+        )
+        assert cancelled["status"] == "cancelled"
+        assert not [call for call in replacement_rpc.calls if call[0] == "submit"]
+    finally:
+        release_resolve.set()
+        assert owner.stop(timeout=1.0)
 
 
 def test_pending_local_approval_is_reported_with_safe_choices(db: Path):

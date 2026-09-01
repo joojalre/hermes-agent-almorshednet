@@ -528,6 +528,101 @@ def test_demote_rejects_unpublished_terminal_liability_without_mutation(
     assert after["events"] == before["events"]
 
 
+@pytest.mark.parametrize(
+    ("mismatched_field", "mismatched_value"),
+    [
+        ("discussion_event_id", "different-discussion"),
+        ("member_id", "coder"),
+        ("thread_id", "different-thread"),
+        ("turn_id", "different-turn"),
+    ],
+)
+def test_demote_rejects_terminal_event_with_mismatched_task_correlation(
+    tmp_path,
+    monkeypatch,
+    mismatched_field,
+    mismatched_value,
+):
+    adb = _authority_db(tmp_path)
+    rooms.create_room(
+        adb,
+        room_id="room-1",
+        name="Field Room",
+        members=[
+            {"member_id": "planner", "profile": "planner", "handle": "planner"},
+            {"member_id": "coder", "profile": "coder", "handle": "coder"},
+        ],
+        authority_gateway_id=AUTH_A,
+    )
+    source = rooms.append_event(
+        adb,
+        room_id="room-1",
+        event_id="discussion-1",
+        kind="message.user",
+        actor=USER,
+        payload={"text": "inspect", "thread_id": "thread-1"},
+        authority_gateway_id=AUTH_A,
+        authority_epoch=1,
+        require_open_admissions=True,
+    )
+    identity = driver.TaskIdentity(
+        room_id="room-1",
+        task_id="task-correlated",
+        thread_id="thread-1",
+        turn_id="turn-1",
+    )
+    driver.admit_task(
+        adb,
+        identity,
+        payload={
+            "target_profile": "planner",
+            "prompt": "Publish this task's exact terminal result before demotion.",
+            "source_event_seq": source["seq"],
+        },
+        clock=lambda: 100.0,
+    )
+    driver.cancel_task(
+        adb,
+        identity,
+        cancel_id="cancel-correlated",
+        expected_cancel_generation=0,
+        clock=lambda: 100.0,
+    )
+    terminal_payload = {
+        "discussion_event_id": "discussion-1",
+        "member_id": "planner",
+        "member_index": 0,
+        "round_index": 0,
+        "seen_through_seq": source["seq"],
+        "task_id": "task-correlated",
+        "thread_id": "thread-1",
+        "turn_id": "turn-1",
+        "reason": "forged correlation",
+    }
+    terminal_payload[mismatched_field] = mismatched_value
+    rooms.append_event(
+        adb,
+        room_id="room-1",
+        event_id="forged-terminal",
+        kind="turn.cancelled",
+        actor={"kind": "gateway", "id": AUTH_A},
+        payload=terminal_payload,
+        authority_gateway_id=AUTH_A,
+        authority_epoch=1,
+    )
+    monkeypatch.setattr(replicas, "local_authority_gateway_id", lambda: AUTH_A)
+    before = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)
+
+    with pytest.raises(replicas.ReplicaError, match="unpublished terminal"):
+        replicas.demote_room(
+            adb, room_id="room-1", observed_gateway_id=AUTH_B, observed_epoch=2
+        )
+
+    after = rooms.read_events(adb, room_id="room-1", since_seq=0, limit=100)
+    assert after["authority"] == before["authority"]
+    assert after["events"] == before["events"]
+
+
 def test_demote_preflights_authority_lost_control_capacity(tmp_path, monkeypatch):
     adb = _authority_db(tmp_path)
     _seed_room(adb, n_events=0)

@@ -42,6 +42,38 @@ _ROOM_SESSION_TITLE_MAX_CHARS = 100
 _TERMINAL_TRUNCATION_NOTICE = (
     "\n\n[Reply truncated. Ask the Bot to share the full result as a file.]"
 )
+_PROCESS_SUBMISSION_LOCK = threading.Lock()
+_PROCESS_SUBMISSIONS: set[tuple[str, state.TaskIdentity, int]] = set()
+
+
+def _submission_fence_key(
+    db_path: Path | str,
+    identity: state.TaskIdentity,
+    execution_generation: int,
+) -> tuple[str, state.TaskIdentity, int]:
+    database = os.path.normcase(str(Path(db_path).resolve()))
+    return database, identity, int(execution_generation)
+
+
+def _register_process_submission(
+    key: tuple[str, state.TaskIdentity, int],
+) -> None:
+    with _PROCESS_SUBMISSION_LOCK:
+        _PROCESS_SUBMISSIONS.add(key)
+
+
+def _unregister_process_submission(
+    key: tuple[str, state.TaskIdentity, int],
+) -> None:
+    with _PROCESS_SUBMISSION_LOCK:
+        _PROCESS_SUBMISSIONS.discard(key)
+
+
+def _process_submission_is_registered(
+    key: tuple[str, state.TaskIdentity, int],
+) -> bool:
+    with _PROCESS_SUBMISSION_LOCK:
+        return key in _PROCESS_SUBMISSIONS
 
 
 class RoomSessionIdentityUnavailableError(RuntimeError):
@@ -537,11 +569,20 @@ class HostedRoomRuntime:
             task["identity"],
             int(task["execution_generation"]),
         )
+        submission_key = _submission_fence_key(
+            self.db_path,
+            task["identity"],
+            int(task["execution_generation"]),
+        )
         with self._status_lock:
             submission_in_progress = (
                 self._submitting_tasks.get(task["identity"].room_id)
                 == exact_submission
             )
+        submission_in_progress = (
+            submission_in_progress
+            or _process_submission_is_registered(submission_key)
+        )
         result = transport.interrupt_admitted(
             task=task["identity"],
             execution_generation=int(task["execution_generation"]),
@@ -874,6 +915,12 @@ class HostedRoomRuntime:
         profile = task["payload"]["target_profile"]
         transport = self.rpc
         submit_attempted = False
+        submission_key = _submission_fence_key(
+            self.db_path,
+            attempt.identity,
+            attempt.execution_generation,
+        )
+        _register_process_submission(submission_key)
         with self._status_lock:
             self._current_tasks[binding.room_id] = attempt.identity
             self._submitting_tasks[binding.room_id] = (
@@ -982,6 +1029,7 @@ class HostedRoomRuntime:
                         on_terminal=on_terminal,
                     )
                 finally:
+                    _unregister_process_submission(submission_key)
                     with self._status_lock:
                         if (
                             self._submitting_tasks.get(binding.room_id)
@@ -1039,6 +1087,7 @@ class HostedRoomRuntime:
             else:
                 self._settle_failure_if_current(attempt, exc)
         finally:
+            _unregister_process_submission(submission_key)
             with self._status_lock:
                 self._current_tasks.pop(binding.room_id, None)
                 if (

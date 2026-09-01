@@ -384,6 +384,10 @@ class HostedRoomService:
                 snapshot = self._policy_snapshot(room)
                 events = list(snapshot.events)
             self.policy_checkpoint.compact_completed(room_id=binding.room_id)
+            driver.prune_closed_published_deferred_tasks(
+                self.db_path,
+                room_id=binding.room_id,
+            )
             driver.prune_published_terminal_tasks(
                 self.db_path,
                 room_id=binding.room_id,
@@ -581,6 +585,10 @@ class HostedRoomService:
         cancelled = 0
         pending = 0
         with self._policy_lock:
+            driver.prune_closed_published_deferred_tasks(
+                self.db_path,
+                room_id=room_id,
+            )
             tasks = {}
             for status in (
                 "queued",

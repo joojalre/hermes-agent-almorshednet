@@ -659,14 +659,18 @@ def _discussion_liability_key(room_id: str, thread_id: str) -> tuple[str, str]:
     return room_id, f"{_DISCUSSION_LIABILITY_PREFIX}{thread_id}"
 
 
-def _pending_discussion_sources(
+def _discussion_source_state(
     conn: sqlite3.Connection,
-    *,
-    consumed_task_sources: set[tuple[str, int, str]],
-) -> dict[tuple[str, str], int]:
+) -> tuple[
+    dict[tuple[str, str], tuple[int, str]],
+    dict[str, int],
+    set[tuple[str, str, str]],
+]:
+    """Return latest sources, Stop fences, and durably closed discussions."""
+
     latest_by_thread: dict[tuple[str, str], tuple[int, str]] = {}
     stopped_through: dict[str, int] = {}
-    completed: set[tuple[str, str]] = set()
+    completed: set[tuple[str, str, str]] = set()
     rows = conn.execute(
         """SELECT event.room_id, event.seq, event.event_id, event.kind,
                   event.payload_json
@@ -693,12 +697,15 @@ def _pending_discussion_sources(
             continue
         if kind == "room.activity":
             discussion_event_id = payload.get("discussion_event_id")
+            thread_id = payload.get("thread_id")
             if (
                 payload.get("status") in {"settled", "bounded"}
                 and isinstance(discussion_event_id, str)
                 and discussion_event_id
+                and isinstance(thread_id, str)
+                and thread_id
             ):
-                completed.add((room_id, discussion_event_id))
+                completed.add((room_id, discussion_event_id, thread_id))
             continue
         thread_id = payload.get("thread_id")
         if isinstance(thread_id, str) and thread_id:
@@ -706,17 +713,299 @@ def _pending_discussion_sources(
                 seq,
                 str(row["event_id"]),
             )
+    return latest_by_thread, stopped_through, completed
+
+
+def _pending_discussion_sources(
+    conn: sqlite3.Connection,
+    *,
+    consumed_task_sources: set[tuple[str, int, str]],
+    source_state: tuple[
+        dict[tuple[str, str], tuple[int, str]],
+        dict[str, int],
+        set[tuple[str, str, str]],
+    ]
+    | None = None,
+) -> dict[tuple[str, str], int]:
+    latest_by_thread, stopped_through, completed = (
+        source_state if source_state is not None else _discussion_source_state(conn)
+    )
 
     pending: dict[tuple[str, str], int] = {}
     for (room_id, thread_id), (seq, event_id) in latest_by_thread.items():
         if seq <= stopped_through.get(room_id, 0):
             continue
-        if (room_id, event_id) in completed:
+        if (room_id, event_id, thread_id) in completed:
             continue
         if (room_id, seq, thread_id) in consumed_task_sources:
             continue
         pending[_discussion_liability_key(room_id, thread_id)] = seq
     return pending
+
+
+def _terminal_event_matches_driver_task(
+    task: sqlite3.Row,
+    *,
+    kind: str,
+    payload: dict[str, Any],
+) -> bool:
+    """Fail closed unless a room-log terminal exactly identifies its driver task."""
+
+    task_id = str(task["task_id"])
+    thread_id = str(task["thread_id"])
+    turn_id = str(task["turn_id"])
+    source_event_id = task["source_event_id"]
+    if (
+        source_event_id is None
+        or str(task["source_kind"]) != "message.user"
+        or payload.get("task_id") != task_id
+        or payload.get("thread_id") != thread_id
+        or payload.get("turn_id") != turn_id
+        or payload.get("discussion_event_id") != str(source_event_id)
+    ):
+        return False
+
+    try:
+        source_payload = json.loads(str(task["source_payload_json"]))
+        task_payload = json.loads(str(task["task_payload_json"]))
+        members = json.loads(str(task["members_json"]))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(source_payload, dict)
+        or source_payload.get("thread_id") != thread_id
+        or not isinstance(task_payload, dict)
+        or not isinstance(members, list)
+    ):
+        return False
+
+    member_id = payload.get("member_id")
+    member_index = payload.get("member_index")
+    round_index = payload.get("round_index")
+    seen_through_seq = payload.get("seen_through_seq")
+    source_event_seq = int(task["source_event_seq"])
+    if (
+        not isinstance(member_id, str)
+        or not member_id
+        or isinstance(member_index, bool)
+        or not isinstance(member_index, int)
+        or member_index < 0
+        or isinstance(round_index, bool)
+        or not isinstance(round_index, int)
+        or round_index < 0
+        or isinstance(seen_through_seq, bool)
+        or not isinstance(seen_through_seq, int)
+        or seen_through_seq < source_event_seq
+    ):
+        return False
+
+    target_profile = task_payload.get("target_profile")
+    if not isinstance(target_profile, str) or not target_profile:
+        return False
+    expected_member_ids: set[str] = set()
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        profile = member.get("profile")
+        legacy_id = member.get("id")
+        if profile != target_profile and not (
+            profile is None and legacy_id == target_profile
+        ):
+            continue
+        candidate = member.get("member_id", legacy_id)
+        if isinstance(candidate, str) and candidate:
+            expected_member_ids.add(candidate)
+    if member_id not in expected_member_ids:
+        return False
+
+    status = str(task["status"])
+    if kind == "turn.deferred":
+        generation = payload.get("execution_generation")
+        return (
+            status == "deferred"
+            and isinstance(generation, int)
+            and not isinstance(generation, bool)
+            and generation == int(task["execution_generation"])
+            and generation > 0
+        )
+    allowed_final_kinds = {
+        "settled": frozenset({"turn.settled", "turn.cancelled"}),
+        "failed": frozenset({"turn.failed", "turn.cancelled"}),
+        "cancelled": frozenset({"turn.cancelled"}),
+    }
+    return kind in allowed_final_kinds.get(status, frozenset())
+
+
+def _published_terminal_task_outcomes(
+    conn: sqlite3.Connection,
+) -> tuple[set[tuple[str, str]], set[tuple[str, str, int]]]:
+    """Return only terminal outcomes correlated to durable driver task state."""
+
+    if not _table_exists(conn, "hosted_room_driver_tasks"):
+        return set(), set()
+    task_rows = conn.execute(
+        """SELECT task.room_id, task.task_id, task.thread_id, task.turn_id,
+                  task.source_event_seq, task.payload_json AS task_payload_json,
+                  task.status, task.execution_generation, room.members_json,
+                  source.event_id AS source_event_id,
+                  source.kind AS source_kind,
+                  source.payload_json AS source_payload_json
+             FROM hosted_room_driver_tasks AS task
+             JOIN hosted_rooms AS room ON room.room_id=task.room_id
+             LEFT JOIN hosted_room_events AS source
+               ON source.room_id=task.room_id
+              AND source.seq=task.source_event_seq
+            WHERE room.disbanded_at IS NULL"""
+    ).fetchall()
+    tasks = {
+        (str(row["room_id"]), str(row["task_id"])): row for row in task_rows
+    }
+    final: set[tuple[str, str]] = set()
+    deferred: set[tuple[str, str, int]] = set()
+    for row in conn.execute(
+        """SELECT room_id, kind, payload_json FROM hosted_room_events
+           WHERE kind IN (
+               'turn.settled', 'turn.failed', 'turn.cancelled', 'turn.deferred'
+           )"""
+    ).fetchall():
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        room_id = str(row["room_id"])
+        task = tasks.get((room_id, task_id))
+        kind = str(row["kind"])
+        if task is None or not _terminal_event_matches_driver_task(
+            task,
+            kind=kind,
+            payload=payload,
+        ):
+            continue
+        if kind == "turn.deferred":
+            deferred.add((room_id, task_id, int(payload["execution_generation"])))
+        else:
+            final.add((room_id, task_id))
+    return final, deferred
+
+
+def _correlated_terminal_task_ids(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+    events: list[dict[str, Any]],
+) -> frozenset[str]:
+    """Return pending final events that exactly identify durable driver tasks."""
+
+    candidates: list[tuple[str, str, dict[str, Any]]] = []
+    task_ids: set[str] = set()
+    for event in events:
+        kind = event.get("kind")
+        payload = event.get("payload")
+        if payload is None:
+            try:
+                payload = json.loads(str(event.get("payload_json", "")))
+            except json.JSONDecodeError:
+                continue
+        if kind not in _FINAL_TERMINAL_EVENT_KINDS or not isinstance(payload, dict):
+            continue
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        candidates.append((task_id, str(kind), payload))
+        task_ids.add(task_id)
+    if not candidates or not _table_exists(conn, "hosted_room_driver_tasks"):
+        return frozenset()
+
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"""SELECT task.room_id, task.task_id, task.thread_id, task.turn_id,
+                   task.source_event_seq, task.payload_json AS task_payload_json,
+                   task.status, task.execution_generation, room.members_json,
+                   source.event_id AS source_event_id,
+                   source.kind AS source_kind,
+                   source.payload_json AS source_payload_json
+              FROM hosted_room_driver_tasks AS task
+              JOIN hosted_rooms AS room ON room.room_id=task.room_id
+              LEFT JOIN hosted_room_events AS source
+                ON source.room_id=task.room_id
+               AND source.seq=task.source_event_seq
+             WHERE task.room_id=? AND room.disbanded_at IS NULL
+               AND task.task_id IN ({placeholders})""",
+        (room_id, *sorted(task_ids)),
+    ).fetchall()
+    tasks = {str(row["task_id"]): row for row in rows}
+    return frozenset(
+        task_id
+        for task_id, kind, payload in candidates
+        if (task := tasks.get(task_id)) is not None
+        and _terminal_event_matches_driver_task(task, kind=kind, payload=payload)
+    )
+
+
+def _terminal_task_discussion_liability_keys(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+    task_ids: frozenset[str],
+) -> frozenset[tuple[str, str]]:
+    """Transfer final task reserves to their still-open discussions."""
+
+    if not task_ids or not _table_exists(conn, "hosted_room_driver_tasks"):
+        return frozenset()
+    pending = _pending_discussion_sources(conn, consumed_task_sources=set())
+    placeholders = ",".join("?" for _ in task_ids)
+    keys: set[tuple[str, str]] = set()
+    for row in conn.execute(
+        f"""SELECT thread_id, source_event_seq
+              FROM hosted_room_driver_tasks
+             WHERE room_id=? AND task_id IN ({placeholders})""",
+        (room_id, *sorted(task_ids)),
+    ).fetchall():
+        key = _discussion_liability_key(room_id, str(row["thread_id"]))
+        if pending.get(key) == int(row["source_event_seq"]):
+            keys.add(key)
+    return frozenset(keys)
+
+
+def _closing_discussion_liability_keys(
+    conn: sqlite3.Connection,
+    *,
+    room_id: str,
+    events: list[dict[str, Any]],
+) -> frozenset[tuple[str, str]]:
+    """Return exact open-discussion reserves closed by room.activity events."""
+
+    pending = _pending_discussion_sources(conn, consumed_task_sources=set())
+    keys: set[tuple[str, str]] = set()
+    for event in events:
+        if event.get("kind") != "room.activity":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or payload.get("status") not in {
+            "settled",
+            "bounded",
+        }:
+            continue
+        thread_id = payload.get("thread_id")
+        discussion_event_id = payload.get("discussion_event_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            continue
+        if not isinstance(discussion_event_id, str) or not discussion_event_id:
+            continue
+        source = conn.execute(
+            """SELECT seq FROM hosted_room_events
+               WHERE room_id=? AND event_id=? AND kind='message.user'""",
+            (room_id, discussion_event_id),
+        ).fetchone()
+        key = _discussion_liability_key(room_id, thread_id)
+        if source is not None and pending.get(key) == int(source["seq"]):
+            keys.add(key)
+    return frozenset(keys)
 
 
 def _pending_discussion_liability_key_for_source(
@@ -734,45 +1023,52 @@ def _pending_discussion_liability_key_for_source(
 def _terminal_publication_liabilities(
     conn: sqlite3.Connection,
 ) -> set[tuple[str, str]]:
-    publications_exist = _table_exists(conn, "hosted_room_policy_publications")
-    published: set[tuple[str, str]] = set()
-    if publications_exist:
-        published = {
-            (str(row["room_id"]), str(row["task_id"]))
-            for row in conn.execute(
-                """SELECT room_id, task_id FROM hosted_room_policy_publications
-                   WHERE kind IN (
-                       'turn.settled', 'turn.failed', 'turn.cancelled'
-                   )"""
-            ).fetchall()
-        }
-    for row in conn.execute(
-        """SELECT room_id, payload_json FROM hosted_room_events
-           WHERE kind IN ('turn.settled', 'turn.failed', 'turn.cancelled')"""
-    ).fetchall():
-        try:
-            payload = json.loads(str(row["payload_json"]))
-        except json.JSONDecodeError:
-            continue
-        task_id = payload.get("task_id") if isinstance(payload, dict) else None
-        if isinstance(task_id, str) and task_id:
-            published.add((str(row["room_id"]), task_id))
+    published, published_deferred = _published_terminal_task_outcomes(conn)
+    source_state = _discussion_source_state(conn)
+    completed = source_state[2]
     liabilities: set[tuple[str, str]] = set()
     consumed_task_sources: set[tuple[str, int, str]] = set()
     if _table_exists(conn, "hosted_room_driver_tasks"):
         for row in conn.execute(
             """SELECT task.room_id, task.task_id, task.thread_id,
-                      task.source_event_seq, task.status
+                       task.source_event_seq, task.status,
+                       task.execution_generation, source.event_id AS source_event_id
                  FROM hosted_room_driver_tasks AS task
                  JOIN hosted_rooms AS room ON room.room_id=task.room_id
+                 LEFT JOIN hosted_room_events AS source
+                   ON source.room_id=task.room_id
+                  AND source.seq=task.source_event_seq
                 WHERE room.disbanded_at IS NULL"""
         ).fetchall():
             room_id = str(row["room_id"])
             key = (room_id, str(row["task_id"]))
+            source_event_id = row["source_event_id"]
+            deferred_is_closed = (
+                str(row["status"]) == "deferred"
+                and (
+                    room_id,
+                    str(row["task_id"]),
+                    int(row["execution_generation"]),
+                )
+                in published_deferred
+                and source_event_id is not None
+                and (
+                    room_id,
+                    str(source_event_id),
+                    str(row["thread_id"]),
+                )
+                in completed
+            )
+            if deferred_is_closed:
+                continue
             if str(row["status"]) not in {"settled", "failed", "cancelled"}:
                 liabilities.add(key)
             elif key not in published:
                 liabilities.add(key)
+            else:
+                # The final outcome is durable, but its discussion still needs
+                # one reserved closing transition until room.activity lands.
+                continue
             consumed_task_sources.add(
                 (room_id, int(row["source_event_seq"]), str(row["thread_id"]))
             )
@@ -780,6 +1076,7 @@ def _terminal_publication_liabilities(
         _pending_discussion_sources(
             conn,
             consumed_task_sources=consumed_task_sources,
+            source_state=source_state,
         )
     )
     return liabilities
@@ -1012,27 +1309,6 @@ def _is_terminal_recovery_plan(
         and bool(message_event_id.strip())
         and message_event_id == member_event_id
     )
-
-
-def _released_terminal_task_ids(
-    plan: list[tuple[int, dict[str, Any]]],
-) -> frozenset[str]:
-    released: set[str] = set()
-    for _, event in plan:
-        if event.get("kind") not in _FINAL_TERMINAL_EVENT_KINDS:
-            continue
-        payload = event.get("payload")
-        if payload is None:
-            try:
-                payload = json.loads(str(event.get("payload_json", "")))
-            except json.JSONDecodeError:
-                continue
-        if not isinstance(payload, dict):
-            continue
-        task_id = payload.get("task_id")
-        if isinstance(task_id, str) and task_id:
-            released.add(task_id)
-    return frozenset(released)
 
 
 def _prune_disbanded_rooms_locked(
@@ -1485,12 +1761,20 @@ def append_event(
             actor_json=actor_json,
             payload_json=payload_json,
         )
-        released_task_ids = frozenset(
-            {str(payload["task_id"])}
-            if kind in _FINAL_TERMINAL_EVENT_KINDS
-            and isinstance(payload.get("task_id"), str)
-            and payload["task_id"]
-            else set()
+        released_task_ids = _correlated_terminal_task_ids(
+            conn,
+            room_id=room_id,
+            events=[{"kind": kind, "payload": payload}],
+        )
+        prospective_discussion_keys = _terminal_task_discussion_liability_keys(
+            conn,
+            room_id=room_id,
+            task_ids=released_task_ids,
+        )
+        closing_discussion_keys = _closing_discussion_liability_keys(
+            conn,
+            room_id=room_id,
+            events=[{"kind": kind, "payload": payload}],
         )
         _assert_event_capacity(
             conn,
@@ -1501,12 +1785,19 @@ def append_event(
             allow_stop=kind == "room.stop_requested",
             allow_terminal_recovery=(
                 kind in _TERMINAL_COMPLETION_EVENT_KINDS
+                or bool(closing_discussion_keys)
             ),
             released_task_ids=released_task_ids,
+            released_liability_keys=closing_discussion_keys,
             prospective_liability_keys=(
-                frozenset({_discussion_liability_key(room_id, admission_thread_id)})
-                if admission_thread_id is not None
-                else frozenset()
+                prospective_discussion_keys
+                | (
+                    frozenset(
+                        {_discussion_liability_key(room_id, admission_thread_id)}
+                    )
+                    if admission_thread_id is not None
+                    else frozenset()
+                )
             ),
         )
         conn.execute(
@@ -1740,9 +2031,27 @@ def append_events(
                 list(enumerate(prepared))
             )
             released_task_ids = (
-                _released_terminal_task_ids(pending)
+                _correlated_terminal_task_ids(
+                    conn,
+                    room_id=room_id,
+                    events=[event for _, event in pending],
+                )
                 if terminal_recovery
                 else frozenset()
+            )
+            prospective_discussion_keys = (
+                _terminal_task_discussion_liability_keys(
+                    conn,
+                    room_id=room_id,
+                    task_ids=released_task_ids,
+                )
+                if terminal_recovery
+                else frozenset()
+            )
+            closing_discussion_keys = _closing_discussion_liability_keys(
+                conn,
+                room_id=room_id,
+                events=[event for _, event in pending],
             )
             _assert_event_capacity(
                 conn,
@@ -1757,8 +2066,12 @@ def append_events(
                 allow_stop=all(
                     event["kind"] == "room.stop_requested" for _, event in pending
                 ),
-                allow_terminal_recovery=terminal_recovery,
+                allow_terminal_recovery=(
+                    terminal_recovery or bool(closing_discussion_keys)
+                ),
                 released_task_ids=released_task_ids,
+                released_liability_keys=closing_discussion_keys,
+                prospective_liability_keys=prospective_discussion_keys,
             )
             first_seq = int(room["next_seq"])
             next_seq = first_seq

@@ -12,8 +12,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -188,6 +190,8 @@ _DEMOTION_INTENT_COLUMNS = frozenset({
     "created_at",
 })
 _DEMOTION_INTENT_PRIMARY_KEY = ("room_id", "gateway_id", "authority_epoch")
+_STARTUP_AUDIT_LOCK = threading.Lock()
+_STARTUP_AUDITED_SCHEMAS: set[tuple[int, str, int, int, int]] = set()
 
 
 class DriverStateError(ValueError):
@@ -617,6 +621,29 @@ def _raise_if_terminal_recovery_headroom_is_unrecoverable(
             ) from exc
 
 
+def _audit_terminal_recovery_headroom_once(
+    conn: sqlite3.Connection,
+    *,
+    path: Path,
+) -> None:
+    """Audit one database schema once per process, not on every task read."""
+
+    stat = path.stat()
+    schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+    key = (
+        os.getpid(),
+        str(path.resolve()),
+        int(stat.st_dev),
+        int(stat.st_ino),
+        schema_version,
+    )
+    with _STARTUP_AUDIT_LOCK:
+        if key in _STARTUP_AUDITED_SCHEMAS:
+            return
+        _raise_if_terminal_recovery_headroom_is_unrecoverable(conn)
+        _STARTUP_AUDITED_SCHEMAS.add(key)
+
+
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_driver_leases (
@@ -816,7 +843,6 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         return False
     _validate_schema(conn)
     _raise_if_pending_demotion_intent_lacks_stop(conn)
-    _raise_if_terminal_recovery_headroom_is_unrecoverable(conn)
     return True
 
 
@@ -925,11 +951,13 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("BEGIN")
         if _schema_is_current(conn):
+            _audit_terminal_recovery_headroom_once(conn, path=path)
             conn.commit()
             return conn
         conn.rollback()
         conn.execute("BEGIN IMMEDIATE")
         if _schema_is_current(conn):
+            _audit_terminal_recovery_headroom_once(conn, path=path)
             conn.commit()
             return conn
         if _schema_objects_exist(conn):
@@ -943,13 +971,14 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
             _create_demotion_intent_table(conn)
             _validate_schema(conn)
             _raise_if_pending_demotion_intent_lacks_stop(conn)
-            _raise_if_terminal_recovery_headroom_is_unrecoverable(conn)
+            _audit_terminal_recovery_headroom_once(conn, path=path)
             conn.commit()
             return conn
         # Schema creation is one database-wide transaction. The driver schema
         # has never shipped, so an incompatible draft schema fails closed
         # instead of attempting a partial in-place migration.
         _initialize_schema(conn)
+        _audit_terminal_recovery_headroom_once(conn, path=path)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -3153,3 +3182,55 @@ def prune_published_terminal_tasks(
             (room_id, *candidates),
         )
         return max(0, int(deleted.rowcount))
+
+
+def prune_closed_published_deferred_tasks(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+) -> int:
+    """Drop published deferrals after room.activity makes retry impossible."""
+
+    room_id = _identifier(room_id, label="room_id")
+    with _transaction(db_path) as conn:
+        _load_active_room(conn, room_id)
+        _, published_deferred = hosted_rooms._published_terminal_task_outcomes(conn)
+        completed = hosted_rooms._discussion_source_state(conn)[2]
+        candidates: list[tuple[str, int]] = []
+        for row in conn.execute(
+            """SELECT task.task_id, task.thread_id, task.execution_generation,
+                      source.event_id AS source_event_id
+                 FROM hosted_room_driver_tasks AS task
+                 LEFT JOIN hosted_room_events AS source
+                   ON source.room_id=task.room_id
+                  AND source.seq=task.source_event_seq
+                WHERE task.room_id=? AND task.status='deferred'
+                ORDER BY task.source_event_seq, task.created_at, task.task_id
+                LIMIT ?""",
+            (room_id, MAX_TASK_PRUNE_BATCH),
+        ).fetchall():
+            task_id = str(row["task_id"])
+            generation = int(row["execution_generation"])
+            source_event_id = row["source_event_id"]
+            if (
+                (room_id, task_id, generation) in published_deferred
+                and source_event_id is not None
+                and (
+                    room_id,
+                    str(source_event_id),
+                    str(row["thread_id"]),
+                )
+                in completed
+            ):
+                candidates.append((task_id, generation))
+
+        deleted = 0
+        for task_id, generation in candidates:
+            result = conn.execute(
+                """DELETE FROM hosted_room_driver_tasks
+                   WHERE room_id=? AND task_id=? AND status='deferred'
+                     AND execution_generation=?""",
+                (room_id, task_id, generation),
+            )
+            deleted += max(0, int(result.rowcount))
+        return deleted

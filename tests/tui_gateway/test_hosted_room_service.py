@@ -437,11 +437,7 @@ def test_profile_deleted_after_admission_is_deferred_and_peer_continues(
         task["payload"]["target_profile"]: task
         for task in driver.list_tasks(db, room_id="room-1")
     }
-    assert tasks["research"]["status"] == "deferred"
-    assert tasks["research"]["result"] == {
-        "reason": "member_unavailable",
-        "retryable": True,
-    }
+    assert "research" not in tasks
     assert tasks["ops"]["status"] == "settled"
     assert rpc.profile_calls == [
         ("resolve_exact", "ops"),
@@ -501,6 +497,73 @@ def test_demotion_interrupts_inflight_turn_before_authority_changes(tmp_path: Pa
         assert [task["status"] for task in tasks] == ["cancelled"]
     finally:
         service.stop(timeout=1.0)
+
+
+def test_demotion_prunes_compacted_published_deferral_before_cancelling(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    service.send(
+        room_id="room-1",
+        event_id="user-before-deferred-demotion",
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    binding = service.bindings()[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="deferred-before-demotion",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    attempt = driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    driver.defer_running_task(
+        db,
+        attempt,
+        reason="member_unavailable",
+        clock=time.time,
+    )
+
+    service.prepare_room(binding)
+    events_before = service._events("room-1")
+    assert any(event["kind"] == "turn.deferred" for event in events_before)
+    assert any(event["kind"] == "room.activity" for event in events_before)
+    assert len(driver.list_tasks(db, room_id="room-1", status="deferred")) == 1
+
+    observed_gateway = "install:" + "b" * 32
+    result = service.demote_room(
+        "room-1",
+        observed_gateway_id=observed_gateway,
+        observed_epoch=2,
+    )
+
+    assert result["authority_gateway_id"] == observed_gateway
+    assert result["authority_epoch"] == 2
+    assert driver.list_tasks(db, room_id="room-1") == []
+    assert not any(
+        event["kind"] == "turn.cancelled"
+        and event["payload"].get("task_id") == task["identity"].task_id
+        for event in service._events("room-1")
+    )
 
 
 def test_demotion_keeps_local_authority_when_interrupt_is_not_acknowledged(

@@ -39,8 +39,8 @@ from gateway.hosted_rooms import (
     _assert_event_capacity,
     _canonical_json,
     _connect,
+    _correlated_terminal_task_ids,
     _is_terminal_recovery_plan,
-    _released_terminal_task_ids,
     _terminal_publication_liabilities,
     _transaction,
     _validate_identifier,
@@ -507,7 +507,11 @@ def promote_replica(
                 ),
                 allow_terminal_recovery=terminal_recovery,
                 released_task_ids=(
-                    _released_terminal_task_ids(batch_plan)
+                    _correlated_terminal_task_ids(
+                        conn,
+                        room_id=room_id,
+                        events=[event for _, event in batch_plan],
+                    )
                     if terminal_recovery
                     else frozenset()
                 ),
