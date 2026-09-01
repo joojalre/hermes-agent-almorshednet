@@ -18,7 +18,7 @@ RELEASE_MARKERS = (
     "def _legacy_members_match(",
     "def reserve_peer_room(",
     "def remote_run_receipt(",
-    "def record_remote_run_receipt(",
+    "def upsert_remote_run_receipt(",
 )
 PATCH_MARKERS = (
     "_DISCUSSION_LIABILITY_PREFIX",
