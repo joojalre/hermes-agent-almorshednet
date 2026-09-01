@@ -1,0 +1,247 @@
+name: PR21 Patch 4 runtime delta analysis
+
+on:
+  push:
+    branches:
+      - codex/sync-hermes-v021-20260901
+    paths:
+      - .github/workflows/pr21-patch4-analyze.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr21-patch4-runtime-analysis
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: Inspect runtime stop and liveness delta
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_PARENT: 6fdaaf366af0f90283d500c04d58aa041efa00ed
+      SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
+      REPORT_DIR: /tmp/pr21-patch4-analysis
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      NOUS_API_KEY: ""
+    steps:
+      - name: Checkout exact PR21 branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable analysis point and PR19 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$GITHUB_SHA"
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
+          test "$(git rev-parse refs/remotes/origin/pr19-final)" = "$SOURCE_FINAL"
+          git status --short | tee "$REPORT_DIR/start-status.txt"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up locked Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra dev
+
+      - name: Verify current runtime baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest \
+            tests/gateway/test_hosted_room_driver.py \
+            tests/gateway/test_hosted_room_gateway_lifecycle.py \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py \
+            tests/tui_gateway/test_hosted_room_service.py \
+            -q --tb=short | tee "$REPORT_DIR/current-baseline.log"
+
+      - name: Generate scoped diff and AST inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            gateway/hosted_room_driver.py
+            gateway/hosted_room_discussion.py
+            tui_gateway/hosted_room_driver.py
+            tui_gateway/hosted_room_service.py
+            tests/gateway/test_hosted_room_driver.py
+            tests/gateway/test_hosted_room_gateway_lifecycle.py
+            tests/tui_gateway/test_hosted_room_driver_runtime.py
+            tests/tui_gateway/test_hosted_room_service.py
+          )
+          git diff --no-renames --stat HEAD "$SOURCE_FINAL" -- "${files[@]}" \
+            | tee "$REPORT_DIR/runtime-diff-stat.txt"
+          git diff --no-renames --name-status HEAD "$SOURCE_FINAL" -- "${files[@]}" \
+            | tee "$REPORT_DIR/runtime-name-status.txt"
+          git diff --no-renames --unified=5 HEAD "$SOURCE_FINAL" -- "${files[@]}" \
+            > "$REPORT_DIR/runtime-full.diff"
+
+          python - <<'PY'
+          from __future__ import annotations
+
+          import ast
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+          from typing import Any
+
+          source = os.environ["SOURCE_FINAL"]
+          report_dir = Path(os.environ["REPORT_DIR"])
+          files = (
+              "gateway/hosted_room_driver.py",
+              "gateway/hosted_room_discussion.py",
+              "tui_gateway/hosted_room_driver.py",
+              "tui_gateway/hosted_room_service.py",
+              "tests/gateway/test_hosted_room_driver.py",
+              "tests/gateway/test_hosted_room_gateway_lifecycle.py",
+              "tests/tui_gateway/test_hosted_room_driver_runtime.py",
+              "tests/tui_gateway/test_hosted_room_service.py",
+          )
+          keywords = re.compile(
+              r"terminal[_ -]?receipt|not[_ -]?admitted|proven[_ -]?dead|"
+              r"deadline|cancel|retry|stop|reclaim|indeterminate|receipt|"
+              r"settlement|liveness|ownership",
+              re.IGNORECASE,
+          )
+
+          def source_text(path: str) -> str:
+              return subprocess.check_output(
+                  ["git", "show", f"{source}:{path}"], text=True
+              )
+
+          def named_nodes(text: str) -> dict[str, ast.AST]:
+              tree = ast.parse(text)
+              result: dict[str, ast.AST] = {}
+              for node in tree.body:
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                      result[node.name] = node
+              return result
+
+          def class_methods(node: ast.ClassDef) -> dict[str, ast.AST]:
+              return {
+                  child.name: child
+                  for child in node.body
+                  if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+              }
+
+          def dump(node: ast.AST) -> str:
+              return ast.dump(node, include_attributes=False)
+
+          inventory: dict[str, Any] = {}
+          markdown = [
+              "# Patch 4 runtime delta inventory",
+              "",
+              f"Current workflow head: `{os.environ.get('GITHUB_SHA', '')}`",
+              f"PR19 source: `{source}`",
+              "",
+          ]
+
+          for path in files:
+              current = Path(path).read_text(encoding="utf-8")
+              final = source_text(path)
+              current_nodes = named_nodes(current)
+              final_nodes = named_nodes(final)
+              names = sorted(set(current_nodes) | set(final_nodes))
+              changed: list[str] = []
+              missing_current: list[str] = []
+              current_only: list[str] = []
+              changed_methods: dict[str, list[str]] = {}
+              for name in names:
+                  before = current_nodes.get(name)
+                  after = final_nodes.get(name)
+                  if before is None:
+                      missing_current.append(name)
+                      continue
+                  if after is None:
+                      current_only.append(name)
+                      continue
+                  if dump(before) != dump(after):
+                      changed.append(name)
+                  if isinstance(before, ast.ClassDef) and isinstance(after, ast.ClassDef):
+                      before_methods = class_methods(before)
+                      after_methods = class_methods(after)
+                      method_names = sorted(set(before_methods) | set(after_methods))
+                      method_delta = [
+                          method_name
+                          for method_name in method_names
+                          if method_name not in before_methods
+                          or method_name not in after_methods
+                          or dump(before_methods[method_name])
+                          != dump(after_methods[method_name])
+                      ]
+                      if method_delta:
+                          changed_methods[name] = method_delta
+
+              source_keyword_tests: list[str] = []
+              for name, node in final_nodes.items():
+                  segment = ast.get_source_segment(final, node) or ""
+                  if name.startswith("test_") and keywords.search(segment):
+                      source_keyword_tests.append(name)
+
+              inventory[path] = {
+                  "changed_top_level": changed,
+                  "missing_in_current": missing_current,
+                  "current_only": current_only,
+                  "changed_class_methods": changed_methods,
+                  "source_keyword_tests": sorted(source_keyword_tests),
+              }
+              markdown.extend(
+                  [
+                      f"## `{path}`",
+                      "",
+                      f"- Changed top-level: `{', '.join(changed) or 'none'}`",
+                      f"- Missing in current: `{', '.join(missing_current) or 'none'}`",
+                      f"- Current-only: `{', '.join(current_only) or 'none'}`",
+                  ]
+              )
+              for class_name, methods in changed_methods.items():
+                  markdown.append(
+                      f"- `{class_name}` method delta: `{', '.join(methods)}`"
+                  )
+              if source_keyword_tests:
+                  markdown.append(
+                      "- Relevant PR19 tests: `"
+                      + "`, `".join(sorted(source_keyword_tests))
+                      + "`"
+                  )
+              markdown.append("")
+
+          (report_dir / "runtime-ast-inventory.json").write_text(
+              json.dumps(inventory, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          (report_dir / "runtime-ast-inventory.md").write_text(
+              "\n".join(markdown).rstrip() + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload Patch 4 analysis evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr21-patch4-runtime-analysis
+          path: /tmp/pr21-patch4-analysis/**
+          if-no-files-found: error
+          retention-days: 14
