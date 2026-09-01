@@ -1,0 +1,95 @@
+name: Hermes v0.21.0 stage 8 service probe
+
+on:
+  push:
+    branches:
+      - codex/v021-stage8-service-probe-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-stage8-service-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Inspect e3fd service patch after cherry-pick
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout candidate without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch exact PR 19 history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-head
+          test "$(git rev-parse HEAD)" = "c19e98fbf5e0ceb243d066e3e46a4f304fb8d606"
+          git cat-file -e e3fd97d9781aec7efc6ce6cd5d291dc81b024bd1^{commit}
+
+      - name: Reproduce cherry-pick and capture service evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-stage8-service-probe"
+          mkdir -p "$REPORT"
+          git config user.name "Hermes Service Probe"
+          git config user.email "hermes-service-probe@invalid.local"
+
+          set +e
+          git cherry-pick --no-commit e3fd97d9781aec7efc6ce6cd5d291dc81b024bd1 \
+            > "$REPORT/cherry-pick.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" > "$REPORT/cherry-pick.exit"
+          git status --short > "$REPORT/status.txt"
+          git diff --name-only --diff-filter=U > "$REPORT/conflicts.txt"
+          git diff --cached -- tui_gateway/hosted_room_service.py \
+            > "$REPORT/service-cached.diff"
+          git diff -- tui_gateway/hosted_room_service.py \
+            > "$REPORT/service-working.diff"
+
+          python - "$REPORT/service-context.txt" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path("tui_gateway/hosted_room_service.py")
+          text = path.read_text(encoding="utf-8")
+          lines = text.splitlines()
+          markers = (
+              "current_profiles = self.local_profiles()",
+              "member_unavailable",
+              "uuid.uuid4()",
+              "if plan.target.kind == \"local\"",
+              "identity = driver.TaskIdentity(",
+          )
+          output = []
+          for marker in markers:
+              matches = [i for i, line in enumerate(lines) if marker in line]
+              output.append(f"MARKER {marker!r}: {matches}")
+              for index in matches:
+                  start = max(0, index - 16)
+                  end = min(len(lines), index + 32)
+                  output.append(f"--- lines {start + 1}-{end} ---")
+                  output.extend(
+                      f"{line_number + 1:05d}: {lines[line_number]}"
+                      for line_number in range(start, end)
+                  )
+          Path(sys.argv[1]).write_text("\n".join(output) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-stage8-service-probe
+          path: ${{ runner.temp }}/hermes-v021-stage8-service-probe/**
+          if-no-files-found: error
+          retention-days: 14
