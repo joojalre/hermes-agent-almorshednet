@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 70
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 054d91272000a769276b861411182a4a2cb5f5c6
+      EXPECTED_PARENT: 7c1fe07900f9384fba65618d6d1e979d1b579021
       SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
       REPORT_DIR: /tmp/pr21-patch4-probe-v11
       OPENROUTER_API_KEY: ""
@@ -260,7 +260,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-admission-fenced-probe-v11
+          name: pr21-patch4-admission-fenced-probe-v12
           path: /tmp/pr21-patch4-probe-v11/**
           if-no-files-found: warn
           retention-days: 14
