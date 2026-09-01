@@ -1,4 +1,4 @@
-name: PR21 Patch 4 runtime candidate AST probe
+name: PR21 Patch 4 compatible runtime hybrid probe
 
 on:
   push:
@@ -17,13 +17,13 @@ concurrency:
 
 jobs:
   probe:
-    name: Inspect exact runtime candidate delta
+    name: Probe current architecture with Patch4 liveness additions
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 0a6b0b728c5e25846f819f9f8e6a8cf21be19759
-      REPORT_DIR: /tmp/pr21-patch4-probe-v4
+      EXPECTED_PARENT: 0519079141944ca2a035f18859b1153d34a4abcc
+      REPORT_DIR: /tmp/pr21-patch4-probe-v5
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -60,16 +60,13 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Apply candidate and record exact AST delta
+      - name: Build compatible hybrid in runner only
         shell: bash
         run: |
           set -euo pipefail
           cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/current-runtime.py"
           python .github/scripts/pr21_patch4_probe.py | tee "$REPORT_DIR/apply.txt"
-          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/candidate-runtime.py"
-          git diff -- tui_gateway/hosted_room_driver.py \
-            > "$REPORT_DIR/candidate.patch"
-          git diff --stat | tee "$REPORT_DIR/candidate-stat.txt"
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/full-candidate-runtime.py"
           python - <<'PY'
           from __future__ import annotations
 
@@ -78,82 +75,96 @@ jobs:
           import json
           from pathlib import Path
 
-          report_dir = Path("/tmp/pr21-patch4-probe-v4")
-          before = (report_dir / "current-runtime.py").read_text(encoding="utf-8")
-          after = (report_dir / "candidate-runtime.py").read_text(encoding="utf-8")
+          report_dir = Path("/tmp/pr21-patch4-probe-v5")
+          target = Path("tui_gateway/hosted_room_driver.py")
+          baseline_text = (report_dir / "current-runtime.py").read_text(encoding="utf-8")
+          hybrid_text = target.read_text(encoding="utf-8")
+          restored = (
+              "cancel",
+              "_execute_attempt",
+              "_process_room",
+              "_retry_stopping_tasks",
+          )
 
-          def digest(node: ast.AST) -> str:
-              rendered = ast.dump(node, include_attributes=False)
-              return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
-
-          def inventory(text: str) -> dict[str, object]:
+          def class_method(text: str, method_name: str) -> ast.AST:
               tree = ast.parse(text)
-              functions: dict[str, str] = {}
-              classes: dict[str, dict[str, str]] = {}
-              for node in tree.body:
-                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                      functions[node.name] = digest(node)
-                  elif isinstance(node, ast.ClassDef):
-                      methods: dict[str, str] = {}
-                      for child in node.body:
-                          if isinstance(
-                              child, (ast.FunctionDef, ast.AsyncFunctionDef)
-                          ):
-                              methods[child.name] = digest(child)
-                      classes[node.name] = methods
-              return {"functions": functions, "classes": classes}
+              classes = [
+                  node
+                  for node in tree.body
+                  if isinstance(node, ast.ClassDef)
+                  and node.name == "HostedRoomRuntime"
+              ]
+              if len(classes) != 1:
+                  raise RuntimeError("HostedRoomRuntime class is ambiguous")
+              matches = [
+                  node
+                  for node in classes[0].body
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node.name == method_name
+              ]
+              if len(matches) != 1:
+                  raise RuntimeError(
+                      f"expected one HostedRoomRuntime.{method_name}, found {len(matches)}"
+                  )
+              return matches[0]
 
-          left = inventory(before)
-          right = inventory(after)
-          changed_functions = sorted(
-              name
-              for name in set(left["functions"]) | set(right["functions"])
-              if left["functions"].get(name) != right["functions"].get(name)
-          )
-          changed_methods: dict[str, list[str]] = {}
-          for class_name in sorted(
-              set(left["classes"]) | set(right["classes"])
-          ):
-              left_methods = left["classes"].get(class_name, {})
-              right_methods = right["classes"].get(class_name, {})
-              changed = sorted(
-                  name
-                  for name in set(left_methods) | set(right_methods)
-                  if left_methods.get(name) != right_methods.get(name)
-              )
-              if changed:
-                  changed_methods[class_name] = changed
+          def span(text: str, node: ast.AST) -> tuple[int, int]:
+              lines = text.splitlines(keepends=True)
+              offsets: list[int] = []
+              total = 0
+              for line in lines:
+                  offsets.append(total)
+                  total += len(line)
+              start_line = int(node.lineno)
+              decorators = getattr(node, "decorator_list", None) or ()
+              if decorators:
+                  start_line = min(
+                      start_line, *(int(item.lineno) for item in decorators)
+                  )
+              start = offsets[start_line - 1]
+              end_line = int(node.end_lineno)
+              end = offsets[end_line] if end_line < len(lines) else total
+              return start, end
 
+          for method_name in restored:
+              source_node = class_method(baseline_text, method_name)
+              target_node = class_method(hybrid_text, method_name)
+              source_start, source_end = span(baseline_text, source_node)
+              target_start, target_end = span(hybrid_text, target_node)
+              replacement = baseline_text[source_start:source_end].rstrip()
+              hybrid_text = (
+                  hybrid_text[:target_start]
+                  + replacement
+                  + "\n\n"
+                  + hybrid_text[target_end:].lstrip("\n")
+              ).rstrip() + "\n"
+              ast.parse(hybrid_text, filename=str(target))
+              if ast.dump(
+                  class_method(hybrid_text, method_name),
+                  include_attributes=False,
+              ) != ast.dump(source_node, include_attributes=False):
+                  raise RuntimeError(f"failed to restore {method_name}")
+
+          target.write_text(hybrid_text, encoding="utf-8")
           payload = {
-              "changed_top_level_functions": changed_functions,
-              "changed_class_methods": changed_methods,
-              "before_sha256": hashlib.sha256(before.encode("utf-8")).hexdigest(),
-              "after_sha256": hashlib.sha256(after.encode("utf-8")).hexdigest(),
+              "restored_current_methods": list(restored),
+              "baseline_sha256": hashlib.sha256(
+                  baseline_text.encode("utf-8")
+              ).hexdigest(),
+              "hybrid_sha256": hashlib.sha256(
+                  hybrid_text.encode("utf-8")
+              ).hexdigest(),
           }
-          (report_dir / "ast-diff.json").write_text(
+          (report_dir / "hybrid-summary.json").write_text(
               json.dumps(payload, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          markdown = [
-              "# Patch 4 candidate AST delta",
-              "",
-              "## Top-level functions",
-              "",
-              *[f"- `{name}`" for name in changed_functions],
-              "",
-              "## Class methods",
-              "",
-          ]
-          for class_name, names in changed_methods.items():
-              markdown.append(f"### `{class_name}`")
-              markdown.extend(f"- `{name}`" for name in names)
-              markdown.append("")
-          (report_dir / "ast-diff.md").write_text(
-              "\n".join(markdown).rstrip() + "\n",
               encoding="utf-8",
           )
           print(json.dumps(payload, indent=2, sort_keys=True))
           PY
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/hybrid-runtime.py"
+          git diff -- tui_gateway/hosted_room_driver.py \
+            > "$REPORT_DIR/hybrid.patch"
+          git diff --stat | tee "$REPORT_DIR/hybrid-stat.txt"
           python -m py_compile tui_gateway/hosted_room_driver.py
           git diff --check
 
@@ -180,7 +191,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-probe-v4
-          path: /tmp/pr21-patch4-probe-v4/**
+          name: pr21-patch4-runtime-probe-v5
+          path: /tmp/pr21-patch4-probe-v5/**
           if-no-files-found: warn
           retention-days: 14
