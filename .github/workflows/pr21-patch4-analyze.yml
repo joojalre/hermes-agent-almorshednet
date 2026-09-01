@@ -22,9 +22,9 @@ jobs:
     timeout-minutes: 45
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 6fdaaf366af0f90283d500c04d58aa041efa00ed
+      EXPECTED_PARENT: dda3050015d47ea77ac396386d57887769a5c981
       SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
-      REPORT_DIR: /tmp/pr21-patch4-analysis
+      REPORT_DIR: /tmp/pr21-patch4-analysis-v2
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -63,16 +63,25 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Verify current runtime baseline
+      - name: Capture current RED runtime baseline
         shell: bash
         run: |
           set -euo pipefail
+          set +e
           uv run python -m pytest \
             tests/gateway/test_hosted_room_driver.py \
             tests/gateway/test_hosted_room_gateway_lifecycle.py \
             tests/tui_gateway/test_hosted_room_driver_runtime.py \
             tests/tui_gateway/test_hosted_room_service.py \
-            -q --tb=short | tee "$REPORT_DIR/current-baseline.log"
+            -q --tb=short > "$REPORT_DIR/current-baseline.log" 2>&1
+          rc=$?
+          set -e
+          echo "$rc" | tee "$REPORT_DIR/current-baseline.exit"
+          cat "$REPORT_DIR/current-baseline.log"
+          test "$rc" = "1"
+          grep -F "20 failed, 129 passed" "$REPORT_DIR/current-baseline.log"
+          grep -F "NameError: name '_find_terminal_receipt' is not defined" \
+            "$REPORT_DIR/current-baseline.log"
 
       - name: Generate scoped diff and AST inventory
         shell: bash
@@ -131,9 +140,8 @@ jobs:
               )
 
           def named_nodes(text: str) -> dict[str, ast.AST]:
-              tree = ast.parse(text)
               result: dict[str, ast.AST] = {}
-              for node in tree.body:
+              for node in ast.parse(text).body:
                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                       result[node.name] = node
               return result
@@ -182,7 +190,7 @@ jobs:
                       before_methods = class_methods(before)
                       after_methods = class_methods(after)
                       method_names = sorted(set(before_methods) | set(after_methods))
-                      method_delta = [
+                      delta = [
                           method_name
                           for method_name in method_names
                           if method_name not in before_methods
@@ -190,21 +198,21 @@ jobs:
                           or dump(before_methods[method_name])
                           != dump(after_methods[method_name])
                       ]
-                      if method_delta:
-                          changed_methods[name] = method_delta
+                      if delta:
+                          changed_methods[name] = delta
 
-              source_keyword_tests: list[str] = []
+              relevant_tests: list[str] = []
               for name, node in final_nodes.items():
                   segment = ast.get_source_segment(final, node) or ""
                   if name.startswith("test_") and keywords.search(segment):
-                      source_keyword_tests.append(name)
+                      relevant_tests.append(name)
 
               inventory[path] = {
                   "changed_top_level": changed,
                   "missing_in_current": missing_current,
                   "current_only": current_only,
                   "changed_class_methods": changed_methods,
-                  "source_keyword_tests": sorted(source_keyword_tests),
+                  "source_keyword_tests": sorted(relevant_tests),
               }
               markdown.extend(
                   [
@@ -219,10 +227,10 @@ jobs:
                   markdown.append(
                       f"- `{class_name}` method delta: `{', '.join(methods)}`"
                   )
-              if source_keyword_tests:
+              if relevant_tests:
                   markdown.append(
                       "- Relevant PR19 tests: `"
-                      + "`, `".join(sorted(source_keyword_tests))
+                      + "`, `".join(sorted(relevant_tests))
                       + "`"
                   )
               markdown.append("")
@@ -241,7 +249,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-analysis
-          path: /tmp/pr21-patch4-analysis/**
+          name: pr21-patch4-runtime-analysis-v2
+          path: /tmp/pr21-patch4-analysis-v2/**
           if-no-files-found: error
           retention-days: 14
