@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 
 RESTORED_CURRENT_METHODS = (
-    "cancel",
     "_execute_attempt",
     "_process_room",
     "_retry_stopping_tasks",
@@ -237,6 +236,7 @@ def main() -> None:
     summary = {
         "restored_current_methods": list(RESTORED_CURRENT_METHODS),
         "compatibility_adjustments": [
+            "keep_receipt_safe_source_cancel",
             "allow_current_runtime_attempt_through_owner_liveness_gate",
             "probe_local_admission_before_interrupt_so_completion_wins",
             "retry_retryable_not_admitted_and_fail_proven_local_rejection",
