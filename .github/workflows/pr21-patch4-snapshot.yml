@@ -18,9 +18,9 @@ jobs:
     timeout-minutes: 20
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 52a8103692c1a71680fceeb9bf42c52b041d3128
+      EXPECTED_PARENT: add5fd31c051844130a9881551bf3407b3828659
       SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
-      REPORT_DIR: /tmp/pr21-patch4-snapshot
+      REPORT_DIR: /tmp/pr21-patch4-snapshot-v2
     steps:
       - name: Checkout exact PR21 branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -33,8 +33,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$REPORT_DIR/current/tui_gateway" "$REPORT_DIR/current/tests/tui_gateway"
-          mkdir -p "$REPORT_DIR/pr19/tui_gateway" "$REPORT_DIR/pr19/tests/tui_gateway"
+          mkdir -p "$REPORT_DIR/current/tui_gateway" \
+            "$REPORT_DIR/current/tests/tui_gateway" \
+            "$REPORT_DIR/current/gateway"
+          mkdir -p "$REPORT_DIR/pr19/tui_gateway" \
+            "$REPORT_DIR/pr19/tests/tui_gateway" \
+            "$REPORT_DIR/pr19/gateway"
           test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
           test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$GITHUB_SHA"
           git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
@@ -43,21 +47,21 @@ jobs:
             "$REPORT_DIR/current/tui_gateway/hosted_room_driver.py"
           cp tests/tui_gateway/test_hosted_room_driver_runtime.py \
             "$REPORT_DIR/current/tests/tui_gateway/test_hosted_room_driver_runtime.py"
+          cp gateway/hosted_room_driver.py \
+            "$REPORT_DIR/current/gateway/hosted_room_driver.py"
           git show "$SOURCE_FINAL:tui_gateway/hosted_room_driver.py" \
             > "$REPORT_DIR/pr19/tui_gateway/hosted_room_driver.py"
           git show "$SOURCE_FINAL:tests/tui_gateway/test_hosted_room_driver_runtime.py" \
             > "$REPORT_DIR/pr19/tests/tui_gateway/test_hosted_room_driver_runtime.py"
-          sha256sum \
-            "$REPORT_DIR/current/tui_gateway/hosted_room_driver.py" \
-            "$REPORT_DIR/current/tests/tui_gateway/test_hosted_room_driver_runtime.py" \
-            "$REPORT_DIR/pr19/tui_gateway/hosted_room_driver.py" \
-            "$REPORT_DIR/pr19/tests/tui_gateway/test_hosted_room_driver_runtime.py" \
+          git show "$SOURCE_FINAL:gateway/hosted_room_driver.py" \
+            > "$REPORT_DIR/pr19/gateway/hosted_room_driver.py"
+          find "$REPORT_DIR" -type f -print0 | sort -z | xargs -0 sha256sum \
             > "$REPORT_DIR/sha256.txt"
 
       - name: Upload source snapshot
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-runtime-snapshot
-          path: /tmp/pr21-patch4-snapshot/**
+          name: pr21-patch4-runtime-snapshot-v2
+          path: /tmp/pr21-patch4-snapshot-v2/**
           if-no-files-found: error
           retention-days: 14
