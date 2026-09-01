@@ -853,22 +853,24 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Fence this gateway's stale room authority against a proven newer epoch."""
     from gateway.hosted_room_replicas import ReplicaError
+    from gateway.hosted_rooms import HostedRoomError
 
     try:
         service = get_hosted_room_service()
         if service is None:
             return _err(rid, 4123, _WORKER_UNAVAILABLE)
         result = service.demote_room(
-            str(params.get("room_id") or ""),
+            params.get("room_id"),
             observed_gateway_id=params.get("observed_gateway_id"),
             observed_epoch=params.get("observed_epoch"),
         )
         return _ok(rid, result)
     except ReplicaError as exc:
         return _err(rid, 4119, str(exc))
+    except HostedRoomError as exc:
+        return _err(rid, 4119, str(exc))
     except Exception as exc:
         return _err(rid, 5119, str(exc))
-
 
 def register(server) -> None:
     _registry.install(server)
