@@ -335,6 +335,96 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    hosted_task = params.get("_hosted_task")
+    hosted_terminal_callback = params.get("_hosted_terminal_callback")
+    internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
+    if internal_hosted_submit:
+        if session.get("source") != "bot_room":
+            return _err(rid, 4120, "hosted room turns require a bot_room session")
+        if not isinstance(hosted_task, dict) or not callable(hosted_terminal_callback):
+            return _err(rid, 4120, "invalid hosted room turn proof")
+        required_hosted_fields = {
+            "room_id",
+            "task_id",
+            "thread_id",
+            "turn_id",
+            "execution_generation",
+        }
+        if set(hosted_task) != required_hosted_fields or not all(
+            isinstance(hosted_task.get(field), str) and hosted_task[field]
+            for field in required_hosted_fields - {"execution_generation"}
+        ) or not isinstance(hosted_task.get("execution_generation"), int):
+            return _err(rid, 4120, "invalid hosted room turn proof")
+        # Persist the authority identity independently from the bounded display
+        # title. Older Desktop clients can later submit directly into this
+        # session, so the compatibility fence must recover the real room id.
+        session["hosted_room_id"] = hosted_task["room_id"]
+    else:
+        # Older Desktop builds know the `Group: <room-id>` session title but
+        # not the hosted authority marker. Once a gateway owns that room, a
+        # direct prompt into its member session would start a second renderer
+        # driver. Fence it server-side instead of trusting client awareness.
+        room_id = str(session.get("hosted_room_id") or "").strip()
+        session_key = str(session.get("session_key") or "").strip()
+        if not room_id and session_key:
+            try:
+                with _session_db(session) as db:
+                    if db is not None:
+                        room_id = str(
+                            db.get_session_model_config_value(
+                                session_key, "hosted_room_id", ""
+                            )
+                            or ""
+                        ).strip()
+            except Exception:
+                room_id = ""
+        title = str(session.get("title") or "")
+        if room_id or title.startswith("Group: "):
+            try:
+                from gateway.hosted_rooms import (
+                    HostedRoomError,
+                    RoomProbeUnavailableError,
+                    default_db_path,
+                    probe_hosted_room,
+                )
+                from tui_gateway.hosted_room_driver import (
+                    RoomSessionIdentityUnavailableError,
+                    recover_room_id_from_session_title,
+                )
+
+                db_path = default_db_path()
+                if not room_id:
+                    recovered_room_id = recover_room_id_from_session_title(
+                        db_path,
+                        title,
+                    )
+                    room_id = recovered_room_id or title.removeprefix(
+                        "Group: "
+                    ).strip()
+                hosted = probe_hosted_room(db_path, room_id=room_id)
+            except (RoomProbeUnavailableError, RoomSessionIdentityUnavailableError):
+                return _err(
+                    rid,
+                    5122,
+                    "Could not verify this group. Try again after the gateway recovers.",
+                )
+            except HostedRoomError:
+                # Legacy Desktop sessions used the display name after
+                # "Group: "; those names are not hosted room ids.
+                pass
+            except Exception:
+                return _err(
+                    rid,
+                    5122,
+                    "Could not verify this group. Try again after the gateway recovers.",
+                )
+            else:
+                if hosted:
+                    return _err(
+                        rid,
+                        4122,
+                        "This room is managed by its gateway. Update Hermes Desktop to continue it.",
+                    )
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -357,6 +447,12 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    if internal_hosted_submit and turn_isolation:
+        return _err(
+            rid,
+            4121,
+            "hosted room turns do not support isolated compute workers yet",
+        )
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
@@ -365,7 +461,11 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
+            if session.get("_hosted_interrupt_claim") is not None:
+                return _err(rid, 4091, "hosted room member session is stopping")
             if session.get("running"):
+                if internal_hosted_submit:
+                    return _err(rid, 4091, "hosted room member session is busy")
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The
                 # provider interrupt itself must happen after this lock is
@@ -399,6 +499,8 @@ def _(rid, params: dict) -> dict:
         else None
     )
     with session["history_lock"]:
+        if session.get("_hosted_interrupt_claim") is not None:
+            return _err(rid, 4091, "hosted room member session is stopping")
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -812,6 +914,8 @@ def _(rid, params: dict) -> dict:
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
+        if internal_hosted_submit:
+            session["_hosted_room_task"] = dict(hosted_task)
         _start_inflight_turn(session, text)
 
     if turn_isolation:
@@ -872,13 +976,34 @@ def _(rid, params: dict) -> dict:
         # only errors when the build itself fails or the bounded cap expires.
         err = _wait_agent_for_prompt(session, rid, sid)
         if err:
+            error_message = (err.get("error") or {}).get(
+                "message", "agent initialization failed"
+            )
+            if hosted_terminal_callback is not None:
+                terminal_receipt_committed = False
+                try:
+                    terminal_receipt, terminal_receipt_committed = (
+                        _persist_hosted_terminal_receipt(
+                            session,
+                            {"status": "failed", "text": "", "error": error_message},
+                        )
+                    )
+                    hosted_terminal_callback(terminal_receipt)
+                except Exception:
+                    logger.exception(
+                        "hosted room agent initialization terminal receipt commit failed"
+                    )
+                finally:
+                    if terminal_receipt_committed:
+                        with session["history_lock"]:
+                            session.pop("_hosted_room_task", None)
             # Terminal frame + retained snapshot (not a bare "error" event +
             # cleared inflight): if the client is disconnected right now, the
             # retained snapshot is the only way resume can show this failure.
             _emit_terminal_turn_error(
                 sid,
                 session,
-                (err.get("error") or {}).get("message", "agent initialization failed"),
+                error_message,
                 # Agent construction never reached the provider: this is a
                 # local-runtime failure (env/config/venv), not an API error.
                 error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
@@ -908,7 +1033,14 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            terminal_callback=hosted_terminal_callback,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
