@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 90
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 6dd7dadbdce424d5f1eb67847243172364833b4d
+      EXPECTED_PARENT: a0d5d4c66ae957f2e587a9ae6ce69c019d677f90
       SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
       REPORT_DIR: /tmp/pr21-patch4-probe-v13
       OPENROUTER_API_KEY: ""
@@ -145,22 +145,23 @@ jobs:
               assert len(matches) == 1, (name, len(matches))
               return ast.dump(matches[0], include_attributes=False)
 
-          for name in ("cancel", "_execute_attempt", "_retry_stopping_tasks"):
-              assert method(sources["hybrid"], name) == method(sources["patch4"], name)
-              print(f"{name}=patch4")
+          assert method(sources["hybrid"], "cancel") == method(sources["patch4"], "cancel")
+          print("cancel=patch4-exact")
           assert method(sources["hybrid"], "_process_room") == method(sources["current"], "_process_room")
-          print("_process_room=current")
+          print("_process_room=current-exact")
 
           runtime = Path("tui_gateway/hosted_room_driver.py").read_text(encoding="utf-8")
           state = Path("gateway/hosted_room_driver.py").read_text(encoding="utf-8")
           service = Path("tui_gateway/hosted_room_service.py").read_text(encoding="utf-8")
           required = {
               "runtime": (
+                  "_register_process_submission(submission_key)",
                   "_register_process_admission(",
                   "_unregister_process_admission(submission_key)",
                   "Exact peer terminal status is already the durable Stop",
                   "_complete_acknowledged_stop(binding, task, lease)",
                   "if not bool(getattr(exc, \"retryable\", False)):",
+                  "elif self._interrupt_stopping_task(binding, stopping):",
               ),
               "state": (
                   "def reconcile_stop_fenced_inactive_tasks(",
@@ -267,7 +268,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-full-compat-probe-v13
+          name: pr21-patch4-full-compat-probe-v13-r2
           path: /tmp/pr21-patch4-probe-v13/**
           if-no-files-found: warn
           retention-days: 14
