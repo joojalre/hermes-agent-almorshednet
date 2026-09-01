@@ -1,0 +1,115 @@
+name: PR21 ancestry bridge without tree changes
+
+on:
+  push:
+    branches:
+      - codex/sync-hermes-v021-20260901
+    paths:
+      - .github/workflows/pr21-history-bridge.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr21-ancestry-bridge-writer
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    name: Add fork main as second parent while preserving candidate tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_CANDIDATE: b6f137fa4d829e307ee7931b6ed6f9686eddc7d2
+      EXPECTED_CANDIDATE_TREE: 494ce408c55fa9c9e2e687c0fd26dff701ae4b77
+      MAIN_FINAL: e6c06033a04d9745ed1efea97ce35401323dbfd7
+      REPORT_DIR: /tmp/pr21-history-bridge
+    steps:
+      - name: Checkout bridge trigger and candidate parent
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 2
+          persist-credentials: true
+
+      - name: Verify immutable bridge point and fetch main
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_CANDIDATE"
+          test "$(git rev-parse "$EXPECTED_CANDIDATE^{tree}")" = "$EXPECTED_CANDIDATE_TREE"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin \
+            refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$MAIN_FINAL"
+          if git merge-base --is-ancestor "$MAIN_FINAL" HEAD; then
+            echo "main is already an ancestor; refusing redundant bridge" >&2
+            exit 1
+          fi
+          git status --short | tee "$REPORT_DIR/start-status.txt"
+
+      - name: Create tree-preserving merge commit and delete bridge workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Hermes PR21 Reconciler"
+          git config user.email "pr21-reconciler@invalid.local"
+          git merge --no-commit --no-ff -s ours --allow-unrelated-histories \
+            "$MAIN_FINAL"
+          git rm -f -- .github/workflows/pr21-history-bridge.yml
+          git diff --cached --check
+          git commit --no-gpg-sign --no-verify \
+            -m "chore(sync): bridge fork main ancestry to v0.21.0 candidate"
+
+      - name: Verify merge parents and byte-identical candidate tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          bridge_head="$(git rev-parse HEAD)"
+          bridge_tree="$(git rev-parse HEAD^{tree})"
+          parent_line="$(git rev-list --parents -n1 HEAD)"
+          set -- $parent_line
+          test "$#" = "3"
+          test "$2" = "$GITHUB_SHA"
+          test "$3" = "$MAIN_FINAL"
+          test "$bridge_tree" = "$EXPECTED_CANDIDATE_TREE"
+          git diff --exit-code "$EXPECTED_CANDIDATE" HEAD --
+          git merge-base --is-ancestor "$MAIN_FINAL" HEAD
+          test ! -e .github/workflows/pr21-history-bridge.yml
+          test -z "$(git status --porcelain)"
+          {
+            echo "trigger_head=$GITHUB_SHA"
+            echo "candidate_head=$EXPECTED_CANDIDATE"
+            echo "candidate_tree=$EXPECTED_CANDIDATE_TREE"
+            echo "main_parent=$MAIN_FINAL"
+            echo "bridge_head=$bridge_head"
+            echo "bridge_tree=$bridge_tree"
+            echo "parent_line=$parent_line"
+            echo "tree_identical=true"
+          } | tee "$REPORT_DIR/bridge.txt"
+
+      - name: Fast-forward the PR21 branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          bridge_head="$(git rev-parse HEAD)"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" "$bridge_head"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          pushed="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$pushed" = "$bridge_head"
+          echo "pushed_head=$pushed" | tee -a "$REPORT_DIR/bridge.txt"
+
+      - name: Upload ancestry evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr21-history-bridge-evidence
+          path: /tmp/pr21-history-bridge/**
+          if-no-files-found: warn
+          retention-days: 14
