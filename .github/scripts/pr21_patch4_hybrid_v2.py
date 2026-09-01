@@ -15,6 +15,12 @@ PRESERVED_PATCH4_METHODS = (
 )
 
 
+def _replace_once(text: str, old: str, new: str, *, label: str) -> str:
+    if text.count(old) != 1:
+        raise RuntimeError(f"unexpected Patch4 {label} branch")
+    return text.replace(old, new, 1)
+
+
 def build_hybrid(baseline_text: str, candidate_text: str) -> str:
     """Keep Patch 4 fences while preserving current peer and queue contracts."""
 
@@ -70,11 +76,12 @@ def build_hybrid(baseline_text: str, candidate_text: str) -> str:
                             f"queued for retry in {delay:g}s"
                         )
 '''
-    if hybrid_text.count(old_not_admitted) != 1:
-        raise RuntimeError(
-            "unexpected Patch4 not-admitted branch after method preservation"
-        )
-    hybrid_text = hybrid_text.replace(old_not_admitted, new_not_admitted, 1)
+    hybrid_text = _replace_once(
+        hybrid_text,
+        old_not_admitted,
+        new_not_admitted,
+        label="not-admitted",
+    )
 
     old_peer_ack = '''                if self._peer_stop_acknowledged(binding, task):
                     if not self._settle_stopping_completion(binding, task, lease):
@@ -89,11 +96,92 @@ def build_hybrid(baseline_text: str, candidate_text: str) -> str:
                     self._complete_acknowledged_stop(binding, task, lease)
                     continue
 '''
-    if hybrid_text.count(old_peer_ack) != 1:
-        raise RuntimeError(
-            "unexpected Patch4 peer acknowledgement branch after preservation"
+    hybrid_text = _replace_once(
+        hybrid_text,
+        old_peer_ack,
+        new_peer_ack,
+        label="peer acknowledgement",
+    )
+
+    old_owner_gate = '''        if owner_state in {"alive", "unknown"} and not current_attempt_is_local:
+            return False
+'''
+    new_owner_gate = '''        foreign_owner_may_be_live = (
+            owner_state in {"alive", "unknown"} and not current_attempt_is_local
         )
-    hybrid_text = hybrid_text.replace(old_peer_ack, new_peer_ack, 1)
+'''
+    hybrid_text = _replace_once(
+        hybrid_text,
+        old_owner_gate,
+        new_owner_gate,
+        label="foreign owner liveness",
+    )
+
+    old_missing_session = '''        if session is None:
+            return True
+'''
+    new_missing_session = '''        if session is None:
+            return not foreign_owner_may_be_live
+'''
+    hybrid_text = _replace_once(
+        hybrid_text,
+        old_missing_session,
+        new_missing_session,
+        label="missing local session acknowledgement",
+    )
+
+    old_inactive_session = '''        if not active:
+            return True
+'''
+    new_inactive_session = '''        if not active:
+            if self._info_acknowledges_peer_cancel(info, task):
+                return True
+            return not foreign_owner_may_be_live
+'''
+    hybrid_text = _replace_once(
+        hybrid_text,
+        old_inactive_session,
+        new_inactive_session,
+        label="inactive local session acknowledgement",
+    )
+
+    old_wait_info = '''            info = transport.info(
+                profile=profile,
+                session_id=session_id,
+                source=ROOM_SESSION_SOURCE,
+            )
+            self._report_pending_action(task, session_id=session_id, info=info)
+            remaining = max(0.0, deadline_monotonic - time.monotonic())
+'''
+    new_wait_info = '''            info = transport.info(
+                profile=profile,
+                session_id=session_id,
+                source=ROOM_SESSION_SOURCE,
+            )
+            self._report_pending_action(task, session_id=session_id, info=info)
+            if (
+                transport is not self.rpc
+                and not bool(info.get("active", info.get("running", False)))
+            ):
+                receipt = _find_terminal_receipt(
+                    transport.history(
+                        profile=profile,
+                        session_id=session_id,
+                        source=ROOM_SESSION_SOURCE,
+                    ),
+                    attempt.identity,
+                    attempt.execution_generation,
+                )
+                if receipt is not None:
+                    return receipt
+            remaining = max(0.0, deadline_monotonic - time.monotonic())
+'''
+    hybrid_text = _replace_once(
+        hybrid_text,
+        old_wait_info,
+        new_wait_info,
+        label="inactive peer terminal harvest",
+    )
 
     ast.parse(hybrid_text)
     return hybrid_text
@@ -120,6 +208,9 @@ def main() -> None:
             "probe_local_admission_before_interrupt_so_completion_wins",
             "retry_retryable_not_admitted_and_fail_proven_local_rejection",
             "complete_exact_peer_terminal_stop_without_history_reharvest",
+            "allow_exact_interrupt_for_reachable_foreign_local_owner",
+            "refuse_absence_reclaim_while_foreign_owner_may_be_live",
+            "harvest_exact_inactive_peer_terminal_history",
         ],
         "baseline_sha256": hashlib.sha256(
             baseline_text.encode("utf-8")
