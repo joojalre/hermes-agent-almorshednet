@@ -37,6 +37,10 @@ def test_private_runner_assignments_are_removed_from_the_fork() -> None:
             "runner: windows-latest-32-core",
             "runner: windows-latest",
         ),
+        ".github/workflows/nix.yml": (
+            "runs-on: ubuntu-latest-32-core",
+            "runs-on: ubuntu-latest",
+        ),
     }
     for relative, (private, public) in assignments.items():
         workflow = _read(relative)
@@ -49,3 +53,10 @@ def test_standard_python_runner_has_bounded_workers() -> None:
     assert "runs-on: ubuntu-latest" in workflow
     assert "HERMES_TEST_WORKERS: 4" in workflow
     assert "timeout-minutes: 60" in workflow
+
+
+def test_standard_nix_runner_has_bounded_parallelism() -> None:
+    workflow = _read(".github/workflows/nix.yml")
+    assert "runs-on: ubuntu-latest" in workflow
+    assert "nix flake check --print-build-logs --max-jobs 2" in workflow
+    assert "timeout-minutes: 90" in workflow
