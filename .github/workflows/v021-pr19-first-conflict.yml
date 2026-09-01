@@ -1,0 +1,104 @@
+name: Hermes v0.21.0 first PR19 conflict
+
+on:
+  push:
+    branches:
+      - codex/v021-pr19-series-probe-20260901
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-v021-pr19-first-conflict-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  collect:
+    name: Export 3b323 conflict variants over v0.21.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout fork history without credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reproduce and export conflict
+        shell: bash
+        env:
+          EXPECTED_RELEASE: 29112bef099274229cadff79cdff7bf7b99c4b77
+          PRELUDE_COMMIT: ca18e49eaeda7523fef201d756b8e081ec1bddb3
+          CONFLICT_COMMIT: 3b323b078967ddb29ca0f792f007ccc6a559e79e
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/hermes-v021-first-conflict"
+          WT="$RUNNER_TEMP/hermes-v021-first-conflict-worktree"
+          mkdir -p "$REPORT/files"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags upstream refs/tags/v2026.8.31:refs/tags/upstream-v2026.8.31
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-head
+          RELEASE="$(git rev-parse 'upstream-v2026.8.31^{commit}')"
+          test "$RELEASE" = "$EXPECTED_RELEASE"
+          git cat-file -e "$PRELUDE_COMMIT^{commit}"
+          git cat-file -e "$CONFLICT_COMMIT^{commit}"
+
+          git worktree add --detach "$WT" "$RELEASE"
+          git -C "$WT" config user.name "Hermes PR19 Conflict Probe"
+          git -C "$WT" config user.email "pr19-conflict-probe@invalid.local"
+
+          git -C "$WT" cherry-pick --no-commit "$PRELUDE_COMMIT"
+          git -C "$WT" add -A
+          git -C "$WT" commit --no-gpg-sign --no-verify -C "$PRELUDE_COMMIT" >/dev/null
+          PRELUDE_HEAD="$(git -C "$WT" rev-parse HEAD)"
+
+          set +e
+          git -C "$WT" cherry-pick --no-commit "$CONFLICT_COMMIT" > "$REPORT/cherry-pick.log" 2>&1
+          EXIT=$?
+          set -e
+          test "$EXIT" -ne 0
+
+          git -C "$WT" diff --name-only --diff-filter=U > "$REPORT/conflicts.txt"
+          git -C "$WT" status --short > "$REPORT/status.txt"
+          git -C "$WT" diff --cached --name-status > "$REPORT/nonconflicting-staged.txt" || true
+          printf 'path\tbase_lines\tcurrent_lines\tcommit_lines\n' > "$REPORT/manifest.tsv"
+
+          while IFS= read -r path; do
+            dest="$REPORT/files/$path"
+            mkdir -p "$dest"
+            git -C "$WT" show ":1:$path" > "$dest/base"
+            git -C "$WT" show ":2:$path" > "$dest/current-release"
+            git -C "$WT" show ":3:$path" > "$dest/pr19-commit"
+            set +e
+            git diff --no-index --histogram -- "$dest/base" "$dest/current-release" > "$dest/base-to-release.diff"
+            git diff --no-index --histogram -- "$dest/base" "$dest/pr19-commit" > "$dest/base-to-pr19.diff"
+            git diff --no-index --histogram -- "$dest/current-release" "$dest/pr19-commit" > "$dest/release-to-pr19.diff"
+            git merge-file -p --diff3 "$dest/current-release" "$dest/base" "$dest/pr19-commit" > "$dest/merged-preview"
+            set -e
+            printf '%s\t%s\t%s\t%s\n' "$path" \
+              "$(wc -l < "$dest/base" | tr -d ' ')" \
+              "$(wc -l < "$dest/current-release" | tr -d ' ')" \
+              "$(wc -l < "$dest/pr19-commit" | tr -d ' ')" \
+              >> "$REPORT/manifest.tsv"
+          done < "$REPORT/conflicts.txt"
+
+          {
+            echo "release=$RELEASE"
+            echo "prelude_commit=$PRELUDE_COMMIT"
+            echo "prelude_head=$PRELUDE_HEAD"
+            echo "conflict_commit=$CONFLICT_COMMIT"
+            echo "cherry_pick_exit=$EXIT"
+            echo "conflict_files=$(wc -l < "$REPORT/conflicts.txt" | tr -d ' ')"
+          } > "$REPORT/summary.txt"
+
+          git worktree remove --force "$WT"
+
+      - name: Upload exact conflict evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-v021-pr19-first-conflict
+          path: ${{ runner.temp }}/hermes-v021-first-conflict/**
+          if-no-files-found: error
+          retention-days: 14
