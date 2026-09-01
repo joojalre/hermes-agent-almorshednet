@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 60
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: 9e2507c13a21f1f26a06a430eb27942df46f2e9d
+      EXPECTED_PARENT: d490548ecaa7e89ae1ed639384f5fd93d2e6590d
       REPORT_DIR: /tmp/pr21-patch1-storage
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
@@ -46,7 +46,14 @@ jobs:
           test "$remote_head" = "$GITHUB_SHA"
           git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
           test "$(git rev-parse refs/remotes/origin/pr19-final)" = "20d0a6a42365b2b2351e1dca819022b6ec477b39"
-          git cat-file -e c19e98fbf5e0ceb243d066e3e46a4f304fb8d606^{commit}
+          for commit in \
+            10618eb0979f4c3af980f8ce380d9c0fb06fc5ca \
+            7c6a0c8e648b441bf89ecdef5e53c8410cd0d174 \
+            6db80964f7c25c99e577f6d550ad0568f833a5dd \
+            b7f1acdef0308ac75f09c3aa41702686e420b599
+          do
+            git cat-file -e "$commit^{commit}"
+          done
           git status --short | tee "$REPORT_DIR/start-status.txt"
 
       - name: Install uv
@@ -104,14 +111,28 @@ jobs:
           test "$rc" = "1"
           grep -F "require_open_admissions" "$REPORT_DIR/red-liability.log"
 
-      - name: Apply only the final PR19 storage delta
+      - name: Apply storage changes commit by commit
         shell: bash
         run: |
           set -euo pipefail
-          python .github/scripts/pr21_patch1_apply.py \
-            apply-production --report-dir "$REPORT_DIR"
+          python .github/scripts/pr21_patch1_apply_sequential.py \
+            --report-dir "$REPORT_DIR"
           git diff --check
           python -m py_compile gateway/hosted_rooms.py
+          python - <<'PY'
+          from gateway import hosted_rooms as rooms
+
+          for name in (
+              "reserve_peer_room",
+              "remote_run_receipt",
+              "upsert_remote_run_receipt",
+              "_legacy_members_match",
+              "_is_terminal_recovery_plan",
+              "_terminal_publication_liabilities",
+          ):
+              if not callable(getattr(rooms, name, None)):
+                  raise SystemExit(f"required storage API missing: {name}")
+          PY
 
       - name: GREEN focused regressions
         shell: bash
@@ -152,6 +173,7 @@ jobs:
         run: |
           set -euo pipefail
           python .github/scripts/pr21_patch1_apply.py cleanup
+          rm -f .github/scripts/pr21_patch1_apply_sequential.py
           git status --short | tee "$REPORT_DIR/final-status.txt"
           git diff --stat | tee "$REPORT_DIR/final-stat.txt"
           git diff --check
@@ -159,31 +181,29 @@ jobs:
           from pathlib import Path
           import subprocess
 
-          allowed = {
+          temporary = {
               ".github/scripts/pr21_patch1_apply.py",
+              ".github/scripts/pr21_patch1_apply_sequential.py",
               ".github/workflows/pr21-patch1-apply.yml",
               ".github/workflows/pr21-patch1-probe.yml",
-              "gateway/hosted_rooms.py",
-              "tests/gateway/test_hosted_room_storage_reservations.py",
           }
-          changed = set(
-              subprocess.check_output(
-                  ["git", "status", "--porcelain"], text=True
-              ).splitlines()
-          )
-          paths = {line[3:] for line in changed if len(line) >= 4}
-          unexpected = paths - allowed
-          if unexpected:
-              raise SystemExit(f"unexpected changed paths: {sorted(unexpected)}")
           required = {
               "gateway/hosted_rooms.py",
               "tests/gateway/test_hosted_room_storage_reservations.py",
           }
+          allowed = temporary | required
+          changed = subprocess.check_output(
+              ["git", "status", "--porcelain"], text=True
+          ).splitlines()
+          paths = {line[3:] for line in changed if len(line) >= 4}
+          unexpected = paths - allowed
+          if unexpected:
+              raise SystemExit(f"unexpected changed paths: {sorted(unexpected)}")
           if not required <= paths:
               raise SystemExit(f"required changes missing: {sorted(required - paths)}")
-          for temporary in allowed - required:
-              if Path(temporary).exists():
-                  raise SystemExit(f"temporary file remains: {temporary}")
+          for path in temporary:
+              if Path(path).exists():
+                  raise SystemExit(f"temporary file remains: {path}")
           PY
 
       - name: Commit and fast-forward PR21 branch only
@@ -213,7 +233,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr21-patch1-storage-evidence
+          name: pr21-patch1-storage-evidence-sequential
           path: /tmp/pr21-patch1-storage/**
           if-no-files-found: warn
           retention-days: 14
