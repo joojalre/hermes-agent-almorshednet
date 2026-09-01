@@ -1,0 +1,137 @@
+name: PR21 fix shadowed hosted-room test
+
+on:
+  push:
+    branches:
+      - codex/sync-hermes-v021-20260901
+    paths:
+      - .github/workflows/pr21-fix-shadowed-hosted-room-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr21-fix-shadowed-hosted-room-test
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    name: Rename and validate shadowed test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_PARENT: 54d9553b303c30a84e430421abd83f71fe7549c4
+      EVIDENCE: /tmp/pr21-shadowed-test-fix
+    steps:
+      - name: Checkout exact control commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 2
+          persist-credentials: true
+
+      - name: Verify immutable write point
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$GITHUB_SHA"
+          git status --short | tee "$EVIDENCE/start-status.txt"
+
+      - name: Rename only the first shadowed definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tests/tui_gateway/test_hosted_room_service.py")
+          text = path.read_text(encoding="utf-8")
+          old = "def test_terminal_publication_reserves_the_whole_plan_before_append(\n"
+          new = (
+              "def test_terminal_publication_rejects_whole_plan_without_"
+              "partial_append_at_history_limit(\n"
+          )
+          if text.count(old) != 2:
+              raise SystemExit(
+                  f"expected exactly two shadowed definitions, found {text.count(old)}"
+              )
+          if new in text:
+              raise SystemExit("target test name already exists")
+          text = text.replace(old, new, 1)
+          if text.count(old) != 1 or text.count(new) != 1:
+              raise SystemExit("shadowed definition rename was not exact")
+          path.write_text(text, encoding="utf-8")
+          PY
+          git diff --check
+          git diff -- tests/tui_gateway/test_hosted_room_service.py \
+            | tee "$EVIDENCE/patch.diff"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Run focused RED-to-GREEN validation
+        shell: bash
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -o pipefail
+          source .venv/bin/activate
+          python -m pytest \
+            tests/test_no_shadowed_test_definitions.py \
+            tests/tui_gateway/test_hosted_room_service.py \
+            -k 'no_shadowed or terminal_publication' \
+            -q --tb=short 2>&1 | tee "$EVIDENCE/focused-tests.log"
+
+      - name: Commit the smallest tested change
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          test "$(git status --porcelain | wc -l)" -eq 1
+          git status --porcelain \
+            | grep -F "tests/tui_gateway/test_hosted_room_service.py"
+          git config user.name "Hermes PR21 Reconciler"
+          git config user.email "pr21-reconciler@invalid.local"
+          git add -- tests/tui_gateway/test_hosted_room_service.py
+          git commit --no-gpg-sign --no-verify \
+            -m "test(hosted-room): unshadow terminal publication coverage"
+          final_head="$(git rev-parse HEAD)"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" "$final_head"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          pushed="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$pushed" = "$final_head"
+          echo "final_head=$final_head" | tee "$EVIDENCE/final-head.txt"
+
+      - name: Upload focused evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr21-shadowed-test-fix-evidence
+          path: /tmp/pr21-shadowed-test-fix/**
+          if-no-files-found: warn
+          retention-days: 3
