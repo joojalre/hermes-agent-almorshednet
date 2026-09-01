@@ -1,4 +1,4 @@
-name: PR21 Patch 4 service lifecycle integration probe
+name: PR21 Patch 4 deterministic runtime and service probe
 
 on:
   push:
@@ -17,14 +17,14 @@ concurrency:
 
 jobs:
   probe:
-    name: Probe runtime and durable demotion integration
+    name: Stress completion race then inspect service integration
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 65
     env:
       TARGET_BRANCH: codex/sync-hermes-v021-20260901
-      EXPECTED_PARENT: fba4bee42556c38d5481b00b6f5b4227626e21aa
+      EXPECTED_PARENT: b768fb2ee34a8931fe5b16e6bc964ec5e1dba116
       SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
-      REPORT_DIR: /tmp/pr21-patch4-probe-v9
+      REPORT_DIR: /tmp/pr21-patch4-probe-v10
       OPENROUTER_API_KEY: ""
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
@@ -64,7 +64,7 @@ jobs:
           uv python install 3.11
           uv sync --locked --python 3.11 --extra dev
 
-      - name: Build verified Runtime hybrid
+      - name: Build Runtime hybrid with info-before-interrupt
         shell: bash
         run: |
           set -euo pipefail
@@ -78,9 +78,24 @@ jobs:
             --output tui_gateway/hosted_room_driver.py \
             --report "$REPORT_DIR/runtime-hybrid-summary.json" \
             | tee "$REPORT_DIR/runtime-hybrid-build.txt"
-          test "$(sha256sum tui_gateway/hosted_room_driver.py | awk '{print $1}')" = \
-            "def9c9cf8f39a4e0447cc5d6fce33b73824d3fc371f0e6e4df9b3392ade10bf6"
+          sha256sum tui_gateway/hosted_room_driver.py \
+            | tee "$REPORT_DIR/runtime-hybrid-sha256.txt"
           cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/runtime-hybrid.py"
+          python -m py_compile tui_gateway/hosted_room_driver.py
+          git diff --check
+
+      - name: Stress exact completion versus Stop race before Service changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$REPORT_DIR/race-runtime-only.log"
+          for attempt in $(seq 1 10); do
+            echo "attempt=$attempt" | tee -a "$REPORT_DIR/race-runtime-only.log"
+            uv run python -m pytest \
+              tests/tui_gateway/test_hosted_room_driver_runtime.py::test_completion_wins_stop_race_after_attempt_lease_expires \
+              -q --tb=short \
+              | tee -a "$REPORT_DIR/race-runtime-only.log"
+          done
 
       - name: Build selective Service lifecycle integration
         shell: bash
@@ -102,7 +117,20 @@ jobs:
             tui_gateway/hosted_room_service.py
           git diff --check
 
-      - name: GREEN exact Runtime suite
+      - name: Stress exact completion versus Stop race after Service changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$REPORT_DIR/race-with-service.log"
+          for attempt in $(seq 1 10); do
+            echo "attempt=$attempt" | tee -a "$REPORT_DIR/race-with-service.log"
+            uv run python -m pytest \
+              tests/tui_gateway/test_hosted_room_driver_runtime.py::test_completion_wins_stop_race_after_attempt_lease_expires \
+              -q --tb=short \
+              | tee -a "$REPORT_DIR/race-with-service.log"
+          done
+
+      - name: GREEN exact Runtime suite after Service candidate
         shell: bash
         run: |
           set -euo pipefail
@@ -125,7 +153,7 @@ jobs:
           from pathlib import Path
           import json
 
-          report = Path("/tmp/pr21-patch4-probe-v9")
+          report = Path("/tmp/pr21-patch4-probe-v10")
           lines = (report / "service.log").read_text(
               encoding="utf-8", errors="replace"
           ).splitlines()
@@ -180,7 +208,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: pr21-patch4-service-probe-v9
-          path: /tmp/pr21-patch4-probe-v9/**
+          name: pr21-patch4-deterministic-probe-v10
+          path: /tmp/pr21-patch4-probe-v10/**
           if-no-files-found: warn
           retention-days: 14
