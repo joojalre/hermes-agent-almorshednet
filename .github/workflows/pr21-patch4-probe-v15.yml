@@ -1,0 +1,293 @@
+name: PR21 Patch 4 full compatibility probe v15
+
+on:
+  push:
+    branches:
+      - codex/sync-hermes-v021-20260901
+    paths:
+      - .github/workflows/pr21-patch4-probe-v15.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr21-patch4-runtime-probe-v15
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Verify Runtime, State, Service, approvals, peers, and prior patches
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    env:
+      TARGET_BRANCH: codex/sync-hermes-v021-20260901
+      EXPECTED_PARENT: e52ba50a8a2f45981530eb35a59ef621a41d6879
+      SOURCE_FINAL: 20d0a6a42365b2b2351e1dca819022b6ec477b39
+      REPORT_DIR: /tmp/pr21-patch4-probe-v15
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      NOUS_API_KEY: ""
+    steps:
+      - name: Checkout exact PR21 branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: codex/sync-hermes-v021-20260901
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable probe point and source history
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          test "$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')" = "$GITHUB_SHA"
+          git fetch --no-tags origin refs/pull/19/head:refs/remotes/origin/pr19-final
+          test "$(git rev-parse refs/remotes/origin/pr19-final)" = "$SOURCE_FINAL"
+          git cat-file -e e6c06033a04d9745ed1efea97ce35401323dbfd7^{commit}
+          git status --short | tee "$REPORT_DIR/start-status.txt"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up locked Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra dev
+
+      - name: Build peer-safe Runtime hybrid
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/current-runtime.py"
+          python .github/scripts/pr21_patch4_probe.py | tee "$REPORT_DIR/full-runtime-build.txt"
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/full-runtime.py"
+          python .github/scripts/pr21_patch4_hybrid_v2.py \
+            --baseline "$REPORT_DIR/current-runtime.py" \
+            --candidate tui_gateway/hosted_room_driver.py \
+            --output tui_gateway/hosted_room_driver.py \
+            --report "$REPORT_DIR/runtime-hybrid-summary.json" \
+            | tee "$REPORT_DIR/runtime-hybrid-build.txt"
+          cp tui_gateway/hosted_room_driver.py "$REPORT_DIR/runtime-hybrid.py"
+          python -m py_compile tui_gateway/hosted_room_driver.py
+
+      - name: Add selective State recovery contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp gateway/hosted_room_driver.py "$REPORT_DIR/current-state.py"
+          python .github/scripts/pr21_patch4_state.py \
+            --output gateway/hosted_room_driver.py \
+            --report "$REPORT_DIR/state-summary.json" \
+            | tee "$REPORT_DIR/state-build.txt"
+          cp gateway/hosted_room_driver.py "$REPORT_DIR/state-candidate.py"
+          python -m py_compile gateway/hosted_room_driver.py
+
+      - name: Build selective Service lifecycle integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tui_gateway/hosted_room_service.py "$REPORT_DIR/current-service.py"
+          python .github/scripts/pr21_patch4_service.py \
+            --output tui_gateway/hosted_room_service.py \
+            --report "$REPORT_DIR/service-summary.json" \
+            | tee "$REPORT_DIR/service-build.txt"
+          cp tui_gateway/hosted_room_service.py "$REPORT_DIR/service-before-compat.py"
+          python -m py_compile tui_gateway/hosted_room_service.py
+
+      - name: Apply Service compatibility reconciliations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/pr21_patch4_compat.py \
+            --report "$REPORT_DIR/compat-summary.json" \
+            | tee "$REPORT_DIR/compat-build.txt"
+          python .github/scripts/pr21_patch4_compat_v2.py \
+            --report "$REPORT_DIR/compat-v2-summary.json" \
+            | tee "$REPORT_DIR/compat-v2-build.txt"
+          cp tui_gateway/hosted_room_service.py "$REPORT_DIR/service-candidate.py"
+          cp tests/tui_gateway/test_hosted_room_service.py "$REPORT_DIR/service-tests-candidate.py"
+          python -m py_compile \
+            tui_gateway/hosted_room_service.py \
+            tests/tui_gateway/test_hosted_room_service.py
+          git diff --check
+          git diff --stat | tee "$REPORT_DIR/candidate-stat.txt"
+          git diff -- \
+            gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_service.py \
+            tests/tui_gateway/test_hosted_room_service.py \
+            > "$REPORT_DIR/candidate.patch"
+
+      - name: Verify required Runtime State and Service contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' | tee "$REPORT_DIR/provenance.txt"
+          from pathlib import Path
+          import ast
+
+          report = Path("/tmp/pr21-patch4-probe-v15")
+          sources = {
+              "current": (report / "current-runtime.py").read_text(encoding="utf-8"),
+              "patch4": (report / "full-runtime.py").read_text(encoding="utf-8"),
+              "hybrid": (report / "runtime-hybrid.py").read_text(encoding="utf-8"),
+          }
+
+          def method(source: str, name: str):
+              matches = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef) and node.name == name]
+              assert len(matches) == 1, (name, len(matches))
+              return ast.dump(matches[0], include_attributes=False)
+
+          assert method(sources["hybrid"], "cancel") == method(sources["patch4"], "cancel")
+          print("cancel=patch4-exact")
+          assert method(sources["hybrid"], "_process_room") == method(sources["current"], "_process_room")
+          print("_process_room=current-exact")
+
+          runtime = Path("tui_gateway/hosted_room_driver.py").read_text(encoding="utf-8")
+          state = Path("gateway/hosted_room_driver.py").read_text(encoding="utf-8")
+          service = Path("tui_gateway/hosted_room_service.py").read_text(encoding="utf-8")
+          required = {
+              "runtime": (
+                  "_register_process_admission(",
+                  "_unregister_process_admission(submission_key)",
+                  "Exact peer terminal status is already the durable Stop",
+                  "_complete_acknowledged_stop(binding, task, lease)",
+                  "foreign_owner_may_be_live = (",
+                  "transport.history(",
+                  "if not bool(getattr(exc, \"retryable\", False)):",
+              ),
+              "state": (
+                  "def reconcile_stop_fenced_inactive_tasks(",
+                  "def _stop_fenced_inactive_rows(",
+              ),
+              "service": (
+                  "import uuid",
+                  "if is_peer:",
+                  "existing = next(",
+                  "Re-observing the same request must preserve any durable",
+                  "peer_actions = [",
+                  "driver.reconcile_stop_fenced_inactive_tasks(",
+              ),
+          }
+          for label, markers in required.items():
+              source = {"runtime": runtime, "state": state, "service": service}[label]
+              for marker in markers:
+                  assert marker in source, (label, marker)
+                  print(f"{label}:{marker}")
+          PY
+
+      - name: GREEN previously failing Service targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest \
+            tests/tui_gateway/test_hosted_room_service.py::test_stop_room_snapshots_tasks_before_status_transitions \
+            tests/tui_gateway/test_hosted_room_service.py::test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer \
+            tests/tui_gateway/test_hosted_room_service.py::test_cross_process_pending_approval_requires_exact_generation_and_owner_consumes \
+            tests/tui_gateway/test_hosted_room_service.py::test_headless_room_publishes_peer_member_reply_without_desktop_transport \
+            tests/tui_gateway/test_hosted_room_service.py::test_peer_approval_is_scoped_visible_and_resolvable \
+            tests/tui_gateway/test_hosted_room_service.py::test_local_room_approval_uses_the_exact_hidden_session \
+            -q --tb=short | tee "$REPORT_DIR/previous-failures.log"
+
+      - name: Stress completion versus Stop race 30 times
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > "$REPORT_DIR/race.log"
+          for attempt in $(seq 1 30); do
+            echo "attempt=$attempt" | tee -a "$REPORT_DIR/race.log"
+            uv run python -m pytest \
+              tests/tui_gateway/test_hosted_room_driver_runtime.py::test_completion_wins_stop_race_after_attempt_lease_expires \
+              -q --tb=short | tee -a "$REPORT_DIR/race.log"
+          done
+
+      - name: GREEN exact peer terminal Stop contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py::test_peer_terminal_status_acknowledges_durable_stop_on_retry \
+            tests/tui_gateway/test_hosted_room_driver_runtime.py::test_peer_terminal_status_must_match_exact_task_attempt \
+            -q --tb=short | tee "$REPORT_DIR/peer-stop.log"
+
+      - name: GREEN Runtime suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest tests/tui_gateway/test_hosted_room_driver_runtime.py -q --tb=short \
+            | tee "$REPORT_DIR/runtime.log"
+
+      - name: GREEN Service suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest tests/tui_gateway/test_hosted_room_service.py -q --tb=short \
+            | tee "$REPORT_DIR/service.log"
+
+      - name: GREEN lifecycle and RPC integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest \
+            tests/gateway/test_hosted_room_gateway_lifecycle.py \
+            tests/gateway/test_hosted_room_worker_shutdown.py \
+            tests/gateway/test_hosted_room_discussion.py \
+            tests/tui_gateway/test_hosted_room_prompt_fence.py \
+            tests/tui_gateway/test_hosted_room_server_rpc.py \
+            tests/tui_gateway/test_groups_methods.py \
+            tests/tui_gateway/test_groups_replication_methods.py \
+            -q --tb=short | tee "$REPORT_DIR/integration.log"
+
+      - name: GREEN Patch 1 through Patch 3 regression set
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest \
+            tests/gateway/test_hosted_rooms.py \
+            tests/gateway/test_hosted_room_storage_reservations.py \
+            tests/gateway/test_hosted_room_driver.py \
+            tests/gateway/test_hosted_room_driver_admission.py \
+            tests/gateway/test_hosted_room_replicas.py \
+            tests/gateway/test_hosted_room_replicas_patch3.py \
+            -q --tb=short | tee "$REPORT_DIR/prior-patches.log"
+
+      - name: Static verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run ruff check \
+            gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_service.py \
+            tests/tui_gateway/test_hosted_room_service.py \
+            .github/scripts/pr21_patch4_state.py \
+            .github/scripts/pr21_patch4_hybrid_v2.py \
+            .github/scripts/pr21_patch4_service.py \
+            .github/scripts/pr21_patch4_compat.py \
+            .github/scripts/pr21_patch4_compat_v2.py \
+            | tee "$REPORT_DIR/ruff-check.log"
+          python -m compileall -q \
+            gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_driver.py \
+            tui_gateway/hosted_room_service.py \
+            tests/tui_gateway/test_hosted_room_service.py
+          git diff --check
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pr21-patch4-full-compat-probe-v15
+          path: /tmp/pr21-patch4-probe-v15/**
+          if-no-files-found: warn
+          retention-days: 14
