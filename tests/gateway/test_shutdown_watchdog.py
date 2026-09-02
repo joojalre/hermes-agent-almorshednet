@@ -72,6 +72,49 @@ def test_arm_shutdown_watchdog_fires_with_dump_and_exit(tmp_path):
     assert "faulthandler dump" in text
     assert get_shutdown_watchdog_dump_path(tmp_path).name == "gateway-shutdown-watchdog.log"
 
+@pytest.mark.asyncio
+async def test_loop_tick_witness_skips_non_posix_without_warning(
+    tmp_path, caplog, monkeypatch
+):
+    class _WindowsOsProxy:
+        name = "nt"
+
+        def __getattr__(self, item):
+            return getattr(os, item)
+
+    calls = []
+
+    async def _forbid_start_unix_server(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("start_unix_server must not run on non-POSIX")
+
+    monkeypatch.setattr(shutdown_watchdog_module, "os", _WindowsOsProxy())
+    monkeypatch.setattr(
+        shutdown_watchdog_module.asyncio,
+        "start_unix_server",
+        _forbid_start_unix_server,
+        raising=False,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="gateway.shutdown_watchdog"):
+        await shutdown_watchdog_module.loop_heartbeat_forever(
+            interval_s=60.0,
+            home=tmp_path,
+            should_continue=lambda: False,
+        )
+
+    payload = json.loads(
+        get_loop_heartbeat_path(tmp_path).read_text(encoding="utf-8")
+    )
+    assert calls == []
+    assert payload["loop_tick_socket"] is True
+    assert 0 < int(payload["loop_tick_tcp_port"]) <= 65535
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+        and "Loop tick socket unavailable" in record.getMessage()
+    ]
 
 
 
