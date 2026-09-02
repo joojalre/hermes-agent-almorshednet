@@ -144,6 +144,7 @@ _NOISY_LOGGERS = (
     "openai",
     "openai._base_client",
     "httpx",
+    "httpx2",
     "httpcore",
     "asyncio",
     "hpack",
@@ -229,6 +230,27 @@ class _ComponentFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         return record.name.startswith(self._prefixes)
+
+
+class _RoutineTransportNoiseFilter(logging.Filter):
+    """Drop routine MCP transport chatter while preserving real failures."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "httpx2" and record.levelno <= logging.INFO:
+            return False
+
+        if record.name == "mcp.client.streamable_http":
+            message = record.getMessage()
+            if record.levelno <= logging.INFO and message.startswith(
+                "Received session ID:"
+            ):
+                return False
+            if record.levelno <= logging.WARNING and message.startswith(
+                "Session termination failed: 404"
+            ):
+                return False
+
+        return True
 
 
 # Logger name prefixes that belong to each component.
@@ -394,6 +416,7 @@ def setup_verbose_logging() -> None:
     handler = logging.StreamHandler(_safe_stderr())
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(RedactingFormatter(_LOG_FORMAT_VERBOSE, datefmt="%H:%M:%S"))
+    handler.addFilter(_RoutineTransportNoiseFilter())
     handler._hermes_verbose = True  # type: ignore[attr-defined]
     root.addHandler(handler)
 
@@ -622,6 +645,7 @@ def _register_queued_handler(handler: logging.Handler) -> None:
         if _log_queue is None:
             _log_queue = queue.SimpleQueue()
             qh = _NonFormattingQueueHandler(_log_queue)
+            qh.addFilter(_RoutineTransportNoiseFilter())
             qh._hermes_queue = True  # type: ignore[attr-defined]
             # Always funnel through the root logger so records from any logger
             # (production passes root here; callers may pass a child) reach the
