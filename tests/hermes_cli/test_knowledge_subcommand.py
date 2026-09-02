@@ -1,4 +1,4 @@
-﻿"""Regression coverage for the bounded Knowledge Sync CLI surface."""
+"""Regression coverage for the bounded Knowledge Sync CLI surface."""
 
 from __future__ import annotations
 
