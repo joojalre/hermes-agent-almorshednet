@@ -152,6 +152,7 @@ async def test_loop_tick_witness_arms_over_tcp_on_windows(
         shutdown_watchdog_module.asyncio,
         "start_unix_server",
         side_effect=_forbid_start_unix_server,
+        create=True,
     ), caplog.at_level(logging.DEBUG, logger="gateway.shutdown_watchdog"):
         payload = await _run_heartbeat_until_payload(tmp_path)
 
