@@ -689,6 +689,8 @@ def test_terminal_publication_retries_after_a_newer_user_wins_the_append_race(
     assert terminal["payload"]["reason"] == "superseded_by_newer_user_event"
 
 
+# Keep this rejection case separately named from the recovery-reserve case below.
+# Duplicate module-level test names are silently shadowed by Python.
 def test_terminal_publication_rejects_whole_plan_without_partial_append_at_history_limit(
     tmp_path: Path,
     monkeypatch,
