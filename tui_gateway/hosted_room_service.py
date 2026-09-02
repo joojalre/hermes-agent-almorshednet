@@ -903,6 +903,7 @@ class HostedRoomService:
             payload=normalized,
             authority_gateway_id=str(room["authority_gateway_id"]),
             authority_epoch=int(room["authority_epoch"]),
+            require_open_admissions=True,
         )
         binding = next(
             (
