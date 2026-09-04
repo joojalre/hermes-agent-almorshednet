@@ -97,6 +97,8 @@ const {
   $updateOverlayTarget,
   requestActiveUpdate,
   resetUpdateApplyState,
+  $automaticUpdateChecksEnabled,
+  setAutomaticUpdateChecksEnabled,
   startUpdatePoller,
   stopUpdatePoller,
   $updateStatus
@@ -341,6 +343,7 @@ describe('requestActiveUpdate', () => {
     getActionStatusSpy.mockReset().mockResolvedValue({ lines: [], running: false, exit_code: 0 })
     resetUpdateApplyState()
     $updateStatus.set(null)
+    setAutomaticUpdateChecksEnabled(true)
     $backendUpdateStatus.set(null)
     $updateOverlayOpen.set(false)
     ;(globalThis as unknown as { window: unknown }).window = {
@@ -1336,6 +1339,7 @@ describe('startUpdatePoller', () => {
       fetchedAt: 0
     })
     $updateStatus.set(null)
+    setAutomaticUpdateChecksEnabled(true)
     ;(globalThis as unknown as { window: unknown }).window = {
       hermesDesktop: { updates: { check: checkMock, onProgress: onProgressMock } },
       addEventListener: vi.fn((event: string, handler: Function) => {
@@ -1385,5 +1389,22 @@ describe('startUpdatePoller', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(checkMock).toHaveBeenCalled()
+  })
+
+  it('exposes a persistent switch that pauses and resumes background checks', async () => {
+    setAutomaticUpdateChecksEnabled(false)
+    startUpdatePoller()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect($automaticUpdateChecksEnabled.get()).toBe(false)
+    expect(checkMock).not.toHaveBeenCalled()
+    expect(storage.get('hermes:automatic-update-checks')).toBe('false')
+
+    setAutomaticUpdateChecksEnabled(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect($automaticUpdateChecksEnabled.get()).toBe(true)
+    expect(checkMock).toHaveBeenCalled()
+    expect(storage.get('hermes:automatic-update-checks')).toBe('true')
   })
 })

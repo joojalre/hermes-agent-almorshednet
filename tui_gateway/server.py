@@ -1707,6 +1707,13 @@ except (TypeError, ValueError):
 _SESSION_TTL_S = max(0.0, _SESSION_TTL_S)
 _REAPER_SCAN_S = 300.0
 
+# A stale client can poll several session-scoped methods after its runtime has
+# already been reaped. Preserve the first diagnostic, but coalesce identical
+# method/session warnings so one detached tab cannot flood errors.log.
+_STALE_SESSION_LOG_COOLDOWN_S = 60.0
+_stale_session_log_lock = threading.Lock()
+_stale_session_log_state: dict[tuple[str, str], tuple[float, int]] = {}
+
 
 # ── Flush-on-kill + periodic incremental flush (#94724 item 2) ───────────
 # A `hermes serve` killed mid-update used to lose every un-flushed in-memory
@@ -3673,6 +3680,40 @@ def _start_agent_build(sid: str, session: dict) -> None:
     build_thread.start()
 
 
+def _log_stale_session_rejection(method: str, sid: str, rid: Any) -> None:
+    key = (method, sid)
+    now = time.monotonic()
+    with _stale_session_log_lock:
+        previous = _stale_session_log_state.get(key)
+        if previous is not None and now - previous[0] < _STALE_SESSION_LOG_COOLDOWN_S:
+            _stale_session_log_state[key] = (previous[0], previous[1] + 1)
+            return
+
+        repeated = previous[1] if previous is not None else 0
+        _stale_session_log_state[key] = (now, 0)
+
+    if repeated:
+        logger.warning(
+            "session-scoped RPC rejected: method=%s session_id=%r not in memory "
+            "(detached/reaped runtime; client should resume the stored session); "
+            "coalesced_rejections=%d, rid=%r",
+            method,
+            sid,
+            repeated + 1,
+            rid,
+        )
+    else:
+        logger.warning(
+            "session-scoped RPC rejected: method=%s session_id=%r not in memory "
+            "(detached/reaped runtime; client should resume the stored session; "
+            "identical rejections coalesced for %.0fs), rid=%r",
+            method,
+            sid,
+            _STALE_SESSION_LOG_COOLDOWN_S,
+            rid,
+        )
+
+
 def _sess_nowait(params, rid):
     sid = params.get("session_id") or ""
     s = _sessions.get(sid)
@@ -3686,13 +3727,7 @@ def _sess_nowait(params, rid):
     # this class returned a silent 4001. Log it so a "message vanished"
     # report is diagnosable as "request arrived and was rejected" instead of
     # "request never arrived" (see #90428).
-    logger.warning(
-        "session-scoped RPC rejected: method=%s session_id=%r not in memory "
-        "(detached/reaped runtime; client should resume the stored session), rid=%r",
-        _current_rpc_method.get() or "?",
-        sid,
-        rid,
-    )
+    _log_stale_session_rejection(_current_rpc_method.get() or "?", sid, rid)
     return (None, _err(rid, 4001, "session not found"))
 
 

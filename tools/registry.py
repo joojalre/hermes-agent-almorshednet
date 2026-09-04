@@ -422,7 +422,7 @@ def _check_fn_cached(fn: Callable) -> bool:
             # Recent success → treat this failure as a flake. Serve last-good
             # True and do NOT cache the failure, so the next call re-probes
             # rather than pinning a stale verdict for the full TTL.
-            logger.warning(
+            logger.info(
                 "check_fn %s failed (%s) within %.0fs of last success; "
                 "treating as transient and keeping tool(s) available",
                 getattr(fn, "__qualname__", fn),
@@ -431,9 +431,12 @@ def _check_fn_cached(fn: Callable) -> bool:
             )
             return True
 
-        # No recent success (or grace expired) — honor the failure. Log it so
-        # silent tool loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
+        # A False result is an expected capability decision for optional
+        # integrations (for example, browser control when no browser is
+        # attached), not a runtime fault. Keep it visible in the normal
+        # gateway log without promoting every unavailable optional tool to
+        # the error log on every profile turn.
+        logger.info(
             "check_fn %s %s; dependent tools will be unavailable this turn",
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",

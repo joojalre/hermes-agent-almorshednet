@@ -135,6 +135,11 @@ function skillSubtitle(skill: SkillInfo): React.ReactNode {
           hub
         </Badge>
       )}
+      {provenance === 'bundled' && (
+        <Badge className="shrink-0 normal-case" variant="muted">
+          built-in
+        </Badge>
+      )}
     </>
   )
 }
@@ -462,6 +467,19 @@ export function SkillsView({
   )
 
   const runningInstalls = useMemo(() => new Set(runningInstallKey.split('|').filter(Boolean)), [runningInstallKey])
+
+  // Provenance counts make it clear why a skill appears in this list (agent,
+  // bundled, or Skills Hub) instead of implying that only one source exists.
+  const provenanceSummary = useMemo(() => {
+    const counts = { agent: 0, bundled: 0, hub: 0 }
+
+    for (const skill of skills ?? []) {
+      const provenance = skill.provenance ?? 'agent'
+      counts[provenance] += 1
+    }
+
+    return t.skills.provenanceSummary(counts.agent, counts.bundled, counts.hub)
+  }, [skills, t.skills])
 
   const visibleToolsets = useMemo(
     () => (toolsets ? filteredToolsets(toolsets, query, toolCalls ?? {}, toolsetsSortDesc) : []),
@@ -897,22 +915,27 @@ export function SkillsView({
                 <MasterDetail pane={skillEditorPane} resizeId="capabilities-split" split="wide">
                   <ListColumn
                     header={
-                      <ListStrip
-                        left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
-                        right={
-                          <ListStripMenu
-                            items={[
-                              {
-                                disabled: bulkBusy,
-                                label: t.skills.disableUnused,
-                                onSelect: () => void disableUnused()
-                              }
-                            ]}
-                            label={t.skills.tabSkills}
-                            toggle={bulkSwitch(allSkillsEnabled)}
-                          />
-                        }
-                      />
+                      <>
+                        <div className="border-b border-(--ui-stroke-secondary) px-3 py-1 text-[0.65rem] text-(--ui-text-tertiary)">
+                          {provenanceSummary}
+                        </div>
+                        <ListStrip
+                          left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
+                          right={
+                            <ListStripMenu
+                              items={[
+                                {
+                                  disabled: bulkBusy,
+                                  label: t.skills.disableUnused,
+                                  onSelect: () => void disableUnused()
+                                }
+                              ]}
+                              label={t.skills.tabSkills}
+                              toggle={bulkSwitch(allSkillsEnabled)}
+                            />
+                          }
+                        />
+                      </>
                     }
                   >
                     {visibleSkills.map(skill => (

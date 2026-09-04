@@ -1624,6 +1624,8 @@ export interface MemoryStatusResponse {
   active: string
   providers: { name: string; description: string; configured: boolean }[]
   builtin_files: { memory: number; user: number }
+  /** Resolved local paths for opening the existing built-in files. */
+  builtin_paths?: { memory?: string; user?: string }
 }
 
 /** `GET /api/curator` — background skill-curator status. */

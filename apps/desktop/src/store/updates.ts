@@ -16,7 +16,7 @@ import type {
 } from '@/global'
 import { checkHermesUpdate, getActionStatus, updateHermes } from '@/hermes'
 import { translateNow } from '@/i18n'
-import { persistString, storedString } from '@/lib/storage'
+import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
 import { $connectionsRegistry, refreshConnectionsRegistry } from '@/store/connections'
 import { reconnectGateway } from '@/store/gateway-reconnect'
 import { dismissNotification, notify } from '@/store/notifications'
@@ -52,6 +52,12 @@ export const $updateApply = atom<UpdateApplyState>(IDLE)
 export const $updateChecking = atom<boolean>(false)
 export const $updateOverlayOpen = atom<boolean>(false)
 export const $updateStatus = atom<DesktopUpdateStatus | null>(null)
+
+// Background update checks are opt-out. This preference controls checking and
+// notifications only; applying a code update remains an explicit action so a
+// dirty checkout can never be overwritten silently.
+const AUTO_UPDATE_CHECKS_KEY = 'hermes:automatic-update-checks'
+export const $automaticUpdateChecksEnabled = atom(storedBoolean(AUTO_UPDATE_CHECKS_KEY, true))
 
 // Client and backend are independently updatable; each keeps its own state.
 export const $backendUpdateStatus = atom<DesktopUpdateStatus | null>(null)
@@ -989,6 +995,39 @@ let lastFocusAt = 0
 let connectionUnsub: (() => void) | null = null
 let lastConnectionMode: string | undefined
 
+function runBackgroundChecks(): void {
+  if (!$automaticUpdateChecksEnabled.get()) {
+    return
+  }
+
+  void checkUpdates()
+  void checkBackendUpdates()
+}
+
+function syncBackgroundTimer(): void {
+  if (!pollerStarted) {
+    return
+  }
+
+  if (backgroundTimer !== null) {
+    clearInterval(backgroundTimer)
+    backgroundTimer = null
+  }
+
+  if (!$automaticUpdateChecksEnabled.get()) {
+    return
+  }
+
+  runBackgroundChecks()
+  backgroundTimer = setInterval(runBackgroundChecks, 30 * 60 * 1000)
+}
+
+export function setAutomaticUpdateChecksEnabled(enabled: boolean): void {
+  $automaticUpdateChecksEnabled.set(enabled)
+  persistBoolean(AUTO_UPDATE_CHECKS_KEY, enabled)
+  syncBackgroundTimer()
+}
+
 /** Wire up background polling + progress streaming. Idempotent. */
 export function startUpdatePoller(): void {
   if (pollerStarted || typeof window === 'undefined') {
@@ -1002,8 +1041,6 @@ export function startUpdatePoller(): void {
   }
 
   pollerStarted = true
-  void checkUpdates()
-  void checkBackendUpdates()
   void refreshDesktopVersion()
   bridge.onProgress(ingestProgress)
 
@@ -1017,19 +1054,13 @@ export function startUpdatePoller(): void {
 
     lastConnectionMode = conn?.mode
 
-    if (conn?.mode === 'remote') {
+    if (conn?.mode === 'remote' && $automaticUpdateChecksEnabled.get()) {
       void checkBackendUpdates()
     }
   })
 
   window.addEventListener('focus', onFocus)
-  backgroundTimer = setInterval(
-    () => {
-      void checkUpdates()
-      void checkBackendUpdates()
-    },
-    30 * 60 * 1000
-  )
+  syncBackgroundTimer()
 }
 
 export function stopUpdatePoller(): void {
@@ -1046,6 +1077,10 @@ export function stopUpdatePoller(): void {
 }
 
 function onFocus() {
+  if (!$automaticUpdateChecksEnabled.get()) {
+    return
+  }
+
   const now = Date.now()
 
   if (now - lastFocusAt < 5 * 60 * 1000) {
@@ -1053,7 +1088,6 @@ function onFocus() {
   }
 
   lastFocusAt = now
-  void checkUpdates()
-  void checkBackendUpdates()
+  runBackgroundChecks()
   void refreshDesktopVersion()
 }

@@ -582,6 +582,8 @@ export interface Translations {
       justNowSuffix: string
       automaticUpdates: string
       automaticUpdatesDesc: string
+      updateParked: string
+      updateParkedDesc: string
       branchCommit: (branch: string, commit: string) => string
       never: string
       justNow: string
@@ -1269,6 +1271,7 @@ export interface Translations {
     bulkNoChange: string
     usageCount: (count: number | string) => string
     provenance: Record<'agent' | 'bundled' | 'hub', string>
+    provenanceSummary: (agent: number, bundled: number, hub: number) => string
     emptyNoneFound: (noun: string) => string
     emptyNothingMatches: (query: string) => string
     emptyNoneAvailable: (noun: string) => string
@@ -1547,6 +1550,7 @@ export interface Translations {
       builtinMemory: string
       memoryFile: string
       userFile: string
+      openFile: string
       bytes: (size: string) => string
       empty: string
       resetMemory: string

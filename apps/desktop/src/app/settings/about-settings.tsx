@@ -10,15 +10,17 @@ import { cn } from '@/lib/utils'
 import {
   $desktopVersion,
   $updateApply,
+  $automaticUpdateChecksEnabled,
   $updateChecking,
   $updateStatus,
   checkUpdates,
   openUpdatesWindow,
   refreshDesktopVersion,
+  setAutomaticUpdateChecksEnabled,
   startActiveUpdate
 } from '@/store/updates'
 
-import { ListRow, SectionHeading, SettingsContent } from './primitives'
+import { SectionHeading, SettingsContent, ToggleRow } from './primitives'
 import { UninstallSection } from './uninstall-section'
 
 const RELEASE_NOTES_URL = 'https://github.com/NousResearch/hermes-agent/releases'
@@ -53,6 +55,7 @@ export function AboutSettings() {
   const status = useStore($updateStatus)
   const apply = useStore($updateApply)
   const checking = useStore($updateChecking)
+  const automaticUpdateChecksEnabled = useStore($automaticUpdateChecksEnabled)
   const [justChecked, setJustChecked] = useState(false)
 
   // The version atom is loaded once at app boot, which makes About show a
@@ -69,6 +72,7 @@ export function AboutSettings() {
   const updateAvailable = behind > 0 || Boolean(status?.updateAvailable)
   const supported = status?.supported !== false
   const applying = apply.applying || apply.stage === 'restart'
+  const updateParked = updateAvailable && Boolean(status?.dirty)
 
   const handleCheck = async () => {
     setJustChecked(false)
@@ -180,6 +184,12 @@ export function AboutSettings() {
                 {a.lastChecked(relativeTime(status?.fetchedAt, a))}
                 {justChecked && !checking ? a.justNowSuffix : ''}
               </p>
+              {updateParked && (
+                <div className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-800 dark:text-amber-200">
+                  <p className="font-medium">{a.updateParked}</p>
+                  <p className="mt-0.5 text-amber-900/70 dark:text-amber-100/70">{a.updateParkedDesc}</p>
+                </div>
+              )}
             </div>
           </div>
 
@@ -222,10 +232,12 @@ export function AboutSettings() {
           </div>
         </div>
 
-        <ListRow
+        <ToggleRow
+          checked={automaticUpdateChecksEnabled}
           description={a.automaticUpdatesDesc}
           hint={a.branchCommit(status?.branch ?? 'unknown', status?.currentSha?.slice(0, 7) ?? 'unknown')}
-          title={a.automaticUpdates}
+          label={a.automaticUpdates}
+          onChange={setAutomaticUpdateChecksEnabled}
         />
 
         <UninstallSection />

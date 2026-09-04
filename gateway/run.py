@@ -34240,7 +34240,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # is one line, key=value, parent_cmdline last (often long).
         if _shutdown_ctx is not None:
             try:
-                logger.warning(
+                logger.log(
+                    logging.INFO if planned_takeover or planned_stop else logging.WARNING,
                     "Shutdown context: %s", format_context_for_log(_shutdown_ctx)
                 )
             except Exception as _e:
