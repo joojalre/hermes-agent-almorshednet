@@ -254,6 +254,32 @@ test('startup reap still reaps a backend whose parent is gone or reused', async 
   assert.deepEqual(parseBackendOwnership(store.value()), [reused])
 })
 
+test('startup reap deduplicates and overlaps parent liveness probes', async () => {
+  const first = { ...ownershipEntry({ pid: 58 }), parentPid: 400, parentStartMarker: 'os-start-parent' }
+  const second = {
+    ...ownershipEntry({ pid: 59, nonce: 'second' }),
+    parentPid: 400,
+    parentStartMarker: 'os-start-parent'
+  }
+  const store = memoryStore(stored([first, second]))
+  const release = deferred()
+  const matchesParent = vi.fn(async () => {
+    await release.promise
+    return true
+  })
+
+  const ownership = createOwnership(store, { matchesParent })
+  const reap = ownership.reapOrphans()
+
+  // Both records share one parent probe; it must be scheduled immediately,
+  // before the caller releases it, and only once.
+  await Promise.resolve()
+  assert.equal(matchesParent.mock.calls.length, 1)
+  release.resolve()
+  assert.deepEqual(await reap, [])
+  assert.deepEqual(parseBackendOwnership(store.value()), [first, second])
+})
+
 test('startup reap preserves a record when parent liveness probing fails', async () => {
   const entry = { ...ownershipEntry({ pid: 57 }), parentPid: 300, parentStartMarker: 'os-start-parent' }
   const store = memoryStore(stored([entry]))

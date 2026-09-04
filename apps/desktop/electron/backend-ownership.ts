@@ -238,6 +238,41 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
       const reaped: number[] = []
       const deadline = Date.now() + (deps.reapDeadlineMs ?? REAP_ORPHANS_DEADLINE_MS)
 
+      // Parent liveness is probed through the OS process table. On Windows
+      // that probe shells out to PowerShell, so doing it once per record
+      // serially can delay startup by minutes when an older ownership file
+      // contains many backends belonging to the same Electron parent. Probe
+      // each distinct (PID, start-marker) pair once and start all probes
+      // before the identity/stop pass. Reaping itself remains sequential so
+      // stop failures preserve the exact record and cannot race each other.
+      const parentProbes = new Map<string, Promise<boolean | undefined>>()
+      const identityProbes = new Map<string, Promise<boolean | undefined>>()
+
+      for (const entry of entries) {
+        if (!Number.isInteger(entry.parentPid) || !isNonEmptyString(entry.parentStartMarker)) {
+          continue
+        }
+
+        const key = `${entry.parentPid}\u0000${entry.parentStartMarker}`
+
+        if (!parentProbes.has(key)) {
+          parentProbes.set(key, Promise.resolve().then(() => deps.matchesParent(entry)))
+        }
+      }
+
+      // Identity probes also consult the OS process table (and on Windows
+      // may invoke PowerShell). Start one probe per exact identity up front so
+      // a large stale roster cannot turn startup into N * probe-timeout. A
+      // parent that is found alive still wins below; its speculative identity
+      // result is simply ignored.
+      for (const entry of entries) {
+        const key = `${entry.pid}\u0000${entry.startMarker}\u0000${entry.nonce}\u0000${entry.profile}`
+
+        if (!identityProbes.has(key)) {
+          identityProbes.set(key, Promise.resolve().then(() => deps.matchesIdentity(entry)))
+        }
+      }
+
       for (let i = 0; i < entries.length; i += 1) {
         // Budget exhausted: preserve the unprocessed records so a later launch
         // can retry them. A slow identity probe must never stall boot — the
@@ -258,7 +293,11 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
         let parentAlive: boolean | undefined
 
         try {
-          parentAlive = await deps.matchesParent(entry)
+          const key =
+            Number.isInteger(entry.parentPid) && isNonEmptyString(entry.parentStartMarker)
+              ? `${entry.parentPid}\u0000${entry.parentStartMarker}`
+              : undefined
+          parentAlive = key ? await parentProbes.get(key) : await deps.matchesParent(entry)
         } catch {
           survivors.push(entry)
 
@@ -274,7 +313,8 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
         let matches: boolean | undefined
 
         try {
-          matches = await deps.matchesIdentity(entry)
+          const key = `${entry.pid}\u0000${entry.startMarker}\u0000${entry.nonce}\u0000${entry.profile}`
+          matches = await identityProbes.get(key)
         } catch {
           survivors.push(entry)
 
