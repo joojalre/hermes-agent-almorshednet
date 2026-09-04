@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.hosted_room_driver import TaskIdentity
-from tui_gateway.hosted_room_driver import HostedRoomProfileUnavailableError
 from tui_gateway.hosted_room_server_rpc import (
     HostedRoomServerRPC,
     HostedRoomSessionError,
@@ -47,27 +46,6 @@ def _server():
         _pending_approval_request_payload=lambda _session_key: None,
     )
     return server, calls
-
-
-def _admitted_session(
-    task: TaskIdentity,
-    *,
-    execution_generation: int = 2,
-    running: bool = True,
-):
-    return {
-        "history_lock": threading.Lock(),
-        "running": running,
-        "source": "bot_room",
-        "room_plumbing": True,
-        "_hosted_room_task": {
-            "room_id": task.room_id,
-            "task_id": task.task_id,
-            "thread_id": task.thread_id,
-            "turn_id": task.turn_id,
-            "execution_generation": execution_generation,
-        },
-    }
 
 
 def test_routes_exact_hidden_session_and_internal_task_proof():
@@ -115,19 +93,6 @@ def test_routes_exact_hidden_session_and_internal_task_proof():
     assert resume["source"] == "bot_room"
 
 
-def test_unavailable_profile_is_rejected_before_any_server_handler():
-    server, calls = _server()
-    rpc = HostedRoomServerRPC(
-        server,
-        profile_available=lambda profile: profile == "default",
-    )
-
-    with pytest.raises(HostedRoomProfileUnavailableError):
-        rpc.resolve_exact(profile="deleted", title="Group: room", source="bot_room")
-
-    assert calls == []
-
-
 def test_handler_calls_use_a_private_drop_transport_and_restore_the_caller():
     server, _calls = _server()
     seen = []
@@ -173,192 +138,6 @@ def test_info_and_interrupt_are_exact_task_scoped():
     )
     params = next(params for method, params in calls if method == "session.interrupt")
     assert params["expected_hosted_task_id"] == "task-a"
-
-
-def test_interrupt_admitted_matches_full_process_local_task_proof():
-    server, calls = _server()
-    task = TaskIdentity("room", "task", "thread", "turn")
-    server._sessions["runtime"] = _admitted_session(task)
-    rpc = HostedRoomServerRPC(server)
-
-    result = rpc.interrupt_admitted(
-        task=task,
-        execution_generation=2,
-        source="bot_room",
-    )
-
-    assert result == {
-        "status": "interrupted",
-        "acknowledged": True,
-        "active": True,
-        "interrupted": True,
-        "session_id": "runtime",
-    }
-    interrupt = next(params for method, params in calls if method == "session.interrupt")
-    assert interrupt == {
-        "session_id": "runtime",
-        "expected_hosted_task_id": "task",
-        "expected_hosted_execution_generation": 2,
-    }
-    assert not any(method in {"session.list", "session.resume"} for method, _ in calls)
-
-
-def test_interrupt_admitted_acknowledges_inactive_and_absent_tasks():
-    server, calls = _server()
-    task = TaskIdentity("room", "task", "thread", "turn")
-    server._sessions["runtime"] = _admitted_session(task, running=False)
-    rpc = HostedRoomServerRPC(server)
-
-    assert rpc.interrupt_admitted(
-        task=task,
-        execution_generation=2,
-        source="bot_room",
-    ) == {
-        "status": "inactive",
-        "acknowledged": True,
-        "active": False,
-        "interrupted": False,
-        "session_id": "runtime",
-    }
-
-    server._sessions.clear()
-    assert rpc.interrupt_admitted(
-        task=task,
-        execution_generation=2,
-        source="bot_room",
-    ) == {
-        "status": "absent",
-        "acknowledged": False,
-        "active": False,
-        "interrupted": False,
-        "session_id": None,
-    }
-    assert not any(method == "session.interrupt" for method, _ in calls)
-
-
-def test_concurrent_interrupt_claim_stays_pending_until_signal_is_proven():
-    server, _calls = _server()
-    task = TaskIdentity("room", "task", "thread", "turn")
-    server._sessions["runtime"] = _admitted_session(task)
-    first_entered = threading.Event()
-    release_first = threading.Event()
-    call_lock = threading.Lock()
-    call_count = 0
-
-    def interrupt(rid, _params):
-        nonlocal call_count
-        with call_lock:
-            call_count += 1
-            current = call_count
-        if current == 1:
-            first_entered.set()
-            assert release_first.wait(timeout=5)
-            return {"id": rid, "result": {"status": "interrupted"}}
-        return {"id": rid, "result": {"status": "not_interrupted"}}
-
-    server._methods["session.interrupt"] = interrupt
-    rpc = HostedRoomServerRPC(server)
-    first_result: list[dict] = []
-    first = threading.Thread(
-        target=lambda: first_result.append(
-            dict(
-                rpc.interrupt_admitted(
-                    task=task,
-                    execution_generation=2,
-                    source="bot_room",
-                )
-            )
-        )
-    )
-    first.start()
-    assert first_entered.wait(timeout=5)
-
-    try:
-        overlapping = rpc.interrupt_admitted(
-            task=task,
-            execution_generation=2,
-            source="bot_room",
-        )
-        assert overlapping == {
-            "status": "pending",
-            "acknowledged": False,
-            "active": True,
-            "interrupted": False,
-            "session_id": "runtime",
-        }
-    finally:
-        release_first.set()
-        first.join(timeout=5)
-    assert not first.is_alive()
-    assert first_result == [
-        {
-            "status": "interrupted",
-            "acknowledged": True,
-            "active": True,
-            "interrupted": True,
-            "session_id": "runtime",
-        }
-    ]
-
-
-def test_interrupt_admitted_fails_closed_on_ambiguous_admission():
-    server, calls = _server()
-    task = TaskIdentity("room", "task", "thread", "turn")
-    server._sessions["runtime-a"] = _admitted_session(task)
-    server._sessions["runtime-b"] = _admitted_session(task)
-    rpc = HostedRoomServerRPC(server)
-
-    with pytest.raises(HostedRoomSessionError) as exc:
-        rpc.interrupt_admitted(
-            task=task,
-            execution_generation=2,
-            source="bot_room",
-        )
-
-    assert exc.value.code == 4091
-    assert not any(method == "session.interrupt" for method, _ in calls)
-
-
-def test_interrupt_admitted_fails_closed_on_generation_conflict():
-    server, calls = _server()
-    task = TaskIdentity("room", "task", "thread", "turn")
-    server._sessions["runtime"] = _admitted_session(
-        task,
-        execution_generation=3,
-    )
-    rpc = HostedRoomServerRPC(server)
-
-    with pytest.raises(HostedRoomSessionError) as exc:
-        rpc.interrupt_admitted(
-            task=task,
-            execution_generation=2,
-            source="bot_room",
-        )
-
-    assert exc.value.code == 4092
-    assert not any(method == "session.interrupt" for method, _ in calls)
-
-
-def test_deleted_profile_does_not_block_process_local_admitted_interrupt():
-    server, calls = _server()
-    task = TaskIdentity("room", "task", "thread", "turn")
-    server._sessions["runtime"] = _admitted_session(task)
-
-    def deleted_profile(_profile):
-        raise AssertionError("process-local interrupt must not inspect profiles")
-
-    rpc = HostedRoomServerRPC(server, profile_available=deleted_profile)
-
-    result = rpc.interrupt_admitted(
-        task=task,
-        execution_generation=2,
-        source="bot_room",
-    )
-
-    assert result["status"] == "interrupted"
-    interrupt = next(params for method, params in calls if method == "session.interrupt")
-    assert "profile" not in interrupt
-    assert not any(method in {"session.list", "session.resume"} for method, _ in calls)
 
 
 def test_local_approval_snapshot_and_response_use_exact_request():

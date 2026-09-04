@@ -62,6 +62,13 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.codex_headers import (
+    CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
+    apply_required_codex_headers as _apply_required_codex_headers,
+    codex_cloudflare_headers as _codex_cloudflare_headers,
+    is_official_codex_base_url as _is_official_codex_base_url,
+)
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -528,6 +535,14 @@ _CODEX_PROGRESS_DELTA_TYPES = frozenset(
         "response.reasoning_text.delta",
     }
 )
+
+
+# Progress-aware auxiliary stream deadlines (Aug 2026, masoria report):
+# a dead stream fails fast at the no-progress window (first token AND
+# between tokens), a live stream re-arms per substantive event and is
+# bounded only by _aux_stream_total_ceiling() (shared with the streamed
+# chat.completions path).
+_AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS = 60.0
 
 
 def _codex_event_has_content(event: Any) -> bool:
@@ -1326,89 +1341,10 @@ _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
-# Codex OAuth endpoint used when a caller explicitly requests
-# provider="openai-codex".  There is deliberately no hardcoded default
-# model: the set of models OpenAI accepts on this endpoint for
-# ChatGPT-account auth is an undocumented, shifting allow-list, and
-# pinning one here has drifted silently twice (gpt-5.3-codex → gpt-5.2-codex
-# → gpt-5.4 over 6 weeks in early 2026).  Callers must pass the model
-# they want explicitly (from config.yaml model.model, auxiliary.<task>.model,
-# or the user's active Codex model selection).
-_CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-
-
-def _is_official_codex_base_url(base_url: str) -> bool:
-    """Identify OpenAI's Codex endpoint without matching custom proxies."""
-    try:
-        parsed = urlparse(base_url)
-        path = parsed.path.rstrip("/")
-        return (
-            parsed.scheme == "https"
-            and parsed.hostname == "chatgpt.com"
-            and parsed.port in (None, 443)
-            and (path == "/backend-api/codex" or path.startswith("/backend-api/codex/"))
-        )
-    except (TypeError, ValueError):
-        return False
-
-
-def _codex_cloudflare_headers(
-    access_token: str, *, base_url: str = _CODEX_AUX_BASE_URL,
-) -> Dict[str, str]:
-    """Identity and account headers for chatgpt.com/backend-api/codex.
-
-    OpenAI requires third-party harnesses to identify themselves. Requests to
-    the official endpoint always send Hermes' originator and version. Custom
-    endpoints retain the existing compatibility identity. In either case,
-    preserve ``ChatGPT-Account-ID`` from the OAuth JWT's
-    ``chatgpt_account_id`` claim.
-
-    Malformed tokens are tolerated — we drop the account-ID header rather than
-    raise, so a bad token still surfaces as an auth error (401) instead of a
-    crash at client construction.
-    """
-    headers = {
-        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
-        "originator": "codex_cli_rs",
-    }
-    if _is_official_codex_base_url(base_url):
-        from hermes_cli import __version__
-
-        headers.update({
-            "User-Agent": f"HermesAgent/{__version__}",
-            "originator": "hermes-agent",
-        })
-    if not isinstance(access_token, str) or not access_token.strip():
-        return headers
-    try:
-        import base64
-        parts = access_token.split(".")
-        if len(parts) < 2:
-            return headers
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
-        acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
-        if isinstance(acct_id, str) and acct_id:
-            headers["ChatGPT-Account-ID"] = acct_id
-    except Exception:
-        pass
-    return headers
-
-
-def _apply_required_codex_headers(
-    client_kwargs: Dict[str, Any], *, access_token: str, base_url: str,
-) -> None:
-    """Keep required Codex identity after user/provider header overrides."""
-    if not _is_official_codex_base_url(base_url):
-        return
-    required = _codex_cloudflare_headers(access_token, base_url=base_url)
-    required_names = {name.lower() for name in required}
-    existing = client_kwargs.get("default_headers") or {}
-    client_kwargs["default_headers"] = {
-        **{name: value for name, value in existing.items()
-           if str(name).lower() not in required_names},
-        **required,
-    }
+# Codex helpers live in a small leaf module so fresh client builders never
+# request newly added exports from a stale, long-lived auxiliary router. The
+# private aliases above preserve the established import surface for plugins and
+# tests while new production consumers import the leaf directly.
 
 
 # Hosts that expose BOTH an Anthropic-style ``…/anthropic`` path and a sibling
@@ -1849,9 +1785,38 @@ class _CodexCompletionsAdapter:
         tool_calls_raw: List[Any] = []
         usage = None
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+        # Progress-aware stream deadlines (supersedes the old single absolute
+        # kill at ``total_timeout``). Three regimes:
+        #   1. First token: the stream must produce its first substantive
+        #      payload within ``no_progress_timeout`` (60s default) or we
+        #      fail fast and let the caller's normal retry/fallback chain
+        #      run — a dead (or keepalive-only zombie) Codex stream no
+        #      longer holds the full 300s compression budget before falling
+        #      back (masoria report, Aug 2026: 3 stacked 300s waits ->
+        #      20+ min stuck on "Summarizing").
+        #   2. Streaming: every substantive event re-arms the deadline by
+        #      ``no_progress_timeout`` — a live stream is never killed by an
+        #      absolute total, so a long reasoning summary that is actually
+        #      producing tokens completes instead of timing out at 300s and
+        #      falling back (#54915's original complaint, fixed properly).
+        #      Keepalive/lifecycle frames do NOT re-arm, mirroring the
+        #      commit-fence progress gating (#96707).
+        #   3. Hard ceiling: an absolute backstop from
+        #      ``_aux_stream_total_ceiling`` (max(600s, 4x configured
+        #      timeout) — the same bound the streamed chat.completions path
+        #      uses) so a pathological one-token-per-59s drip still
+        #      terminates.
+        _start_monotonic = time.monotonic()
+        no_progress_timeout = _AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS
+        if total_timeout is not None:
+            no_progress_timeout = min(no_progress_timeout, float(total_timeout))
+        hard_deadline = _start_monotonic + _aux_stream_total_ceiling(total_timeout)
+        deadline_lock = threading.Lock()
+        progress_deadline = [_start_monotonic + no_progress_timeout]
+        saw_content = threading.Event()
         timed_out = threading.Event()
-        timeout_timer: Optional[threading.Timer] = None
+        stream_finished = threading.Event()
+        timeout_timer: List[Optional[threading.Timer]] = [None]
         # A protected provider call may outlive its owning compression attempt:
         # the owner returns promptly on hard cancellation while this adapter is
         # still blocked in the SDK stream on its isolated worker. Timer threads
@@ -1863,8 +1828,34 @@ class _CodexCompletionsAdapter:
         attempt_stream_lock = threading.Lock()
         attempt_stream: List[Any] = []
 
+        def _effective_deadline() -> float:
+            with deadline_lock:
+                return min(hard_deadline, progress_deadline[0])
+
+        def _record_stream_progress() -> None:
+            # A substantive payload re-arms the no-progress window. The hard
+            # ceiling is never extended.
+            with deadline_lock:
+                progress_deadline[0] = time.monotonic() + no_progress_timeout
+
         def _timeout_message() -> str:
-            return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
+            elapsed = time.monotonic() - _start_monotonic
+            if time.monotonic() >= hard_deadline:
+                return (
+                    "Codex auxiliary Responses stream exceeded "
+                    f"{hard_deadline - _start_monotonic:.1f}s hard ceiling"
+                )
+            if not saw_content.is_set():
+                return (
+                    "Codex auxiliary Responses stream produced no output "
+                    f"within {float(no_progress_timeout):.1f}s "
+                    f"(no-progress timeout, {elapsed:.1f}s elapsed)"
+                )
+            return (
+                "Codex auxiliary Responses stream stalled: no new output "
+                f"for {float(no_progress_timeout):.1f}s "
+                f"({elapsed:.1f}s elapsed)"
+            )
 
         def _close_client_on_timeout() -> None:
             begin_timeout_cleanup = getattr(
@@ -1917,7 +1908,7 @@ class _CodexCompletionsAdapter:
                 logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
-            if deadline is not None and time.monotonic() >= deadline:
+            if total_timeout is not None and time.monotonic() >= _effective_deadline():
                 if not timed_out.is_set():
                     _close_client_on_timeout()
                 raise TimeoutError(_timeout_message())
@@ -1939,11 +1930,30 @@ class _CodexCompletionsAdapter:
                 # new failure mode for auxiliary calls.
                 pass
 
+        def _watchdog_fire() -> None:
+            # Re-armable watchdog: if progress moved the deadline forward
+            # since this timer was scheduled, reschedule instead of killing
+            # a live stream. Only kill when the effective deadline (progress
+            # window or hard ceiling, whichever is sooner) has truly passed.
+            remaining = _effective_deadline() - time.monotonic()
+            if remaining > 0:
+                if timed_out.is_set() or stream_finished.is_set():
+                    return
+                t = threading.Timer(remaining, _watchdog_fire)
+                t.daemon = True
+                timeout_timer[0] = t
+                t.start()
+                return
+            _close_client_on_timeout()
+
         try:
             if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
-                timeout_timer.daemon = True
-                timeout_timer.start()
+                timeout_timer[0] = threading.Timer(
+                    max(_effective_deadline() - time.monotonic(), 0.0),
+                    _watchdog_fire,
+                )
+                timeout_timer[0].daemon = True
+                timeout_timer[0].start()
             _check_cancelled()
 
             # Event-driven Responses streaming via the low-level
@@ -1975,7 +1985,13 @@ class _CodexCompletionsAdapter:
                 # compression commit fence) counts only substantive
                 # payloads — lifecycle and keepalive events must not reset
                 # the compression idle clock.
+                # The transport no-progress window likewise re-arms only on
+                # substantive payloads: a zombie stream that drips SSE
+                # keepalives but never produces output dies at the same 60s
+                # window as a fully dead connection.
                 if _codex_event_has_content(_event):
+                    _record_stream_progress()
+                    saw_content.set()
                     _notify_aux_provider_response()
                 else:
                     _notify_aux_timing_response()
@@ -2070,8 +2086,10 @@ class _CodexCompletionsAdapter:
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
         finally:
-            if timeout_timer is not None:
-                timeout_timer.cancel()
+            stream_finished.set()
+            _t = timeout_timer[0]
+            if _t is not None:
+                _t.cancel()
 
         content = "".join(text_parts).strip() or None
 
@@ -9535,6 +9553,7 @@ class _ChatStreamAccumulator:
         self._total_ceiling = total_ceiling
         self.content_parts: List[str] = []
         self.reasoning_parts: List[str] = []
+        self.reasoning_details: List[Any] = []
         self.tool_calls_acc: Dict[int, Dict[str, Any]] = {}
         self.finish_reason = None
         self.usage = None
@@ -9579,6 +9598,24 @@ class _ChatStreamAccumulator:
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
             made_progress = True
+        # OpenRouter-compatible reasoning models may stream their entire
+        # thinking phase through ``reasoning_details`` instead of
+        # ``reasoning`` / ``reasoning_content``.  Treat only details carrying
+        # actual text as forward progress: structural/signed envelopes must
+        # not keep an otherwise stalled compression alive indefinitely.
+        reasoning_details = getattr(delta, "reasoning_details", None)
+        if reasoning_details is None:
+            model_extra = getattr(delta, "model_extra", None)
+            if isinstance(model_extra, dict):
+                reasoning_details = model_extra.get("reasoning_details")
+        if isinstance(reasoning_details, list):
+            for detail in reasoning_details:
+                self.reasoning_details.append(detail)
+                if isinstance(detail, dict) and any(
+                    isinstance(detail.get(field), str) and detail[field]
+                    for field in ("summary", "thinking", "content", "text")
+                ):
+                    made_progress = True
         for tc in (getattr(delta, "tool_calls", None) or []):
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
@@ -9620,6 +9657,7 @@ class _ChatStreamAccumulator:
             content="".join(self.content_parts),
             tool_calls=tool_calls,
             reasoning="".join(self.reasoning_parts) or None,
+            reasoning_details=self.reasoning_details or None,
         )
         choice = SimpleNamespace(
             index=0,
@@ -10081,12 +10119,20 @@ def _call_llm_impl(
             # fall straight through to provider/model fallback; fast blips (a
             # streaming-close or a 5xx) still retry, since those are cheap.
             if task == "compression" and _is_timeout_error(transient_err):
-                logger.info(
-                    "Auxiliary compression: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s",
-                    transient_err,
-                )
-                raise
+                # A fast first-token fail (dead stream detected within the
+                # 60s no-progress window, zero output seen) is cheap — take
+                # the normal same-provider retry chain first; the provider
+                # is often fine and only that one stream was stillborn. A
+                # mid-stream stall or hard-ceiling timeout skips straight to
+                # fallback, because re-running a multi-minute summary on the
+                # same provider doubles the user-visible stall (#54465).
+                if "no-progress timeout" not in str(transient_err):
+                    logger.info(
+                        "Auxiliary compression: timeout on the critical path; "
+                        "skipping same-provider retry and falling back: %s",
+                        transient_err,
+                    )
+                    raise
             _max_transient_retries = _transient_retry_count()
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):

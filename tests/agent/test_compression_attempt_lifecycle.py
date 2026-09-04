@@ -100,8 +100,8 @@ class TestWorkerTeardownOnCeiling:
             worker=cooperative_worker,
             messages=original,
             system_prompt_fallback="fallback",
-            idle_timeout_seconds=2.0,
-            total_ceiling_seconds=2.0,
+            idle_timeout_seconds=0.1,
+            total_ceiling_seconds=0.2,
             fence=fence,
             stall_fallback=False,
         )

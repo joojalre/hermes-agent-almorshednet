@@ -29,11 +29,11 @@ from pathlib import Path
 from typing import Any
 
 from gateway.hosted_rooms import (
-    MAX_ACTOR_ID_CHARS,
+    HostedRoomError,
     MAX_ACTIVE_ROOMS,
+    MAX_ACTOR_ID_CHARS,
     MAX_EVENT_JSON_BYTES,
     MAX_ROOM_ID_CHARS,
-    HostedRoomError,
     RoomConflictError,
     _CRITICAL_CONTROL_EVENT_KINDS,
     _assert_event_capacity,
@@ -49,7 +49,6 @@ from gateway.hosted_rooms import (
     _validate_room_name,
     local_authority_gateway_id,
 )
-
 MAX_REPLICA_ROOMS = 256
 MAX_REPLICA_EVENT_BYTES = 256 * 1024 * 1024
 
@@ -301,7 +300,6 @@ def ingest_page(
         "authority": authority,
         "caught_up": new_last >= observed_latest_seq,
     }
-
 
 def replica_state(db_path: Path | str, *, room_id: Any) -> dict[str, Any]:
     """Return the stored replica's coverage and authority lineage."""
@@ -594,7 +592,6 @@ def promote_replica(
         "latest_seq": claim_seq,
     }
 
-
 def validate_demotion_observation(
     *,
     room_id: Any,
@@ -618,7 +615,6 @@ def validate_demotion_observation(
     ):
         raise ReplicaError("observed_epoch must be a positive integer")
     return room_id, observed_gateway_id, observed_epoch
-
 
 def demote_room(
     db_path: Path | str,

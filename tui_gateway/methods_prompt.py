@@ -355,76 +355,74 @@ def _(rid, params: dict) -> dict:
             for field in required_hosted_fields - {"execution_generation"}
         ) or not isinstance(hosted_task.get("execution_generation"), int):
             return _err(rid, 4120, "invalid hosted room turn proof")
-        # Persist the authority identity independently from the bounded display
-        # title. Older Desktop clients can later submit directly into this
-        # session, so the compatibility fence must recover the real room id.
-        session["hosted_room_id"] = hosted_task["room_id"]
     else:
         # Older Desktop builds know the `Group: <room-id>` session title but
         # not the hosted authority marker. Once a gateway owns that room, a
         # direct prompt into its member session would start a second renderer
         # driver. Fence it server-side instead of trusting client awareness.
-        room_id = str(session.get("hosted_room_id") or "").strip()
-        session_key = str(session.get("session_key") or "").strip()
-        if not room_id and session_key:
-            try:
-                with _session_db(session) as db:
-                    if db is not None:
-                        room_id = str(
-                            db.get_session_model_config_value(
-                                session_key, "hosted_room_id", ""
-                            )
-                            or ""
-                        ).strip()
-            except Exception:
-                room_id = ""
         title = str(session.get("title") or "")
-        if room_id or title.startswith("Group: "):
-            try:
-                from gateway.hosted_rooms import (
-                    HostedRoomError,
-                    RoomProbeUnavailableError,
-                    default_db_path,
-                    probe_hosted_room,
-                )
-                from tui_gateway.hosted_room_driver import (
-                    RoomSessionIdentityUnavailableError,
-                    recover_room_id_from_session_title,
-                )
-
-                db_path = default_db_path()
-                if not room_id:
-                    recovered_room_id = recover_room_id_from_session_title(
-                        db_path,
-                        title,
+        if title.startswith("Group: "):
+            room_id = title.removeprefix("Group: ").strip()
+            if room_id:
+                try:
+                    from gateway.hosted_rooms import (
+                        HostedRoomError,
+                        RoomProbeUnavailableError,
+                        default_db_path,
+                        probe_hosted_room,
+                        probe_peer_room_reservation,
                     )
-                    room_id = recovered_room_id or title.removeprefix(
-                        "Group: "
-                    ).strip()
-                hosted = probe_hosted_room(db_path, room_id=room_id)
-            except (RoomProbeUnavailableError, RoomSessionIdentityUnavailableError):
-                return _err(
-                    rid,
-                    5122,
-                    "Could not verify this group. Try again after the gateway recovers.",
-                )
-            except HostedRoomError:
-                # Legacy Desktop sessions used the display name after
-                # "Group: "; those names are not hosted room ids.
-                pass
-            except Exception:
-                return _err(
-                    rid,
-                    5122,
-                    "Could not verify this group. Try again after the gateway recovers.",
-                )
-            else:
-                if hosted:
+
+                    hosted = probe_hosted_room(default_db_path(), room_id=room_id)
+                    peer = False
+                    if not hosted:
+                        from hermes_constants import named_profile_home
+
+                        session_profile_home = named_profile_home(
+                            str(session.get("profile_home") or "")
+                        )
+                        requested_profile = (
+                            (
+                                session_profile_home.name
+                                if session_profile_home is not None
+                                else ""
+                            )
+                            or str(params.get("profile") or "").strip()
+                            or str(_current_profile_name() or "default").strip()
+                        )
+                        peer = probe_peer_room_reservation(
+                            default_db_path(),
+                            room_id=room_id,
+                            target_profile=requested_profile,
+                        )
+                except RoomProbeUnavailableError:
                     return _err(
                         rid,
-                        4122,
-                        "This room is managed by its gateway. Update Hermes Desktop to continue it.",
+                        5122,
+                        "Could not verify this group. Try again after the gateway recovers.",
                     )
+                except HostedRoomError:
+                    # Legacy Desktop sessions used the display name after
+                    # "Group: "; those names are not hosted room ids.
+                    pass
+                except Exception:
+                    return _err(
+                        rid,
+                        5122,
+                        "Could not verify this group. Try again after the gateway recovers.",
+                    )
+                else:
+                    if hosted or peer:
+                        return _err(
+                            rid,
+                            4122,
+                            (
+                                "This room is managed by its gateway. "
+                                if hosted
+                                else "This room is managed by its home host. "
+                            )
+                            + "Update Hermes Desktop to continue it.",
+                        )
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -461,8 +459,6 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
-            if session.get("_hosted_interrupt_claim") is not None:
-                return _err(rid, 4091, "hosted room member session is stopping")
             if session.get("running"):
                 if internal_hosted_submit:
                     return _err(rid, 4091, "hosted room member session is busy")
@@ -499,8 +495,6 @@ def _(rid, params: dict) -> dict:
         else None
     )
     with session["history_lock"]:
-        if session.get("_hosted_interrupt_claim") is not None:
-            return _err(rid, 4091, "hosted room member session is stopping")
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -943,7 +937,17 @@ def _(rid, params: dict) -> dict:
     # Disk-full must fail the RPC (not stream silently): desktop maps the error
     # string to a "disk full" toast so the user knows why the send vanished.
     try:
-        _ensure_session_db_row(session)
+        if _ensure_session_db_row(session) is False:
+            # Store unavailable: failing the RPC is the only user-visible
+            # signal — same principle as the disk-full path above (#98924).
+            # _db_error carries the SessionDB open failure for the toast.
+            return _err(
+                rid,
+                5072,
+                "session storage unavailable: "
+                f"{_db_error or 'state.db could not be opened'} — the message "
+                "was not saved; repair state.db and try again",
+            )
         # A branch becomes real here: copy its parent's transcript into the row so it
         # resumes with full context (the agent won't persist the seed itself).
         _persist_branch_seed(session)
@@ -976,34 +980,13 @@ def _(rid, params: dict) -> dict:
         # only errors when the build itself fails or the bounded cap expires.
         err = _wait_agent_for_prompt(session, rid, sid)
         if err:
-            error_message = (err.get("error") or {}).get(
-                "message", "agent initialization failed"
-            )
-            if hosted_terminal_callback is not None:
-                terminal_receipt_committed = False
-                try:
-                    terminal_receipt, terminal_receipt_committed = (
-                        _persist_hosted_terminal_receipt(
-                            session,
-                            {"status": "failed", "text": "", "error": error_message},
-                        )
-                    )
-                    hosted_terminal_callback(terminal_receipt)
-                except Exception:
-                    logger.exception(
-                        "hosted room agent initialization terminal receipt commit failed"
-                    )
-                finally:
-                    if terminal_receipt_committed:
-                        with session["history_lock"]:
-                            session.pop("_hosted_room_task", None)
             # Terminal frame + retained snapshot (not a bare "error" event +
             # cleared inflight): if the client is disconnected right now, the
             # retained snapshot is the only way resume can show this failure.
             _emit_terminal_turn_error(
                 sid,
                 session,
-                error_message,
+                (err.get("error") or {}).get("message", "agent initialization failed"),
                 # Agent construction never reached the provider: this is a
                 # local-runtime failure (env/config/venv), not an API error.
                 error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
@@ -1721,6 +1704,8 @@ def _(rid, params: dict) -> dict:
     # from _pending) while the card is still visible — common when a WebSocket
     # reconnect during the wait drops tool.complete. A late answer must resolve
     # gracefully instead of hitting the raw 4009 "no pending answer request".
+    if proxied := _respond_compute_host_clarify(rid, params):
+        return proxied
     return _respond(rid, params, "answer", allow_expired=True)
 
 

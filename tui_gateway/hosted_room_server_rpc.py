@@ -15,15 +15,13 @@ from types import ModuleType
 from typing import Any, Callable
 
 from gateway import hosted_room_driver as state
-from tui_gateway.hosted_room_driver import HostedRoomProfileUnavailableError
-from tui_gateway.transport import Transport, bind_transport, reset_transport
+from tui_gateway.transport import bind_transport, reset_transport
 
 
 class _InternalDropTransport:
     """Accept internal frames without publishing private room traffic."""
 
-    def write(self, obj: dict) -> bool:
-        del obj
+    def write(self, _obj: dict) -> bool:
         return True
 
     def close(self) -> None:
@@ -37,34 +35,15 @@ class HostedRoomSessionError(RuntimeError):
         super().__init__(f"{method} failed: {message}")
         self.method = method
         self.code = code
-        self.not_admitted = False
 
 
 class HostedRoomServerRPC:
     """Normalize the installed server handlers for :class:`HostedRoomRuntime`."""
 
-    def __init__(
-        self,
-        server: ModuleType,
-        *,
-        profile_available: Callable[[str], bool] | None = None,
-    ) -> None:
+    def __init__(self, server: ModuleType) -> None:
         self.server = server
-        self.profile_available = profile_available or (lambda _profile: True)
         self._ids = itertools.count(1)
-        self._transport: Transport = _InternalDropTransport()
-
-    def _require_profile_available(self, profile: str) -> None:
-        try:
-            available = self.profile_available(profile)
-        except Exception as exc:
-            raise HostedRoomProfileUnavailableError(
-                "hosted room target profile availability could not be verified"
-            ) from exc
-        if not available:
-            raise HostedRoomProfileUnavailableError(
-                "hosted room target profile is unavailable"
-            )
+        self._transport = _InternalDropTransport()
 
     def _call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         handler = self.server._methods[method]
@@ -88,7 +67,6 @@ class HostedRoomServerRPC:
     def resolve_exact(
         self, *, profile: str, title: str, source: str
     ) -> Mapping[str, Any] | None:
-        self._require_profile_available(profile)
         result = self._call(
             "session.list",
             {
@@ -108,7 +86,6 @@ class HostedRoomServerRPC:
         return {"session_id": session_id, "title": row.get("title") or title}
 
     def create(self, *, profile: str, title: str, source: str) -> Mapping[str, Any]:
-        self._require_profile_available(profile)
         return self._call(
             "session.create",
             {
@@ -125,7 +102,6 @@ class HostedRoomServerRPC:
     def resume(
         self, *, profile: str, session_id: str, source: str
     ) -> Mapping[str, Any]:
-        self._require_profile_available(profile)
         return self._call(
             "session.resume",
             {
@@ -147,7 +123,6 @@ class HostedRoomServerRPC:
         execution_generation: int,
         on_terminal: Callable[[Mapping[str, Any]], None],
     ) -> Mapping[str, Any]:
-        self._require_profile_available(profile)
         try:
             return self._call(
                 "prompt.submit",
@@ -176,7 +151,6 @@ class HostedRoomServerRPC:
     def history(
         self, *, profile: str, session_id: str, source: str
     ) -> Sequence[Mapping[str, Any]]:
-        self._require_profile_available(profile)
         del source
         result = self._call(
             "session.history",
@@ -240,186 +214,6 @@ class HostedRoomServerRPC:
             },
         )
 
-    def _find_admitted_session(
-        self,
-        *,
-        task: state.TaskIdentity,
-        execution_generation: int,
-        source: str,
-    ) -> tuple[str, bool] | None:
-        method = "session.interrupt_admitted"
-        if source != "bot_room":
-            raise HostedRoomSessionError(method, 4000, "source must be bot_room")
-        if (
-            isinstance(execution_generation, bool)
-            or not isinstance(execution_generation, int)
-            or execution_generation <= 0
-        ):
-            raise HostedRoomSessionError(
-                method,
-                4000,
-                "execution_generation must be a positive integer",
-            )
-
-        expected_identity = (
-            task.room_id,
-            task.task_id,
-            task.thread_id,
-            task.turn_id,
-        )
-        matches: list[tuple[str, bool]] = []
-        generation_conflicts: list[str] = []
-        lock_type = type(threading.Lock())
-
-        # Admission proof is process-local. Lock membership first, then each
-        # session record, so deleted profiles and the persisted session index
-        # are not involved in cancellation ownership.
-        with self.server._sessions_lock:
-            candidates = tuple(self.server._sessions.items())
-        for session_id, record in candidates:
-            if not isinstance(record, dict):
-                continue
-            if (
-                record.get("room_plumbing") is not True
-                or record.get("source") != source
-            ):
-                continue
-            lock = record.get("history_lock")
-            if not isinstance(lock, lock_type):
-                raise HostedRoomSessionError(
-                    method,
-                    4090,
-                    "admitted hosted room session has no usable history lock",
-                )
-            with lock:
-                if (
-                    record.get("room_plumbing") is not True
-                    or record.get("source") != source
-                ):
-                    continue
-                proof = record.get("_hosted_room_task")
-                if not isinstance(proof, Mapping):
-                    continue
-                observed_identity = (
-                    proof.get("room_id"),
-                    proof.get("task_id"),
-                    proof.get("thread_id"),
-                    proof.get("turn_id"),
-                )
-                if observed_identity != expected_identity:
-                    continue
-                observed_generation = proof.get("execution_generation")
-                if (
-                    isinstance(observed_generation, bool)
-                    or not isinstance(observed_generation, int)
-                    or observed_generation != execution_generation
-                ):
-                    generation_conflicts.append(str(session_id))
-                    continue
-                matches.append((str(session_id), bool(record.get("running"))))
-
-        if generation_conflicts:
-            raise HostedRoomSessionError(
-                method,
-                4092,
-                "admitted hosted room task has a conflicting execution generation",
-            )
-        if len(matches) > 1:
-            raise HostedRoomSessionError(
-                method,
-                4091,
-                "admitted hosted room task is ambiguous across local sessions",
-            )
-        return matches[0] if matches else None
-
-    def interrupt_admitted(
-        self,
-        *,
-        task: state.TaskIdentity,
-        execution_generation: int,
-        source: str,
-    ) -> Mapping[str, Any]:
-        """Interrupt one exact process-local admission without profile lookup."""
-        match = self._find_admitted_session(
-            task=task,
-            execution_generation=execution_generation,
-            source=source,
-        )
-        if match is None:
-            return {
-                "status": "absent",
-                # Absence is only an observation. The driver combines it with
-                # its process-local submit lifecycle before acknowledging the
-                # durable Stop, so a concurrent admission cannot be cancelled
-                # and then start afterwards.
-                "acknowledged": False,
-                "active": False,
-                "interrupted": False,
-                "session_id": None,
-            }
-
-        session_id, active = match
-        if not active:
-            return {
-                "status": "inactive",
-                "acknowledged": True,
-                "active": False,
-                "interrupted": False,
-                "session_id": session_id,
-            }
-
-        result = self._call(
-            "session.interrupt",
-            {
-                "session_id": session_id,
-                "expected_hosted_task_id": task.task_id,
-                "expected_hosted_execution_generation": execution_generation,
-            },
-        )
-        interrupted = bool(result.get("interrupted")) or (
-            result.get("status") == "interrupted"
-        )
-        if not interrupted:
-            observed = self._find_admitted_session(
-                task=task,
-                execution_generation=execution_generation,
-                source=source,
-            )
-            if observed is None:
-                return {
-                    "status": "absent",
-                    "acknowledged": False,
-                    "active": False,
-                    "interrupted": False,
-                    "session_id": None,
-                }
-            observed_session_id, observed_active = observed
-            if observed_active:
-                # Another exact Stop can own the process-local interrupt claim.
-                # A negative signal result is not proof that the turn stopped.
-                return {
-                    "status": "pending",
-                    "acknowledged": False,
-                    "active": True,
-                    "interrupted": False,
-                    "session_id": observed_session_id,
-                }
-            return {
-                "status": "inactive",
-                "acknowledged": True,
-                "active": False,
-                "interrupted": False,
-                "session_id": observed_session_id,
-            }
-        return {
-            **result,
-            "status": "interrupted",
-            "acknowledged": True,
-            "active": True,
-            "interrupted": True,
-            "session_id": session_id,
-        }
-
     def interrupt(
         self,
         *,
@@ -428,7 +222,6 @@ class HostedRoomServerRPC:
         source: str,
         expected_task_id: str,
     ) -> Mapping[str, Any] | None:
-        self._require_profile_available(profile)
         del source
         return self._call(
             "session.interrupt",

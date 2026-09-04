@@ -296,10 +296,8 @@ class TestNoProgressDeadLoopBreaker:
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
-        with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            SessionDB(db_path=Path(tmpdir) / "t.db") as db,
-        ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
             with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
                 agent = AIAgent(
                     api_key="test-key",

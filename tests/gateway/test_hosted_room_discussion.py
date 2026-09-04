@@ -200,13 +200,15 @@ def test_replay_defers_missing_frozen_member_without_blocking_healthy_members(
     assert missing.task is not None
     assert missing.task.member.profile == "research"
 
-    deferred = discussion.plan_unavailable_member_deferral(
+    deferred = discussion.plan_publication(
         room,
         _events(db),
         missing.task,
+        status="deferred",
+        result={"reason": "member_unavailable"},
+        execution_generation=1,
         local_profiles=remaining_profiles,
     )
-    assert deferred is not None
     assert deferred.terminal_kind == "turn.deferred"
     assert deferred.events[-1].payload["reason"] == "member_unavailable"
     _append_publication(db, deferred)
@@ -219,15 +221,6 @@ def test_replay_defers_missing_frozen_member_without_blocking_healthy_members(
     assert healthy.status == "task"
     assert healthy.task is not None
     assert healthy.task.member.profile == "build"
-    assert (
-        discussion.plan_unavailable_member_deferral(
-            room,
-            _events(db),
-            healthy.task,
-            local_profiles=remaining_profiles,
-        )
-        is None
-    )
 
 
 def test_distinct_threads_are_planned_fifo_without_skipping(room_db):
@@ -281,14 +274,14 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
     assert first == repeated
     assert first.identity.thread_id == "thread-1"
     assert first.payload == {
-        "target_profile": "research",
         "target_member_id": "member-research",
+        "target_profile": "research",
         "prompt": first.payload["prompt"],
         "source_event_seq": user["seq"],
     }
     assert set(first.payload) == {
-        "target_profile",
         "target_member_id",
+        "target_profile",
         "prompt",
         "source_event_seq",
     }
@@ -319,37 +312,6 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
         )
         == first
     )
-
-
-def test_reconstructs_legacy_three_field_task_payload(
-    room_db: tuple[Path, dict],
-):
-    db, room = room_db
-    _append_user(db, event_id="user-1", text="Check the release.")
-    planned = _next_task(room, db)
-    legacy_payload = {
-        "target_profile": planned.payload["target_profile"],
-        "prompt": planned.payload["prompt"],
-        "source_event_seq": planned.payload["source_event_seq"],
-    }
-
-    driver.admit_task(
-        db,
-        planned.identity,
-        payload=legacy_payload,
-        clock=time.time,
-    )
-    stored = driver.get_task(db, planned.identity)
-    reconstructed = discussion.reconstruct_task_plan(
-        room,
-        _events(db),
-        stored,
-        local_profiles=LOCAL_PROFILES,
-    )
-
-    assert stored["payload"] == legacy_payload
-    assert reconstructed == planned
-    assert reconstructed.payload["target_member_id"] == "member-research"
 
 
 @pytest.mark.parametrize(
@@ -454,6 +416,7 @@ def test_failed_members_advance_the_round_as_silence(
         )
         assert publication.terminal_kind == "turn.failed"
         assert len(publication.events) == 1
+        assert publication.events[0].payload["reason_code"] == "unknown"
         _append_publication(db, publication)
 
     decision = discussion.plan_next_task(
@@ -463,6 +426,40 @@ def test_failed_members_advance_the_round_as_silence(
     )
     assert decision.status == "settled"
     assert decision.reason == "silent_round"
+
+
+def test_failed_publication_preserves_a_typed_actionable_reason(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="Please continue.")
+    task = _next_task(room, db)
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        task,
+        status="failed",
+        result={"error": "HTTP 401 authentication failed"},
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert publication.events[0].payload["reason_code"] == "provider_auth_or_access"
+
+
+def test_failed_publication_rejects_an_untrusted_reason_code(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="Please continue.")
+    task = _next_task(room, db)
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        task,
+        status="failed",
+        result={"error": "failed", "reason_code": "invented"},
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert publication.events[0].payload["reason_code"] == "unknown"
 
 
 def test_publication_is_idempotent_and_changed_result_conflicts(
