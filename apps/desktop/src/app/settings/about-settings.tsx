@@ -8,9 +8,9 @@ import { type Translations, useI18n } from '@/i18n'
 import { AlertTriangle, CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
+  $automaticUpdateChecksEnabled,
   $desktopVersion,
   $updateApply,
-  $automaticUpdateChecksEnabled,
   $updateChecking,
   $updateStatus,
   checkUpdates,
