@@ -1,10 +1,9 @@
 """Durable execution state for a same-gateway hosted room driver.
 
 This module owns only the driver lease and task state machine. It does not
-invoke models or touch sessions. Admission reads the co-located hosted-room
-event log so Stop and authority-demotion fences are atomic with task creation.
-Callers provide both the database path and clock so recovery and fencing
-behavior can be tested without process-global state.
+invoke models, touch sessions, or depend on the hosted-room event log. Callers
+provide both the database path and clock so recovery and fencing behavior can
+be tested without process-global state.
 """
 
 from __future__ import annotations
@@ -63,8 +62,11 @@ _TASK_REQUIRED_PAYLOAD_FIELDS = frozenset({
     "prompt",
     "source_event_seq",
 })
+
 _TASK_OPTIONAL_PAYLOAD_FIELDS = frozenset({"target_member_id"})
+
 _TASK_PAYLOAD_FIELDS = _TASK_REQUIRED_PAYLOAD_FIELDS | _TASK_OPTIONAL_PAYLOAD_FIELDS
+
 _LEASE_COLUMNS = frozenset({
     "room_id",
     "gateway_id",
@@ -78,6 +80,7 @@ _LEASE_COLUMNS = frozenset({
     "updated_at",
     "released_at",
 })
+
 _TASK_COLUMNS = frozenset({
     "room_id",
     "task_id",
@@ -104,6 +107,7 @@ _TASK_COLUMNS = frozenset({
     "terminal_at",
     "indeterminate_at",
 })
+
 _TASK_COLUMN_ORDER = (
     "room_id",
     "task_id",
@@ -130,10 +134,15 @@ _TASK_COLUMN_ORDER = (
     "terminal_at",
     "indeterminate_at",
 )
+
 _OWNER_LEASE_COLUMNS = frozenset({"process_pid", "process_start_time"})
+
 _OWNER_TASK_COLUMNS = frozenset({"run_process_pid", "run_process_start_time"})
+
 _LEGACY_LEASE_COLUMNS = _LEASE_COLUMNS - _OWNER_LEASE_COLUMNS
+
 _LEGACY_TASK_COLUMNS = _TASK_COLUMNS - _OWNER_TASK_COLUMNS
+
 _TERMINAL_RECEIPT_COLUMNS = frozenset({
     "room_id",
     "task_id",
@@ -178,6 +187,8 @@ _APPROVAL_REQUEST_COLUMN_ORDER = (
     "updated_at",
     "consumed_at",
 )
+
+
 _ADMISSION_BARRIER_COLUMNS = frozenset({
     "room_id",
     "gateway_id",
@@ -185,7 +196,9 @@ _ADMISSION_BARRIER_COLUMNS = frozenset({
     "reason",
     "created_at",
 })
+
 _ADMISSION_BARRIER_PRIMARY_KEY = ("room_id", "gateway_id", "authority_epoch")
+
 _DEMOTION_INTENT_COLUMNS = frozenset({
     "room_id",
     "gateway_id",
@@ -195,10 +208,12 @@ _DEMOTION_INTENT_COLUMNS = frozenset({
     "cancel_id",
     "created_at",
 })
-_DEMOTION_INTENT_PRIMARY_KEY = ("room_id", "gateway_id", "authority_epoch")
-_STARTUP_AUDIT_LOCK = threading.Lock()
-_STARTUP_AUDITED_SCHEMAS: set[tuple[int, str, int, int, int]] = set()
 
+_DEMOTION_INTENT_PRIMARY_KEY = ("room_id", "gateway_id", "authority_epoch")
+
+_STARTUP_AUDIT_LOCK = threading.Lock()
+
+_STARTUP_AUDITED_SCHEMAS: set[tuple[int, str, int, int, int]] = set()
 
 class DriverStateError(ValueError):
     """Base class for invalid or conflicting driver-state operations."""
@@ -226,7 +241,6 @@ class TaskConflictError(DriverStateError):
 
 class TaskAdmissionBlockedError(DriverStateError):
     """Raised when a durable Stop or authority fence rejects a new task."""
-
 
 class StaleTaskError(DriverStateError):
     """Raised when an obsolete task attempt or cancellation tries to commit."""
@@ -308,7 +322,6 @@ def _optional_process_integer(value: Any, *, label: str) -> int | None:
         raise DriverValidationError(f"{label} must be a positive integer or null")
     return value
 
-
 def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
     if not isinstance(value, dict):
         raise DriverValidationError("payload must be an object")
@@ -360,7 +373,6 @@ def _task_payload(value: Any) -> tuple[dict[str, Any], str, str]:
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return normalized, encoded, digest
 
-
 @dataclass(frozen=True)
 class TaskIdentity:
     """Stable identity for one admitted room turn."""
@@ -392,7 +404,6 @@ class DriverLease:
     reclaimed: bool = False
     process_pid: int | None = None
     process_start_time: int | None = None
-
 
 @dataclass(frozen=True)
 class TaskAttempt:
@@ -452,7 +463,6 @@ def _create_task_table(
         )"""
     )
 
-
 def _create_terminal_receipt_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_terminal_receipts (
@@ -511,7 +521,6 @@ def _create_admission_barrier_table(conn: sqlite3.Connection) -> None:
         )"""
     )
 
-
 def _create_demotion_intent_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_driver_demotion_intents (
@@ -532,7 +541,6 @@ def _create_demotion_intent_table(conn: sqlite3.Connection) -> None:
         )"""
     )
 
-
 def _demotion_intent_table_exists(conn: sqlite3.Connection) -> bool:
     return (
         conn.execute(
@@ -542,7 +550,6 @@ def _demotion_intent_table_exists(conn: sqlite3.Connection) -> bool:
         ).fetchone()
         is not None
     )
-
 
 def _raise_if_legacy_demotion_barrier_is_unrecoverable(
     conn: sqlite3.Connection,
@@ -565,7 +572,6 @@ def _raise_if_legacy_demotion_barrier_is_unrecoverable(
             "restore the pre-update state snapshot or recreate the unpublished "
             "driver tables"
         )
-
 
 def _raise_if_pending_demotion_intent_lacks_stop(
     conn: sqlite3.Connection,
@@ -615,7 +621,6 @@ def _raise_if_pending_demotion_intent_lacks_stop(
                 "unpublished driver tables"
             )
 
-
 def _raise_if_terminal_recovery_headroom_is_unrecoverable(
     conn: sqlite3.Connection,
 ) -> None:
@@ -632,7 +637,6 @@ def _raise_if_terminal_recovery_headroom_is_unrecoverable(
                 "headroom; restore the pre-update state snapshot or drain the "
                 "unpublished driver state before starting this version"
             ) from exc
-
 
 def _audit_terminal_recovery_headroom_once(
     conn: sqlite3.Connection,
@@ -655,7 +659,6 @@ def _audit_terminal_recovery_headroom_once(
             return
         _raise_if_terminal_recovery_headroom_is_unrecoverable(conn)
         _STARTUP_AUDITED_SCHEMAS.add(key)
-
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -690,7 +693,6 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
                room_id, status, source_event_seq, created_at, task_id
            )"""
     )
-
 
 def _validate_schema(conn: sqlite3.Connection) -> None:
     lease_columns = frozenset(
@@ -800,7 +802,6 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
             "hosted_room_driver_demotion_intents is missing its barrier foreign key"
         )
 
-
 def _schema_objects_exist(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         """SELECT name FROM sqlite_master
@@ -858,7 +859,6 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     _raise_if_pending_demotion_intent_lacks_stop(conn)
     return True
 
-
 def _migrate_owner_identity_columns(conn: sqlite3.Connection) -> None:
     """Add nullable process-identity fences to the unpublished driver schema."""
 
@@ -897,7 +897,6 @@ def _migrate_owner_identity_columns(conn: sqlite3.Connection) -> None:
             "INTEGER CHECK (run_process_start_time IS NULL OR "
             "run_process_start_time >= 1)"
         )
-
 
 def _migrate_task_status_constraint(conn: sqlite3.Connection) -> None:
     """Expand the unpublished task-state CHECK without losing durable work."""
@@ -999,7 +998,6 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
         raise
     return conn
 
-
 @contextmanager
 def _transaction(db_path: Path | str) -> Iterator[sqlite3.Connection]:
     conn = _connect(db_path)
@@ -1034,7 +1032,6 @@ def _lease_from_row(
         ),
         reclaimed=reclaimed,
     )
-
 
 def _task_identity_from_row(row: sqlite3.Row) -> TaskIdentity:
     return TaskIdentity(
@@ -1101,7 +1098,6 @@ def _task_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, A
         ),
         "idempotent": idempotent,
     }
-
 
 def _load_task(conn: sqlite3.Connection, identity: TaskIdentity) -> sqlite3.Row:
     row = conn.execute(
@@ -1312,7 +1308,6 @@ def acquire_lease(
         ).fetchone()
         return _lease_from_row(current, reclaimed=True)
 
-
 def renew_lease(
     db_path: Path | str,
     lease: DriverLease,
@@ -1347,7 +1342,6 @@ def renew_lease(
         current = dict(current)
         current["expires_at"] = expires_at
         return _lease_from_row(current)
-
 
 def release_lease(
     db_path: Path | str,
@@ -1434,7 +1428,6 @@ def _ensure_admission_barrier(
         "idempotent": False,
     }
 
-
 def block_room_admissions(
     db_path: Path | str,
     *,
@@ -1466,7 +1459,6 @@ def block_room_admissions(
             authority_epoch=authority_epoch,
             created_at=now,
         )
-
 
 def begin_room_demotion(
     db_path: Path | str,
@@ -1576,7 +1568,6 @@ def begin_room_demotion(
             "idempotent": False,
         }
 
-
 def pending_room_demotion(
     db_path: Path | str,
     *,
@@ -1601,7 +1592,6 @@ def pending_room_demotion(
     finally:
         conn.close()
     return dict(row) if row is not None else None
-
 
 def _raise_if_task_fenced(
     conn: sqlite3.Connection,
@@ -1633,7 +1623,6 @@ def _raise_if_task_fenced(
             "task source event is behind the current Stop fence"
         )
 
-
 def _stop_fenced_inactive_rows(
     conn: sqlite3.Connection,
     *,
@@ -1661,8 +1650,6 @@ def _stop_fenced_inactive_rows(
         (room_id, int(stop["seq"])),
     ).fetchall()
     return cancel_id, rows
-
-
 def reconcile_stop_fenced_inactive_tasks(
     db_path: Path | str,
     *,
@@ -1702,7 +1689,6 @@ def reconcile_stop_fenced_inactive_tasks(
                 "stop-fenced inactive tasks changed during reconciliation"
             )
         return [_task_identity_from_row(row) for row in rows]
-
 
 def admit_task(
     db_path: Path | str,
@@ -1794,7 +1780,6 @@ def admit_task(
         row = _load_task(conn, identity)
         return _task_from_row(row)
 
-
 def start_task(
     db_path: Path | str,
     identity: TaskIdentity,
@@ -1878,7 +1863,6 @@ def start_task(
             cancel_generation=expected_cancel_generation,
         )
 
-
 def settle_task(
     db_path: Path | str,
     attempt: TaskAttempt,
@@ -1944,62 +1928,6 @@ def settle_task(
         )
         if updated.rowcount != 1:
             raise StaleTaskError("task changed during settlement")
-        return _task_from_row(_load_task(conn, attempt.identity))
-
-
-def defer_running_task(
-    db_path: Path | str,
-    attempt: TaskAttempt,
-    *,
-    reason: Any,
-    clock: Clock,
-) -> dict[str, Any]:
-    """Fence a running attempt that cannot safely reach its target profile."""
-
-    reason = _identifier(reason, label="defer_reason")
-    result_json = _canonical_json({"reason": reason, "retryable": True})
-    now = _timestamp(clock)
-    with _transaction(db_path) as conn:
-        _require_active_lease(conn, attempt.lease, now=now)
-        row = _load_task(conn, attempt.identity)
-        exact_attempt = (
-            int(row["execution_generation"]) == attempt.execution_generation
-            and int(row["cancel_generation"]) == attempt.cancel_generation
-            and row["run_gateway_id"] == attempt.lease.gateway_id
-            and row["run_process_generation"] == attempt.lease.process_generation
-            and int(row["run_lease_generation"] or 0)
-            == attempt.lease.lease_generation
-        )
-        if (
-            row["status"] == "deferred"
-            and exact_attempt
-            and row["result_json"] == result_json
-        ):
-            return _task_from_row(row, idempotent=True)
-        if row["status"] != "running" or not exact_attempt:
-            raise StaleTaskError("task attempt is stale or cancelled")
-        updated = conn.execute(
-            """UPDATE hosted_room_driver_tasks
-               SET status='deferred', result_json=?, terminal_at=?, updated_at=?
-               WHERE room_id=? AND task_id=? AND status='running'
-                 AND execution_generation=? AND cancel_generation=?
-                 AND run_gateway_id=? AND run_process_generation=?
-                 AND run_lease_generation=?""",
-            (
-                result_json,
-                now,
-                now,
-                attempt.identity.room_id,
-                attempt.identity.task_id,
-                attempt.execution_generation,
-                attempt.cancel_generation,
-                attempt.lease.gateway_id,
-                attempt.lease.process_generation,
-                attempt.lease.lease_generation,
-            ),
-        )
-        if updated.rowcount != 1:
-            raise StaleTaskError("task changed during deferral")
         return _task_from_row(_load_task(conn, attempt.identity))
 
 
@@ -2132,6 +2060,66 @@ def resolve_indeterminate_task(
         return _task_from_row(_load_task(conn, identity))
 
 
+def resolve_indeterminate_cancellation(
+    db_path: Path | str,
+    identity: TaskIdentity,
+    lease: DriverLease,
+    *,
+    expected_execution_generation: int,
+    expected_cancel_generation: int,
+    cancel_id: Any,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Commit a verified terminal cancellation for an uncertain attempt."""
+    if lease.room_id != identity.room_id:
+        raise DriverValidationError("lease and task belong to different rooms")
+    if (
+        not isinstance(expected_execution_generation, int)
+        or expected_execution_generation < 1
+    ):
+        raise DriverValidationError(
+            "expected_execution_generation must be a positive integer"
+        )
+    if (
+        not isinstance(expected_cancel_generation, int)
+        or expected_cancel_generation < 0
+    ):
+        raise DriverValidationError("expected_cancel_generation must be non-negative")
+    cancel_id = _identifier(cancel_id, label="cancel_id")
+    now = _timestamp(clock)
+    with _transaction(db_path) as conn:
+        _require_active_lease(conn, lease, now=now)
+        row = _load_task(conn, identity)
+        if row["status"] == "cancelled" and row["cancel_id"] == cancel_id:
+            return _task_from_row(row, idempotent=True)
+        if (
+            row["status"] != "indeterminate"
+            or int(row["execution_generation"]) != expected_execution_generation
+            or int(row["cancel_generation"]) != expected_cancel_generation
+        ):
+            raise StaleTaskError("indeterminate cancellation proof is stale")
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='cancelled', cancel_generation=?, cancel_id=?,
+                   terminal_at=?, updated_at=?
+               WHERE room_id=? AND task_id=? AND status='indeterminate'
+                 AND execution_generation=? AND cancel_generation=?""",
+            (
+                expected_cancel_generation + 1,
+                cancel_id,
+                now,
+                now,
+                identity.room_id,
+                identity.task_id,
+                expected_execution_generation,
+                expected_cancel_generation,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StaleTaskError("indeterminate cancellation proof lost its fence")
+        return _task_from_row(_load_task(conn, identity))
+
+
 def requeue_indeterminate_task(
     db_path: Path | str,
     identity: TaskIdentity,
@@ -2190,7 +2178,6 @@ def requeue_indeterminate_task(
         if updated.rowcount != 1:
             raise StaleTaskError("indeterminate task changed during requeue")
         return _task_from_row(_load_task(conn, identity))
-
 
 def defer_indeterminate_task(
     db_path: Path | str,
@@ -2343,6 +2330,63 @@ def requeue_deferred_task(
             raise StaleTaskError("deferred task changed during requeue")
         return _task_from_row(_load_task(conn, identity))
 
+def requeue_not_admitted_task(
+    db_path: Path | str,
+    attempt: TaskAttempt,
+    *,
+    clock: Clock,
+) -> dict[str, Any]:
+    """Return a running task to its durable queue after proven non-admission."""
+    now = _timestamp(clock)
+    lease = attempt.lease
+    identity = attempt.identity
+    if lease.room_id != identity.room_id:
+        raise DriverValidationError("lease and task belong to different rooms")
+    with _transaction(db_path) as conn:
+        _require_active_lease(conn, lease, now=now)
+        row = _load_task(conn, identity)
+        if (
+            row["status"] == "queued"
+            and int(row["execution_generation"]) == attempt.execution_generation
+            and int(row["cancel_generation"]) == attempt.cancel_generation
+            and row["run_gateway_id"] is None
+            and row["run_process_generation"] is None
+            and row["run_lease_generation"] is None
+        ):
+            return _task_from_row(row, idempotent=True)
+        if (
+            row["status"] != "running"
+            or int(row["execution_generation"]) != attempt.execution_generation
+            or int(row["cancel_generation"]) != attempt.cancel_generation
+            or row["run_gateway_id"] != lease.gateway_id
+            or row["run_process_generation"] != lease.process_generation
+            or int(row["run_lease_generation"] or 0) != lease.lease_generation
+        ):
+            raise StaleTaskError("not-admitted task attempt lost its fence")
+        updated = conn.execute(
+            """UPDATE hosted_room_driver_tasks
+               SET status='queued', run_gateway_id=NULL,
+                   run_process_generation=NULL, run_lease_generation=NULL,
+                   started_at=NULL, updated_at=?
+               WHERE room_id=? AND task_id=? AND status='running'
+                 AND execution_generation=? AND cancel_generation=?
+                 AND run_gateway_id=? AND run_process_generation=?
+                 AND run_lease_generation=?""",
+            (
+                now,
+                identity.room_id,
+                identity.task_id,
+                attempt.execution_generation,
+                attempt.cancel_generation,
+                lease.gateway_id,
+                lease.process_generation,
+                lease.lease_generation,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StaleTaskError("not-admitted task changed during requeue")
+        return _task_from_row(_load_task(conn, identity))
+
 
 def cancel_task(
     db_path: Path | str,
@@ -2448,30 +2492,12 @@ def begin_task_cancel(
 def complete_task_cancel(
     db_path: Path | str,
     identity: TaskIdentity,
-    lease: DriverLease,
     *,
     cancel_id: Any,
-    expected_execution_generation: int,
     expected_cancel_generation: int,
     clock: Clock,
 ) -> dict[str, Any]:
-    """Commit acknowledged cancellation under the exact current owner lease."""
-    if lease.room_id != identity.room_id:
-        raise DriverValidationError("lease and task belong to different rooms")
-    if (
-        not isinstance(expected_execution_generation, int)
-        or expected_execution_generation < 1
-    ):
-        raise DriverValidationError(
-            "expected_execution_generation must be a positive integer"
-        )
-    if (
-        not isinstance(expected_cancel_generation, int)
-        or expected_cancel_generation < 1
-    ):
-        raise DriverValidationError(
-            "expected_cancel_generation must be a positive integer"
-        )
+    """Commit cancellation only after the transport acknowledges exact Stop."""
     cancel_id = _identifier(cancel_id, label="cancel_id")
     now = _timestamp(clock)
     with _transaction(db_path) as conn:
@@ -2481,180 +2507,25 @@ def complete_task_cancel(
         if (
             row["status"] != "stopping"
             or row["cancel_id"] != cancel_id
-            or int(row["execution_generation"]) != expected_execution_generation
             or int(row["cancel_generation"]) != expected_cancel_generation
         ):
             raise StaleTaskError("task stop acknowledgement is stale")
-        _require_active_lease(conn, lease, now=now)
-        if (
-            row["run_gateway_id"] != lease.gateway_id
-            or row["run_process_generation"] != lease.process_generation
-            or row["run_process_pid"] != lease.process_pid
-            or row["run_process_start_time"] != lease.process_start_time
-            or int(row["run_lease_generation"] or 0) != lease.lease_generation
-        ):
-            raise StaleTaskError("task Stop is owned by another driver generation")
-        receipt = conn.execute(
-            """SELECT 1 FROM hosted_room_terminal_receipts
-               WHERE room_id=? AND task_id=? AND execution_generation=?""",
-            (identity.room_id, identity.task_id, int(row["execution_generation"])),
-        ).fetchone()
-        if receipt is not None:
-            raise TaskConflictError(
-                "task has a durable terminal receipt that must settle before cancellation"
-            )
         updated = conn.execute(
             """UPDATE hosted_room_driver_tasks
                SET status='cancelled', terminal_at=?, updated_at=?
                WHERE room_id=? AND task_id=? AND status='stopping'
-                  AND cancel_id=? AND execution_generation=?
-                  AND cancel_generation=? AND run_gateway_id=?
-                  AND run_process_generation=? AND run_process_pid IS ?
-                  AND run_process_start_time IS ? AND run_lease_generation=?""",
+                 AND cancel_id=? AND cancel_generation=?""",
             (
                 now,
                 now,
                 identity.room_id,
                 identity.task_id,
                 cancel_id,
-                expected_execution_generation,
                 expected_cancel_generation,
-                lease.gateway_id,
-                lease.process_generation,
-                lease.process_pid,
-                lease.process_start_time,
-                lease.lease_generation,
             ),
         )
         if updated.rowcount != 1:
             raise StaleTaskError("task changed during stop acknowledgement")
-        return _task_from_row(_load_task(conn, identity))
-
-
-def claim_stopping_task(
-    db_path: Path | str,
-    identity: TaskIdentity,
-    lease: DriverLease,
-    *,
-    expected_execution_generation: int,
-    expected_cancel_generation: int,
-    owner_liveness: OwnerLiveness,
-    clock: Clock,
-) -> dict[str, Any]:
-    """Fence a Stop to a successor only after process ownership is safe.
-
-    A newer lease proves the prior writer is fenced from durable state, but it
-    does not prove that the prior process stopped executing external work. A
-    successor may claim only when it is another runtime in the same exact
-    process incarnation, or when the recorded owner is confirmed dead.
-    """
-
-    if lease.room_id != identity.room_id:
-        raise DriverValidationError("lease and task belong to different rooms")
-    if (
-        not isinstance(expected_execution_generation, int)
-        or expected_execution_generation < 1
-    ):
-        raise DriverValidationError(
-            "expected_execution_generation must be a positive integer"
-        )
-    if (
-        not isinstance(expected_cancel_generation, int)
-        or expected_cancel_generation < 1
-    ):
-        raise DriverValidationError(
-            "expected_cancel_generation must be a positive integer"
-        )
-    if not callable(owner_liveness):
-        raise DriverValidationError("owner_liveness must be callable")
-    now = _timestamp(clock)
-    with _transaction(db_path) as conn:
-        _require_active_lease(conn, lease, now=now)
-        row = _load_task(conn, identity)
-        if (
-            row["status"] != "stopping"
-            or int(row["execution_generation"]) != expected_execution_generation
-            or int(row["cancel_generation"]) != expected_cancel_generation
-        ):
-            raise StaleTaskError("stopping task generation changed")
-        if (
-            row["run_gateway_id"] == lease.gateway_id
-            and row["run_process_generation"] == lease.process_generation
-            and row["run_process_pid"] == lease.process_pid
-            and row["run_process_start_time"] == lease.process_start_time
-            and int(row["run_lease_generation"] or 0) == lease.lease_generation
-        ):
-            return _task_from_row(row, idempotent=True)
-
-        prior_lease_generation = int(row["run_lease_generation"] or 0)
-        if (
-            row["run_gateway_id"] != lease.gateway_id
-            or not row["run_process_generation"]
-            or row["run_process_pid"] is None
-            or row["run_process_start_time"] is None
-            or lease.process_pid is None
-            or lease.process_start_time is None
-            or prior_lease_generation < 1
-            or lease.lease_generation <= prior_lease_generation
-        ):
-            raise InvalidTaskTransitionError(
-                "stopping task owner is still active or cannot be reclaimed"
-            )
-        receipt = conn.execute(
-            """SELECT 1 FROM hosted_room_terminal_receipts
-               WHERE room_id=? AND task_id=? AND execution_generation=?""",
-            (identity.room_id, identity.task_id, expected_execution_generation),
-        ).fetchone()
-        if receipt is not None:
-            raise TaskConflictError(
-                "task has a durable terminal receipt that must settle before reclaim"
-            )
-        same_process = (
-            int(row["run_process_pid"]) == lease.process_pid
-            and int(row["run_process_start_time"]) == lease.process_start_time
-        )
-        if not same_process:
-            try:
-                owner_state = owner_liveness(
-                    int(row["run_process_pid"]),
-                    int(row["run_process_start_time"]),
-                )
-            except Exception:
-                owner_state = "unknown"
-            if owner_state not in {"alive", "dead", "unknown"}:
-                owner_state = "unknown"
-            if owner_state != "dead":
-                raise LeaseHeldError(
-                    f"stopping task owner process is {owner_state}; reclaim denied"
-                )
-        updated = conn.execute(
-            """UPDATE hosted_room_driver_tasks
-               SET run_process_generation=?, run_process_pid=?,
-                   run_process_start_time=?, run_lease_generation=?, updated_at=?
-               WHERE room_id=? AND task_id=? AND status='stopping'
-                 AND execution_generation=? AND cancel_generation=?
-                 AND run_gateway_id=? AND run_process_generation=?
-                 AND run_process_pid=? AND run_process_start_time=?
-                 AND run_lease_generation=?""",
-            (
-                lease.process_generation,
-                lease.process_pid,
-                lease.process_start_time,
-                lease.lease_generation,
-                now,
-                identity.room_id,
-                identity.task_id,
-                expected_execution_generation,
-                expected_cancel_generation,
-                row["run_gateway_id"],
-                row["run_process_generation"],
-                row["run_process_pid"],
-                row["run_process_start_time"],
-                prior_lease_generation,
-            ),
-        )
-        if updated.rowcount != 1:
-            raise StaleTaskError("stopping task owner changed during reclaim")
         return _task_from_row(_load_task(conn, identity))
 
 
@@ -2946,169 +2817,6 @@ def publish_approval_request(
     }
 
 
-def migrate_legacy_approval_request_member(
-    db_path: Path | str,
-    identity: TaskIdentity,
-    *,
-    execution_generation: int,
-    legacy_member_id: Any,
-    member_id: Any,
-    request_id: Any,
-    session_id: Any,
-    action: Any,
-    clock: Clock,
-) -> bool:
-    """Move one pending legacy approval to its frozen roster member identity."""
-
-    legacy_member_id = _identifier(legacy_member_id, label="legacy_member_id")
-    member_id = _identifier(member_id, label="member_id")
-    request_id = _identifier(request_id, label="request_id")
-    session_id = _identifier(session_id, label="session_id")
-    if (
-        isinstance(execution_generation, bool)
-        or not isinstance(execution_generation, int)
-        or execution_generation < 1
-    ):
-        raise DriverValidationError(
-            "execution_generation must be a positive integer"
-        )
-    if legacy_member_id == member_id:
-        return False
-    action_json = _canonical_json(action)
-    now = _timestamp(clock)
-    with _transaction(db_path) as conn:
-        task = _load_task(conn, identity)
-        if int(task["execution_generation"]) != execution_generation:
-            raise StaleTaskError("approval request belongs to a stale task generation")
-        if task["status"] != "running":
-            raise InvalidTaskTransitionError(
-                "approval request migration requires a running task generation"
-            )
-        legacy = conn.execute(
-            """SELECT * FROM hosted_room_approval_requests
-               WHERE room_id=? AND task_id=? AND execution_generation=?
-                 AND member_id=? AND request_id=? AND consumed_at IS NULL""",
-            (
-                identity.room_id,
-                identity.task_id,
-                execution_generation,
-                legacy_member_id,
-                request_id,
-            ),
-        ).fetchone()
-        if legacy is None:
-            return False
-        if legacy["session_id"] != session_id:
-            raise TaskConflictError(
-                "legacy approval request has a different session"
-            )
-        try:
-            legacy_action = json.loads(legacy["action_json"])
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise TaskConflictError(
-                "legacy approval request has invalid durable content"
-            ) from exc
-        if (
-            not isinstance(legacy_action, dict)
-            or legacy_action.get("member_id") != legacy_member_id
-        ):
-            raise TaskConflictError(
-                "legacy approval request does not match its member identity"
-            )
-        legacy_action["member_id"] = member_id
-        if _canonical_json(legacy_action) != action_json:
-            raise TaskConflictError(
-                "legacy approval request has different content"
-            )
-
-        current = conn.execute(
-            """SELECT * FROM hosted_room_approval_requests
-               WHERE room_id=? AND task_id=? AND execution_generation=?
-                 AND member_id=? AND request_id=?""",
-            (
-                identity.room_id,
-                identity.task_id,
-                execution_generation,
-                member_id,
-                request_id,
-            ),
-        ).fetchone()
-        if current is None:
-            updated = conn.execute(
-                """UPDATE hosted_room_approval_requests
-                   SET member_id=?, action_json=?, updated_at=?
-                   WHERE room_id=? AND task_id=? AND execution_generation=?
-                     AND member_id=? AND request_id=? AND consumed_at IS NULL""",
-                (
-                    member_id,
-                    action_json,
-                    now,
-                    identity.room_id,
-                    identity.task_id,
-                    execution_generation,
-                    legacy_member_id,
-                    request_id,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise StaleTaskError(
-                    "legacy approval request changed during migration"
-                )
-            return True
-
-        if (
-            current["session_id"] != session_id
-            or current["action_json"] != action_json
-        ):
-            raise TaskConflictError(
-                "corrected approval request already has different content"
-            )
-        legacy_choice = legacy["choice"]
-        current_choice = current["choice"]
-        if (
-            legacy_choice is not None
-            and current_choice is not None
-            and legacy_choice != current_choice
-        ):
-            raise TaskConflictError(
-                "legacy and corrected approval requests have conflicting choices"
-            )
-        merged_choice = current_choice or legacy_choice
-        conn.execute(
-            """UPDATE hosted_room_approval_requests
-               SET choice=?, created_at=?, updated_at=?
-               WHERE room_id=? AND task_id=? AND execution_generation=?
-                 AND member_id=? AND request_id=?""",
-            (
-                merged_choice,
-                min(float(legacy["created_at"]), float(current["created_at"])),
-                max(now, float(legacy["updated_at"]), float(current["updated_at"])),
-                identity.room_id,
-                identity.task_id,
-                execution_generation,
-                member_id,
-                request_id,
-            ),
-        )
-        removed = conn.execute(
-            """DELETE FROM hosted_room_approval_requests
-               WHERE room_id=? AND task_id=? AND execution_generation=?
-                 AND member_id=? AND request_id=? AND consumed_at IS NULL""",
-            (
-                identity.room_id,
-                identity.task_id,
-                execution_generation,
-                legacy_member_id,
-                request_id,
-            ),
-        )
-        if removed.rowcount != 1:
-            raise StaleTaskError(
-                "legacy approval request changed during retirement"
-            )
-    return True
-
-
 def decide_approval_request(
     db_path: Path | str,
     identity: TaskIdentity,
@@ -3358,55 +3066,3 @@ def prune_published_terminal_tasks(
             (room_id, *candidates),
         )
         return max(0, int(deleted.rowcount))
-
-
-def prune_closed_published_deferred_tasks(
-    db_path: Path | str,
-    *,
-    room_id: Any,
-) -> int:
-    """Drop published deferrals after room.activity makes retry impossible."""
-
-    room_id = _identifier(room_id, label="room_id")
-    with _transaction(db_path) as conn:
-        _load_active_room(conn, room_id)
-        _, published_deferred = hosted_rooms._published_terminal_task_outcomes(conn)
-        completed = hosted_rooms._discussion_source_state(conn)[2]
-        candidates: list[tuple[str, int]] = []
-        for row in conn.execute(
-            """SELECT task.task_id, task.thread_id, task.execution_generation,
-                      source.event_id AS source_event_id
-                 FROM hosted_room_driver_tasks AS task
-                 LEFT JOIN hosted_room_events AS source
-                   ON source.room_id=task.room_id
-                  AND source.seq=task.source_event_seq
-                WHERE task.room_id=? AND task.status='deferred'
-                ORDER BY task.source_event_seq, task.created_at, task.task_id
-                LIMIT ?""",
-            (room_id, MAX_TASK_PRUNE_BATCH),
-        ).fetchall():
-            task_id = str(row["task_id"])
-            generation = int(row["execution_generation"])
-            source_event_id = row["source_event_id"]
-            if (
-                (room_id, task_id, generation) in published_deferred
-                and source_event_id is not None
-                and (
-                    room_id,
-                    str(source_event_id),
-                    str(row["thread_id"]),
-                )
-                in completed
-            ):
-                candidates.append((task_id, generation))
-
-        deleted = 0
-        for task_id, generation in candidates:
-            result = conn.execute(
-                """DELETE FROM hosted_room_driver_tasks
-                   WHERE room_id=? AND task_id=? AND status='deferred'
-                     AND execution_generation=?""",
-                (room_id, task_id, generation),
-            )
-            deleted += max(0, int(result.rowcount))
-        return deleted

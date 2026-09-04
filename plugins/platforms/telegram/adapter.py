@@ -242,6 +242,7 @@ from plugins.platforms.telegram.telegram_network import (
     TelegramFallbackTransport,
     discover_fallback_ips,
     parse_fallback_ip_env,
+    tcp_keepalive_socket_options,
 )
 from utils import atomic_replace, env_float, env_int
 
@@ -2469,13 +2470,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return False
 
-    async def _drain_polling_connections(self) -> bool:
+    async def _drain_polling_connections(self) -> None:
         """Reset the httpx connection pool used for getUpdates polling.
-
-        Returns ``False`` when Hermes abandons ``shutdown()`` at its bounded
-        deadline. The old shutdown task may still be running in that case, so
-        callers must quarantine this request and rebuild the adapter instead of
-        re-initializing or reconnecting with it.
 
         Network errors (especially through proxies like sing-box) can leave
         httpx connections in a half-closed state that still occupy pool slots.
@@ -2492,38 +2488,37 @@ class TelegramAdapter(BasePlatformAdapter):
         accessor for the polling request; review if upgrading to PTB 23+.
         """
         if not (self._app and self._app.bot):
-            return True
+            return
         try:
             # PTB 22.x: _request is a (get_updates, general) tuple;
             # no public accessor exists for the polling request.
             polling_req = self._app.bot._request[0]  # noqa: SLF001
         except Exception:
-            return True
+            return
+        shutdown_ok = False
         try:
             # Bounded: a wedged CLOSE-WAIT socket can make this close hang
             # forever and freeze the reconnect ladder (#66377). The wall-clock
-            # primitive — not asyncio.wait_for — abandons cancellation-resistant
-            # httpcore cleanup (#58236/#63309). Keep its structured outcome so
-            # our own abandonment is distinguishable from a shutdown coroutine
-            # that completed by raising TimeoutError or another exception.
-            shutdown_result = await run_bounded_async(
-                polling_req.shutdown(),
-                _DRAIN_TIMEOUT,
-                label="telegram-polling-shutdown",
+            # deadline helper — not asyncio.wait_for — because httpcore's pool
+            # close runs under AsyncShieldCancellation and a cancellation-
+            # resistant close wedges wait_for itself forever (#58236/#63309);
+            # same primitive as the general-pool drain (#98094).
+            await _await_with_thread_deadline(
+                polling_req.shutdown(), timeout=_DRAIN_TIMEOUT
             )
-            if shutdown_result.timed_out:
-                logger.error(
-                    "[%s] Polling request shutdown exceeded the Hermes drain "
-                    "deadline; quarantining it before reconnect",
-                    self.name,
-                )
-                return False
+            shutdown_ok = True
         except Exception:
             logger.debug(
-                "[%s] Polling request shutdown completed with an error "
-                "(non-fatal)",
+                "[%s] Polling request shutdown failed/timed out (non-fatal)",
                 self.name, exc_info=True,
             )
+        if not shutdown_ok:
+            # HTTPXRequest.initialize() rebuilds the client only when
+            # ``client.is_closed``. An abandoned aclose() leaves that flag
+            # false, so initialize() is a no-op and start_polling reuses the
+            # CLOSE-WAIT getUpdates socket — the gateway stays alive but
+            # deaf (#87057). Swap in a fresh client before initialize().
+            self._orphan_and_rebuild_polling_client(polling_req)
         try:
             await _await_with_thread_deadline(
                 polling_req.initialize(), timeout=_DRAIN_TIMEOUT
@@ -2536,18 +2531,64 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] Polling request re-initialize failed/timed out (non-fatal)",
                 self.name, exc_info=True,
             )
-        return True
+            self._orphan_and_rebuild_polling_client(polling_req)
 
-    async def _quarantine_abandoned_polling_request(self) -> None:
-        """Hand an abandoned polling request off for fresh-adapter recovery."""
-        message = (
-            "Telegram polling request shutdown did not finish before the drain "
-            "deadline; rebuilding the adapter instead of reusing a request whose "
-            "shutdown may still be running."
+    def _orphan_and_rebuild_polling_client(self, polling_req) -> None:
+        """Replace a wedged HTTPXRequest client after a hung aclose().
+
+        PTB's ``HTTPXRequest.initialize()`` only calls ``_build_client()``
+        when the current client reports ``is_closed``. If ``shutdown()`` was
+        abandoned on a CLOSE-WAIT socket, that flag stays false and the next
+        ``start_polling()`` reuses the dead getUpdates connection (#87057).
+        Swap in a fresh client and close the old one in a detached, bounded
+        background task so it cannot block the reconnect ladder.
+        """
+        old = getattr(polling_req, "_client", None)
+        build = getattr(polling_req, "_build_client", None)
+        if old is None or not callable(build):
+            return
+        if getattr(old, "is_closed", True):
+            return
+        try:
+            polling_req._client = build()  # noqa: SLF001
+        except Exception:
+            logger.debug(
+                "[%s] Failed to rebuild polling HTTP client after hung drain",
+                self.name, exc_info=True,
+            )
+            return
+        logger.warning(
+            "[%s] Replaced wedged getUpdates HTTP client after drain timeout "
+            "(likely CLOSE-WAIT socket)",
+            self.name,
         )
-        logger.error("[%s] %s", self.name, message)
-        self._set_fatal_error("telegram_network_error", message, retryable=True)
-        await self._handoff_polling_fatal_error()
+
+        async def _orphan_aclose() -> None:
+            try:
+                aclose = getattr(old, "aclose", None)
+                if not callable(aclose):
+                    return
+                # The stale client can be wedged in the same cancellation-
+                # swallowing httpcore scope as shutdown(). Use the wall-clock
+                # thread deadline — not asyncio.wait_for — so this cleanup
+                # task cannot itself hang forever and accumulate one leaked
+                # task per reconnect attempt (#87265 review).
+                await _await_with_thread_deadline(
+                    aclose(), timeout=_DRAIN_TIMEOUT
+                )
+            except Exception:
+                logger.debug(
+                    "[%s] Orphan polling client aclose failed (non-fatal)",
+                    self.name, exc_info=True,
+                )
+
+        try:
+            task = asyncio.ensure_future(_orphan_aclose())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            task.add_done_callback(_consume_abandoned_task)
+        except Exception:
+            pass
 
     def _begin_polling_generation(self) -> tuple[int, asyncio.Event]:
         """Start accepting progress for a new getUpdates polling generation."""
@@ -3097,11 +3138,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if getattr(self, "_polling_teardown_started", False):
             return
-        polling_request_reusable = await self._drain_polling_connections()
+        await self._drain_polling_connections()
+
         if getattr(self, "_polling_teardown_started", False):
-            return
-        if not polling_request_reusable:
-            await self._quarantine_abandoned_polling_request()
             return
 
         try:
@@ -3659,11 +3698,8 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.sleep(RETRY_DELAY)
             if getattr(self, "_polling_teardown_started", False):
                 return
-            polling_request_reusable = await self._drain_polling_connections()
+            await self._drain_polling_connections()
             if getattr(self, "_polling_teardown_started", False):
-                return
-            if not polling_request_reusable:
-                await self._quarantine_abandoned_polling_request()
                 return
 
             # Capture a stable local reference: self._app can be reassigned to
@@ -4558,8 +4594,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     max_keepalive_connections=_base_limits.max_keepalive_connections,
                     keepalive_expiry=_base_limits.keepalive_expiry,
                 )
+                # A long-poll request is continuously active, so keepalive
+                # expiry cannot protect it from a server-side connection close.
+                # Never hand getUpdates a pooled socket from a previous poll;
+                # ordinary Bot API requests retain the shared reusable pool.
+                _updates_limits = _httpx.Limits(
+                    max_connections=request_kwargs["connection_pool_size"],
+                    max_keepalive_connections=0,
+                    keepalive_expiry=_base_limits.keepalive_expiry,
+                )
             else:  # pragma: no cover — httpx always present alongside PTB
                 _pool_limits = None
+                _updates_limits = None
 
             def _with_limits(httpx_kwargs: Optional[dict] = None) -> dict:
                 """Merge tuned keepalive limits into httpx client kwargs.
@@ -4636,6 +4682,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 _transport_kwargs: dict = {}
                 if _pool_limits is not None:
                     _transport_kwargs["limits"] = _pool_limits
+                _transport_kwargs["socket_options"] = tcp_keepalive_socket_options()
+                _updates_transport_kwargs = dict(_transport_kwargs)
+                if _updates_limits is not None:
+                    _updates_transport_kwargs["limits"] = _updates_limits
                 request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={
@@ -4648,7 +4698,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs,
                     httpx_kwargs={
                         "transport": TelegramFallbackTransport(
-                            fallback_ips, **_transport_kwargs
+                            fallback_ips,
+                            **_updates_transport_kwargs,
                         )
                     },
                 )
@@ -4658,14 +4709,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
                 get_updates_request = HTTPXRequest(
-                    **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
+                    **request_kwargs,
+                    proxy=proxy_url,
+                    httpx_kwargs={"limits": _updates_limits},
                 )
             else:
                 if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs, httpx_kwargs=_with_limits())
                 get_updates_request = HTTPXRequest(
-                    **request_kwargs, httpx_kwargs=_with_limits()
+                    **request_kwargs, httpx_kwargs={"limits": _updates_limits}
                 )
 
             get_updates_request = self._instrument_polling_request(get_updates_request)

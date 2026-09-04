@@ -1038,7 +1038,9 @@ def _verified_memory_path(memory: Any) -> Path:
     if not isinstance(memory, dict):
         raise KnowledgeError("audit memory record is invalid")
     raw_path = memory.get("path")
-    if raw_path is not None and not isinstance(raw_path, str):
+    if raw_path is not None and (
+        not isinstance(raw_path, str) or _CONTROL_CHARACTER_RE.search(raw_path)
+    ):
         raise KnowledgeError("audit memory path is invalid")
     try:
         candidate = (

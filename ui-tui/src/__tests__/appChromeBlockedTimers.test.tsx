@@ -248,6 +248,15 @@ describe('status-chrome timers under an occluding overlay', () => {
     expect(oneSecondTimers(intervalSpy)).toBeGreaterThan(0)
   })
 
+  it('freezes the FaceTicker verb on compacting and skips verb rotation (#97239)', () => {
+    const { output } = mount({ ...busyProps, compacting: true })
+
+    expect(output()).toContain('compacting')
+    // Glyph still ticks at the kaomoji cadence; the rotating-verb timer does not.
+    expect(armedDelays(intervalSpy).filter(delay => delay === 2500)).toHaveLength(1)
+    expect(oneSecondTimers(intervalSpy)).toBeGreaterThan(0)
+  })
+
   it('arms no FaceTicker timer mid-turn while the modal widget slot is open', () => {
     patchOverlayState({ widget: { appId: 'demo', state: null } })
 
@@ -295,23 +304,17 @@ describe('status-chrome timers under an occluding overlay', () => {
     nowSpy.mockReturnValue(T0 + 300_000)
     rule.clear()
     resetOverlayState()
+    await vi.waitFor(() => expect(rule.output()).toContain('6m 0s'))
 
-    // Wait on the observable frame instead of assuming React's scheduler
-    // completes within 20ms. The full workspace CI runs this suite under
-    // enough parallel load that the fixed delay can expire before Ink emits
-    // the reveal frame, leaving an empty output even though the re-render is
-    // still queued.
-    await vi.waitFor(() => {
-      const resumed = rule.output()
+    const resumed = rule.output()
 
-      // Caught up to real elapsed time, not stuck on the pre-overlay values.
-      expect(resumed).toContain('6m 0s')
-      expect(resumed).toContain('✓ 5m 5s')
-      expect(resumed).not.toContain('1m 0s')
+    // Caught up to real elapsed time, not stuck on the pre-overlay values.
+    expect(resumed).toContain('6m 0s')
+    expect(resumed).toContain('✓ 5m 5s')
+    expect(resumed).not.toContain('1m 0s')
 
-      // …and the clocks are running again.
-      expect(oneSecondTimers(intervalSpy)).toBe(2)
-    })
+    // …and the clocks are running again.
+    expect(oneSecondTimers(intervalSpy)).toBe(2)
   })
 
   it('tears the clocks down when an overlay opens over an already-running status rule', async () => {

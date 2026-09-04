@@ -634,17 +634,55 @@ def _apply_profile_override() -> None:
 
     # 2. If no flag, check active_profile in the hermes root.
     #
-    # EXCEPTION: a supervised s6 gateway child (exported by the container
-    # run-script as HERMES_S6_SUPERVISED_CHILD=1) must NOT follow the sticky
-    # active_profile. Each supervised slot has a fixed profile identity: named
-    # slots pass ``-p <name>`` explicitly (handled in step 1 above), and the
-    # reserved ``gateway-default`` slot runs bare ``hermes gateway run`` to mean
-    # "the root HERMES_HOME profile". If the reserved default child read
-    # active_profile here, switching the active profile (e.g. via the dashboard)
-    # would silently redirect the default gateway into that profile — yielding a
-    # duplicate gateway for the active profile and no real default gateway. See
-    # the "Docker & Profiles & Dashboard" report.
-    if profile_name is None and not os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
+    # EXCEPTION: a supervisor-launched gateway child must NOT follow the
+    # sticky active_profile. Each supervised slot has a fixed profile
+    # identity: named slots pass ``-p <name>`` explicitly (handled in step 1
+    # above) or pin ``HERMES_HOME`` to the profile directory (step 1.5), and
+    # a bare invocation means "the root HERMES_HOME profile". If a supervised
+    # default-profile child read active_profile here, switching the active
+    # profile (e.g. via the dashboard or ``hermes profile use``) would
+    # silently redirect the default gateway into that profile — the default
+    # gateway then assumes the other profile's identity/credentials (logs
+    # under the other profile's tree, connects with its Telegram bot token)
+    # and double-polls a token already owned by that profile's own gateway.
+    # See issue #74872 and the "Docker & Profiles & Dashboard" report.
+    #
+    # Supervisor markers honored (see gateway/restart.py
+    # ``is_gateway_supervisor_process`` for the sibling detection used by
+    # restart routing):
+    #   - HERMES_SUPERVISED_CHILD: generalized marker exported by the
+    #     generated systemd unit, launchd plist, and Windows Scheduled-Task
+    #     launchers (#74872).
+    #   - HERMES_S6_SUPERVISED_CHILD: legacy s6 container marker (back-compat;
+    #     exported by S6ServiceManager's run-script).
+    #   - INVOCATION_ID: set by systemd for service children only (never in
+    #     interactive shells) — covers already-installed gateway units that
+    #     predate the HERMES_SUPERVISED_CHILD marker. Consulted ONLY for
+    #     gateway commands: INVOCATION_ID is inherited by every descendant of
+    #     a systemd-launched process (self-hosted CI runners, user services
+    #     running unrelated hermes commands), so honoring it globally would
+    #     silently disable the sticky active_profile for those.
+    #   - HERMES_GATEWAY_EXTERNAL_SUPERVISOR: explicit external-supervisor
+    #     opt-in (``hermes gateway run --external-supervisor``).
+    #
+    # XPC_SERVICE_NAME is deliberately NOT consulted here: interactive macOS
+    # terminals set it too, and a false positive would silently break the
+    # sticky active_profile for every interactive command.
+    def _under_gateway_supervisor() -> bool:
+        if os.environ.get("HERMES_SUPERVISED_CHILD"):
+            return True
+        if os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
+            return True
+        is_gateway_cmd = next(
+            (a for a in argv if not a.startswith("-")), None
+        ) == "gateway"
+        if is_gateway_cmd and os.environ.get("INVOCATION_ID"):
+            return True
+        return os.environ.get(
+            "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+    if profile_name is None and not _under_gateway_supervisor():
         try:
             from hermes_constants import get_default_hermes_root
 
@@ -3400,9 +3438,6 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
         )
 
-    # Import and run the CLI
-    from cli import main as cli_main
-
     # --query-file: read the single query from a file (or stdin via '-') so
     # callers never have to shell-quote message bodies. This is the transport
     # the Bot Mode DM protocol uses — interpolating arbitrary text into a
@@ -3454,10 +3489,23 @@ def cmd_chat(args):
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     try:
+        from cli import main as cli_main
+
         cli_main(**kwargs)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
+    except ImportError as e:
+        # Mixed-version installs (new cli.py, older hermes_cli.config) crash
+        # here — e.g. missing resolve_turn_limit / split_model_config_default
+        # (#96900). The agent-setup mixin prints this hint too late: HermesCLI
+        # construction already failed. Fast-chat launch also goes through
+        # cmd_chat, so this one catch covers `hermes` / `hermes chat`.
+        from hermes_constants import emit_partial_update_hint
+
+        if emit_partial_update_hint(e):
+            sys.exit(1)
+        raise
 
 
 def cmd_gateway(args):
@@ -10067,18 +10115,6 @@ def _interpreter_scripts_dir() -> Path | None:
     return exe.parent if exe.parent.is_dir() else None
 
 
-_UPDATE_SECURITY_REQUIREMENTS = ("h2==4.4.1",)
-
-
-def _with_update_security_requirements(args: list[str]) -> list[str]:
-    """Return an install command that cannot bypass update security pins."""
-    command = [*args]
-    for requirement in _UPDATE_SECURITY_REQUIREMENTS:
-        if requirement not in command:
-            command.append(requirement)
-    return command
-
-
 def _install_python_dependencies_with_optional_fallback(
     install_cmd_prefix: list[str],
     *,
@@ -10104,10 +10140,6 @@ def _install_python_dependencies_with_optional_fallback(
     installs (#71510 fixed the ZIP path, #83335 fixed lazy-deps; this closes the
     shared helper for the remaining callers).
     """
-    # ``managed_python_env()`` deliberately sets UV_NO_CONFIG=1, and pip does
-    # not read ``[tool.uv].override-dependencies`` at all.  Keep this explicit
-    # request on every primary and fallback install so an existing vulnerable
-    # transitive h2 cannot satisfy a broad consumer range during an update.
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     # A pip / site-packages install has no PROJECT_ROOT/venv; the caller still
@@ -10138,7 +10170,6 @@ def _install_python_dependencies_with_optional_fallback(
             scripts_dir = _interpreter_scripts_dir()
 
     def _install(args: list[str]) -> None:
-        args = _with_update_security_requirements(args)
         if pin_python:
             args = _insert_python_pin(args)
         # strict_quarantine: this is the UPDATE dependency sync. A shim that
@@ -10262,9 +10293,7 @@ def _verify_console_scripts_installed(
 
     try:
         _run_quarantined_install(
-            _with_update_security_requirements(
-                install_cmd_prefix + ["install", "--reinstall", "-e", "."]
-            ),
+            install_cmd_prefix + ["install", "--reinstall", "-e", "."],
             env=env,
             scripts_dir=scripts_dir,
         )
@@ -10418,9 +10447,7 @@ def _verify_core_dependencies_installed(
     repair_args = ["install", "--reinstall", "-e", "."]
     try:
         _run_quarantined_install(
-            _with_update_security_requirements(install_cmd_prefix + repair_args),
-            env=env,
-            scripts_dir=scripts_dir,
+            install_cmd_prefix + repair_args, env=env, scripts_dir=scripts_dir
         )
     except subprocess.CalledProcessError as e:
         logger.warning("dep verification: repair install failed: %s", e)
@@ -10451,10 +10478,7 @@ def _verify_core_dependencies_installed(
     )
     try:
         _run_install_with_heartbeat(
-            _with_update_security_requirements(
-                install_cmd_prefix + ["install", "--reinstall", *specs]
-            ),
-            env=env,
+            install_cmd_prefix + ["install", "--reinstall", *specs], env=env
         )
     except subprocess.CalledProcessError as e:
         logger.warning("dep verification: per-package repair failed: %s", e)
@@ -13836,7 +13860,7 @@ def main():
     build_memory_parser(subparsers, cmd_memory=cmd_memory)
 
     # =======================================================================
-    # knowledge command — bounded, local-first memory synchronization
+    # knowledge command - bounded, local-first memory synchronization
     # =======================================================================
     build_knowledge_parser(subparsers, cmd_knowledge=cmd_knowledge)
 

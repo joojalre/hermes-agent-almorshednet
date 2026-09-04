@@ -6,11 +6,11 @@ nothing about transports or model runtimes.  Callers persist the returned task
 with :mod:`gateway.hosted_room_driver` and append publication plans with
 :mod:`gateway.hosted_rooms`.
 
-The driver payload keeps the target profile and, when it differs, the frozen
-roster member id. Discussion coordinates live in deterministic ``TaskIdentity``
-values and typed terminal events; a restart can therefore reconstruct both the
-current payload and legacy three-field rows. Callers must reconcile terminal
-driver rows into publication plans before asking for the next task.
+The unpublished driver payload intentionally remains unchanged.  Discussion
+coordinates live in deterministic ``TaskIdentity`` values and typed terminal
+events; a restart can therefore reconstruct a task without widening the driver
+schema.  Callers must reconcile terminal driver rows into publication plans
+before asking for the next task.
 """
 
 from __future__ import annotations
@@ -48,7 +48,13 @@ _TURN_ID_RE = re.compile(
     r"m(?P<member>[0-9a-f]{24})$"
 )
 
-_MEMBER_FIELDS = frozenset({"member_id", "profile", "handle", "display_name"})
+_MEMBER_FIELDS = frozenset(
+    {"member_id", "profile", "handle", "display_name", "target"}
+)
+_LOCAL_TARGET_FIELDS = frozenset({"kind", "profile"})
+_PEER_TARGET_FIELDS = frozenset(
+    {"kind", "peer_id", "installation_id", "profile", "capability_digest"}
+)
 _REMOTE_MEMBER_FIELDS = frozenset({
     "connectionId",
     "connectionKind",
@@ -91,6 +97,9 @@ _TERMINAL_EXTRA_FIELDS = {
     "turn.cancelled": frozenset({"reason"}),
     "turn.deferred": frozenset({"execution_generation", "reason"}),
 }
+_TERMINAL_OPTIONAL_FIELDS = {
+    "turn.failed": frozenset({"reason_code"}),
+}
 _TERMINAL_EVENT_KINDS = frozenset(_TERMINAL_EXTRA_FIELDS)
 _AUTHORITY_EVENT_KINDS = frozenset({"authority.claimed", "authority.lost"})
 _AUTHORITY_EVENT_FIELDS = frozenset({
@@ -122,12 +131,13 @@ class DiscussionReconstructionError(DiscussionPolicyError):
 
 @dataclass(frozen=True)
 class DiscussionMember:
-    """One immutable member local to the room's authority gateway."""
+    """One immutable local or peer member of the hosted room."""
 
     member_id: str
     profile: str
     handle: str
     display_name: str = ""
+    target: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -286,18 +296,89 @@ def validate_user_payload(value: Any) -> dict[str, Any]:
     return {"text": text, "thread_id": thread_id}
 
 
+def _validate_member_target(
+    value: Any,
+    *,
+    profile: str,
+    known_profiles: set[str],
+    require_current_profiles: bool,
+    index: int,
+) -> dict[str, Any]:
+    if value is None:
+        if require_current_profiles and profile not in known_profiles:
+            raise DiscussionValidationError(
+                f"member {index} profile '{profile}' is not local to this gateway"
+            )
+        return {"kind": "local", "profile": profile}
+    if not isinstance(value, Mapping):
+        raise DiscussionValidationError(f"member {index} target must be an object")
+    kind = value.get("kind")
+    if kind == "local":
+        target = _exact_fields(
+            value,
+            label=f"member {index} local target",
+            required=_LOCAL_TARGET_FIELDS,
+        )
+        target_profile = _identifier(
+            target["profile"], label=f"member {index} target profile"
+        )
+        if target_profile != profile or (
+            require_current_profiles and profile not in known_profiles
+        ):
+            raise DiscussionValidationError(
+                f"member {index} local target does not match a local profile"
+            )
+        return {"kind": "local", "profile": profile}
+    if kind == "peer":
+        target = _exact_fields(
+            value,
+            label=f"member {index} peer target",
+            required=_PEER_TARGET_FIELDS,
+        )
+        target_profile = _identifier(
+            target["profile"], label=f"member {index} target profile"
+        )
+        if target_profile != profile:
+            raise DiscussionValidationError(
+                f"member {index} peer target profile does not match member profile"
+            )
+        capability_digest = target["capability_digest"]
+        if (
+            not isinstance(capability_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", capability_digest)
+        ):
+            raise DiscussionValidationError(
+                f"member {index} capability_digest must be a sha256 digest"
+            )
+        return {
+            "kind": "peer",
+            "peer_id": _identifier(
+                target["peer_id"], label=f"member {index} peer_id"
+            ),
+            "installation_id": _identifier(
+                target["installation_id"],
+                label=f"member {index} installation_id",
+            ),
+            "profile": target_profile,
+            "capability_digest": capability_digest,
+        }
+    raise DiscussionValidationError(
+        f"member {index} target kind must be local or peer"
+    )
+
+
 def validate_roster(
     value: Any,
     *,
     local_profiles: Iterable[str],
-    require_local_profiles: bool = True,
+    require_current_profiles: bool = True,
 ) -> tuple[DiscussionMember, ...]:
-    """Validate a frozen 2-6 member roster of profiles on this gateway.
+    """Validate a frozen 2-6 member roster of local or peer targets.
 
-    Current-profile membership is a creation-time boundary. Persisted room
-    replay keeps the frozen roster valid when a profile is later renamed or
-    removed so the unavailable-member policy can defer it without disabling
-    the remaining members.
+    Room creation requires each local target to exist on this gateway. Replay
+    preserves the stored roster without reapplying that time-varying check, so
+    an unavailable local member can be deferred while healthy local and peer
+    members continue.
     """
 
     if not isinstance(value, list):
@@ -312,7 +393,7 @@ def validate_roster(
         _identifier(profile, label="local profile") for profile in local_profiles
     }
     members: list[DiscussionMember] = []
-    profiles: set[str] = set()
+    targets: set[str] = set()
     handles: set[str] = set()
     member_ids: set[str] = set()
 
@@ -329,15 +410,18 @@ def validate_roster(
             raw,
             label=f"member {index}",
             required=frozenset({"member_id", "profile", "handle"}),
-            optional=frozenset({"display_name"}),
+            optional=frozenset({"display_name", "target"}),
         )
         member_id = _identifier(member["member_id"], label=f"member {index} id")
         profile = _identifier(member["profile"], label=f"member {index} profile")
         handle = _identifier(member["handle"], label=f"member {index} handle")
-        if require_local_profiles and profile not in known_profiles:
-            raise DiscussionValidationError(
-                f"member {index} profile '{profile}' is not local to this gateway"
-            )
+        target = _validate_member_target(
+            member.get("target"),
+            profile=profile,
+            known_profiles=known_profiles,
+            require_current_profiles=require_current_profiles,
+            index=index,
+        )
         display_name = member.get("display_name", "")
         if not isinstance(display_name, str):
             raise DiscussionValidationError(
@@ -347,18 +431,24 @@ def validate_roster(
         if len(display_name) > hosted_rooms.MAX_ACTOR_LABEL_CHARS:
             raise DiscussionValidationError(f"member {index} display_name is too long")
 
-        profile_key = profile.casefold()
+        target_key = json.dumps(
+            target,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).casefold()
         handle_key = handle.casefold()
         member_key = member_id.casefold()
-        if profile_key in profiles:
-            raise DiscussionValidationError("member profiles must be unique")
+        if target_key in targets:
+            if target.get("kind") == "local":
+                raise DiscussionValidationError("member profiles must be unique")
+            raise DiscussionValidationError("member targets must be unique")
         if handle_key in handles or handle_key in {"all", "everyone"}:
             raise DiscussionValidationError(
                 "member handles must be unique and cannot reserve @all or @everyone"
             )
         if member_key in member_ids:
             raise DiscussionValidationError("member ids must be unique")
-        profiles.add(profile_key)
+        targets.add(target_key)
         handles.add(handle_key)
         member_ids.add(member_key)
         members.append(
@@ -367,6 +457,7 @@ def validate_roster(
                 profile=profile,
                 handle=handle,
                 display_name=display_name,
+                target=target,
             )
         )
     return tuple(members)
@@ -376,7 +467,7 @@ def validate_room(
     value: Any,
     *,
     local_profiles: Iterable[str],
-    require_local_profiles: bool = True,
+    require_current_profiles: bool = True,
 ) -> DiscussionRoom:
     """Project a hosted-room row into the strict same-gateway policy shape."""
 
@@ -402,7 +493,7 @@ def validate_room(
     members = validate_roster(
         value.get("members"),
         local_profiles=local_profiles,
-        require_local_profiles=require_local_profiles,
+        require_current_profiles=require_current_profiles,
     )
     return DiscussionRoom(
         room_id=room_id,
@@ -624,11 +715,14 @@ def _validate_member_message(
     if not isinstance(text, str) or not text.strip() or is_pass_text(text):
         raise DiscussionValidationError("message.member text must be a non-pass string")
     member = _member_by_id(room, payload.get("member_id"))
+    expected_connection = None
+    if member.target and member.target.get("kind") == "peer":
+        expected_connection = member.target.get("peer_id")
     if (
         actor.get("kind") != "member"
         or actor.get("id") != member.member_id
         or actor.get("profile") != member.profile
-        or actor.get("connection_id") is not None
+        or actor.get("connection_id") != expected_connection
     ):
         raise DiscussionValidationError("message.member actor does not match roster")
 
@@ -642,7 +736,12 @@ def _validate_terminal_event(
     authority_gateway_id: str,
 ) -> None:
     required = _TERMINAL_COMMON_FIELDS | _TERMINAL_EXTRA_FIELDS[kind]
-    _exact_fields(payload, label=f"{kind} payload", required=required)
+    _exact_fields(
+        payload,
+        label=f"{kind} payload",
+        required=required,
+        optional=_TERMINAL_OPTIONAL_FIELDS.get(kind, frozenset()),
+    )
     _validate_turn_coordinates(payload, room)
     _positive_int(payload.get("seen_through_seq"), label="seen_through_seq")
     if (
@@ -671,6 +770,13 @@ def _validate_terminal_event(
                 payload.get("execution_generation"),
                 label="execution_generation",
             )
+        if kind == "turn.failed" and "reason_code" in payload:
+            from tools.bot_failure_reasons import ALL_REASONS
+
+            if payload["reason_code"] not in ALL_REASONS:
+                raise DiscussionValidationError(
+                    "turn.failed reason_code must use the shared failure vocabulary"
+                )
 
 
 def _validate_authority_event(
@@ -867,7 +973,7 @@ def derive_member_watermarks(
     room = validate_room(
         room_value,
         local_profiles=local_profiles,
-        require_local_profiles=False,
+        require_current_profiles=False,
     )
     validated = _validated_events(events, room=room)
     return _derive_member_watermarks(validated)
@@ -918,7 +1024,14 @@ def _derive_member_watermarks(
 
 
 def _member_digest(member: DiscussionMember) -> str:
-    seed = f"{member.member_id}\0{member.profile}\0{member.handle}"
+    target = json.dumps(
+        member.target or {"kind": "local", "profile": member.profile},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    seed = (
+        f"{member.member_id}\0{member.profile}\0{member.handle}\0{target}"
+    )
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
@@ -1092,12 +1205,11 @@ def _make_task_plan(
         turn_id=turn_id,
     )
     payload = {
+        "target_member_id": member.member_id,
         "target_profile": member.profile,
         "prompt": prompt,
         "source_event_seq": discussion_event.seq,
     }
-    if member.member_id != member.profile:
-        payload["target_member_id"] = member.member_id
     return DiscussionTaskPlan(
         identity=identity,
         payload=payload,
@@ -1121,7 +1233,7 @@ def plan_next_task(
     room = validate_room(
         room_value,
         local_profiles=local_profiles,
-        require_local_profiles=False,
+        require_current_profiles=False,
     )
     validated = _validated_events(events, room=room)
     user_events = _discussion_user_events(validated)
@@ -1270,31 +1382,6 @@ def plan_next_task(
     raise AssertionError("bounded Discussion loop exhausted unexpectedly")
 
 
-def plan_unavailable_member_deferral(
-    room_value: Any,
-    events: Sequence[Mapping[str, Any]],
-    task: DiscussionTaskPlan,
-    *,
-    local_profiles: Iterable[str],
-) -> PublicationPlan | None:
-    """Defer a frozen member whose profile disappeared before admission."""
-
-    available_profiles = {
-        _identifier(profile, label="local profile") for profile in local_profiles
-    }
-    if task.member.profile in available_profiles:
-        return None
-    return plan_publication(
-        room_value,
-        events,
-        task,
-        status="deferred",
-        result={"reason": "member_unavailable"},
-        execution_generation=1,
-        local_profiles=available_profiles,
-    )
-
-
 def reconstruct_task_plan(
     room_value: Any,
     events: Sequence[Mapping[str, Any]],
@@ -1307,7 +1394,7 @@ def reconstruct_task_plan(
     room = validate_room(
         room_value,
         local_profiles=local_profiles,
-        require_local_profiles=False,
+        require_current_profiles=False,
     )
     validated = _validated_events(events, room=room)
     identity = task.get("identity")
@@ -1318,16 +1405,13 @@ def reconstruct_task_plan(
         raise DiscussionReconstructionError(
             "driver task has no valid identity or payload"
         )
-    required_payload_fields = frozenset({
+    required_payload = frozenset({
         "target_profile",
         "prompt",
         "source_event_seq",
     })
-    allowed_payload_fields = required_payload_fields | frozenset({"target_member_id"})
-    payload_fields = frozenset(payload)
-    if (
-        not required_payload_fields.issubset(payload_fields)
-        or not payload_fields.issubset(allowed_payload_fields)
+    if not required_payload <= frozenset(payload) or (
+        frozenset(payload) - required_payload - {"target_member_id"}
     ):
         raise DiscussionReconstructionError("driver task payload shape changed")
     match = _TURN_ID_RE.fullmatch(identity.turn_id)
@@ -1362,14 +1446,16 @@ def reconstruct_task_plan(
         (
             candidate
             for candidate in room.members
-            if candidate.profile == profile
-            and (
-                target_member_id is None
-                or candidate.member_id == target_member_id
+            if (
+                candidate.member_id == target_member_id
+                if target_member_id is not None
+                else candidate.profile == profile
             )
         ),
         None,
     )
+    if member is not None and member.profile != profile:
+        member = None
     if member is None or _member_digest(member) != match.group("member"):
         raise DiscussionReconstructionError("task target member does not match turn_id")
     prompt = payload.get("prompt")
@@ -1386,12 +1472,9 @@ def reconstruct_task_plan(
         seen_through_seq=seen_through_seq,
         prompt=prompt,
     )
-    expected_payload = dict(reconstructed.payload)
-    if "target_member_id" not in payload:
-        expected_payload.pop("target_member_id", None)
-    elif "target_member_id" not in expected_payload:
-        expected_payload["target_member_id"] = member.member_id
-    if reconstructed.identity != identity or expected_payload != dict(payload):
+    if reconstructed.identity != identity or dict(reconstructed.payload) != dict(
+        payload
+    ):
         raise DiscussionReconstructionError(
             "driver task failed deterministic reconstruction"
         )
@@ -1430,7 +1513,7 @@ def plan_publication(
     room = validate_room(
         room_value,
         local_profiles=local_profiles,
-        require_local_profiles=False,
+        require_current_profiles=False,
     )
     validated = _validated_events(events, room=room)
     if task.identity.room_id != room.room_id:
@@ -1489,6 +1572,8 @@ def plan_publication(
                 "id": task.member.member_id,
                 "profile": task.member.profile,
             }
+            if task.member.target and task.member.target.get("kind") == "peer":
+                member_actor["connection_id"] = task.member.target["peer_id"]
             if task.member.display_name:
                 member_actor["display_name"] = task.member.display_name
             effects.append(
@@ -1517,13 +1602,27 @@ def plan_publication(
         }
         terminal_kind = "turn.settled"
     elif effective_status == "failed":
+        error_text = _terminal_text(
+            result,
+            field="error",
+            fallback="member turn failed",
+        )
+        from tools.bot_failure_reasons import ALL_REASONS, classify_agent_error
+
+        supplied_reason = (
+            str(result.get("reason_code") or result.get("reason") or "").strip()
+            if isinstance(result, Mapping)
+            else ""
+        )
+        reason_code = (
+            supplied_reason
+            if supplied_reason in ALL_REASONS
+            else classify_agent_error(error_text)
+        )
         terminal_payload = {
             **common,
-            "error": _terminal_text(
-                result,
-                field="error",
-                fallback="member turn failed",
-            ),
+            "error": error_text,
+            "reason_code": reason_code,
         }
         terminal_kind = "turn.failed"
     elif effective_status == "cancelled":
