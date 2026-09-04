@@ -236,7 +236,6 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
 
       const survivors: BackendOwnershipEntry[] = []
       const reaped: number[] = []
-      const deadline = Date.now() + (deps.reapDeadlineMs ?? REAP_ORPHANS_DEADLINE_MS)
 
       // Parent liveness is probed through the OS process table. On Windows
       // that probe shells out to PowerShell, so doing it once per record
@@ -256,7 +255,12 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
         const key = `${entry.parentPid}\u0000${entry.parentStartMarker}`
 
         if (!parentProbes.has(key)) {
-          parentProbes.set(key, Promise.resolve().then(() => deps.matchesParent(entry)))
+          const probe = Promise.resolve().then(() => deps.matchesParent(entry))
+          // A record may leave this speculative probe unawaited. Mark the
+          // rejection handled so a late OS probe cannot surface as an
+          // unhandled rejection after the sweep has returned.
+          probe.catch(() => undefined)
+          parentProbes.set(key, probe)
         }
       }
 
@@ -269,9 +273,20 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
         const key = `${entry.pid}\u0000${entry.startMarker}\u0000${entry.nonce}\u0000${entry.profile}`
 
         if (!identityProbes.has(key)) {
-          identityProbes.set(key, Promise.resolve().then(() => deps.matchesIdentity(entry)))
+          const probe = Promise.resolve().then(() => deps.matchesIdentity(entry))
+          // A record may leave this speculative probe unawaited. Mark the
+          // rejection handled so a late OS probe cannot surface as an
+          // unhandled rejection after the sweep has returned.
+          probe.catch(() => undefined)
+          identityProbes.set(key, probe)
         }
       }
+
+      // Scheduling the deduplicated probes is synchronous and intentionally
+      // outside the sweep budget. Establish the deadline after that bounded
+      // bookkeeping so a sub-millisecond test/clock tick cannot skip the
+      // first record before any real probe has been attempted.
+      const deadline = Date.now() + (deps.reapDeadlineMs ?? REAP_ORPHANS_DEADLINE_MS)
 
       for (let i = 0; i < entries.length; i += 1) {
         // Budget exhausted: preserve the unprocessed records so a later launch
@@ -297,6 +312,7 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
             Number.isInteger(entry.parentPid) && isNonEmptyString(entry.parentStartMarker)
               ? `${entry.parentPid}\u0000${entry.parentStartMarker}`
               : undefined
+
           parentAlive = key ? await parentProbes.get(key) : await deps.matchesParent(entry)
         } catch {
           survivors.push(entry)
