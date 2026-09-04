@@ -1220,7 +1220,8 @@ class HostedRoomRuntime:
                         )
                         if self.publish_terminal is not None:
                             self.publish_terminal(binding, settled)
-                    except (state.StaleLeaseError, state.StaleTaskError):
+                    except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
+                        recovered = False
                         try:
                             current = state.get_task(self.db_path, attempt.identity)
                             if current["status"] == "stopping":
@@ -1243,12 +1244,20 @@ class HostedRoomRuntime:
                                 )
                                 if self.publish_terminal is not None:
                                     self.publish_terminal(binding, settled)
+                                recovered = True
+                            elif current["status"] in state.TERMINAL_STATUSES:
+                                recovered = True
                         except (
                             state.LeaseHeldError,
                             state.StaleLeaseError,
                             state.StaleTaskError,
                         ):
                             pass
+                        if not recovered:
+                            self._drop_lease(binding.room_id)
+                            self._record_error(
+                                f"task {attempt.identity.task_id} terminal commit fenced: {fence_exc}"
+                            )
                     except state.DriverStateError as exc:
                         self._settle_failure_if_current(
                             attempt,
