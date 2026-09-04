@@ -1479,7 +1479,7 @@ let poolLimits = readPersistedPoolLimits()
 // preference: setPoolLimits() pushes a new max into the coordinator.
 const localBackendSpawnCoordinator = new LocalBackendSpawnCoordinator(poolLimits.maxBackends)
 // How long a spawn may wait for a free local slot. Must stay under the
-// renderer's BACKEND_BOOT_WAIT_TIMEOUT_MS (180s, src/lib/with-timeout.ts) so
+// renderer's BACKEND_BOOT_WAIT_TIMEOUT_MS (240s, src/lib/with-timeout.ts) so
 // the queued ticket fails before the renderer does and the user sees why.
 const POOL_SLOT_WAIT_MS = 30_000
 
@@ -12373,7 +12373,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     }
   }
 
-  // Bound the slot wait BELOW the renderer's backend-boot budget (45s): once
+  // Bound the slot wait BELOW the renderer's backend-boot budget (240s): once
   // the renderer has given up on this spawn, a ticket still queued for the
   // pool-idle window (10 min) would hold the pool key hostage and every
   // later click on the profile would join that stale wait. Failing here
