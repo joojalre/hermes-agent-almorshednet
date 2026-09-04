@@ -433,10 +433,11 @@ def _check_fn_cached(fn: Callable) -> bool:
 
         # A False result is an expected capability decision for optional
         # integrations (for example, browser control when no browser is
-        # attached), not a runtime fault. Keep it visible in the normal
-        # gateway log without promoting every unavailable optional tool to
-        # the error log on every profile turn.
-        logger.info(
+        # attached), not a runtime fault. An exception is different: retain a
+        # warning so probe failures remain diagnosable without promoting a
+        # normal unavailable capability to the error log.
+        log = logger.warning if raised else logger.info
+        log(
             "check_fn %s %s; dependent tools will be unavailable this turn",
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",

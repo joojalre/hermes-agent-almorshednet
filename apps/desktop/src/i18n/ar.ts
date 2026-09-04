@@ -1206,6 +1206,7 @@ export const ar = defineLocale({
     actionDone: 'اكتمل الإجراء',
     actionFailed: 'فشل الإجراء',
     actionStartedWaiting: 'بدأ الإجراء، جار الانتظار...',
+    actionTimedOut: 'ما زال الإجراء يعمل؛ راجع السجلات الأخيرة لمعرفة حالته النهائية.',
     loadingStatus: 'جار تحميل الحالة',
     recentLogs: 'السجلات الأخيرة',
     noLogs: 'لا توجد سجلات',

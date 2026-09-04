@@ -1495,6 +1495,7 @@ export interface Translations {
     actionDone: string
     actionFailed: string
     actionStartedWaiting: string
+    actionTimedOut: string
     loadingStatus: string
     recentLogs: string
     noLogs: string

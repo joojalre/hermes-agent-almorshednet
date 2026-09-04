@@ -153,6 +153,22 @@ describe('no union roster', () => {
       sourceScoped: true
     })
   })
+
+  it('does not retarget an active row to the only non-live route', async () => {
+    hostMock.profileRoutes.mockResolvedValue([
+      { connectionId: 'homelab', mode: 'remote', profile: 'default', targetProfile: 'default' }
+    ])
+
+    const rows = await mergedRoster(
+      { profiles: [{ last_session: { id: 'hermes-chat', last_active: 1 }, name: 'default' }] },
+      null,
+      'work'
+    )
+
+    expect(rows[0]).toMatchObject({ name: 'default' })
+    expect(rows[0].connectionId).toBeUndefined()
+    expect(rows[0].sourceScoped).toBeUndefined()
+  })
 })
 
 describe('the active source annotates; other sources append', () => {

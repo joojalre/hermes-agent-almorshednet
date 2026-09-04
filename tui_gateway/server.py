@@ -1711,6 +1711,7 @@ _REAPER_SCAN_S = 300.0
 # already been reaped. Preserve the first diagnostic, but coalesce identical
 # method/session warnings so one detached tab cannot flood errors.log.
 _STALE_SESSION_LOG_COOLDOWN_S = 60.0
+_STALE_SESSION_LOG_MAX_ENTRIES = 4096
 _stale_session_log_lock = threading.Lock()
 _stale_session_log_state: dict[tuple[str, str], tuple[float, int]] = {}
 
@@ -3684,6 +3685,17 @@ def _log_stale_session_rejection(method: str, sid: str, rid: Any) -> None:
     key = (method, sid)
     now = time.monotonic()
     with _stale_session_log_lock:
+        cutoff = now - _STALE_SESSION_LOG_COOLDOWN_S
+        for stale_key, (timestamp, _) in list(_stale_session_log_state.items()):
+            if timestamp < cutoff:
+                _stale_session_log_state.pop(stale_key, None)
+
+        # A client-controlled session id must not be able to grow this
+        # diagnostic map without bound even when every entry is fresh.
+        if len(_stale_session_log_state) >= _STALE_SESSION_LOG_MAX_ENTRIES:
+            oldest_key = min(_stale_session_log_state, key=lambda item: _stale_session_log_state[item][0])
+            _stale_session_log_state.pop(oldest_key, None)
+
         previous = _stale_session_log_state.get(key)
         if previous is not None and now - previous[0] < _STALE_SESSION_LOG_COOLDOWN_S:
             _stale_session_log_state[key] = (previous[0], previous[1] + 1)

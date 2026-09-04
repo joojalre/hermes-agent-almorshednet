@@ -46,6 +46,9 @@ const SECTIONS = ['sessions', 'system', 'usage', 'maintenance'] as const satisfi
 const LOG_FILES = ['agent', 'errors', 'gateway', 'desktop'] as const
 const LOG_LEVELS = ['ALL', 'INFO', 'WARNING', 'ERROR'] as const
 const LOG_TAIL_LINES = 100
+const ACTION_POLL_INTERVAL_MS = 1200
+const ACTION_POLL_DEADLINE_MS = 5 * 60 * 1000
+const ACTION_POLL_REQUEST_TIMEOUT_MS = 5000
 
 const USAGE_PERIODS = [7, 30, 90] as const
 type UsagePeriod = (typeof USAGE_PERIODS)[number]
@@ -292,23 +295,35 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
 
         // Updates can restart the dashboard/backend and briefly make the
         // status endpoint unavailable. Keep following the durable action for
-        // up to five minutes instead of declaring failure after ~20 seconds.
-        for (let attempt = 0; attempt < 240; attempt += 1) {
-          await new Promise(resolve => window.setTimeout(resolve, 1200))
+        // up to five minutes, while bounding both the total wait and each
+        // status request so a hung endpoint cannot stretch this indefinitely.
+        const actionDeadline = Date.now() + ACTION_POLL_DEADLINE_MS
+
+        while (Date.now() < actionDeadline) {
+          const delayMs = Math.min(ACTION_POLL_INTERVAL_MS, actionDeadline - Date.now())
+
+          await new Promise(resolve => window.setTimeout(resolve, delayMs))
+
+          if (Date.now() >= actionDeadline) {
+            break
+          }
+
           try {
-            const polled = await getActionStatus(started.name, 180)
+            const timeoutMs = Math.min(ACTION_POLL_REQUEST_TIMEOUT_MS, actionDeadline - Date.now())
+            const polled = await getActionStatus(started.name, 180, undefined, timeoutMs)
             nextStatus = polled
             setSystemAction(polled)
             upsertDesktopActionTask(polled)
 
             if (!polled.running) {
               actionSucceeded = polled.exit_code === 0
+
               break
             }
           } catch (error) {
             // A restart/update may take the dashboard down for a few seconds.
             // Retry while the action's durable log is still being completed.
-            if (attempt === 239) {
+            if (Date.now() >= actionDeadline) {
               setSystemError(error instanceof Error ? error.message : String(error))
             }
           }
@@ -326,10 +341,15 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
           setSystemAction(pendingStatus)
           upsertDesktopActionTask(pendingStatus)
         }
+
+        if (Date.now() >= actionDeadline && (!nextStatus || nextStatus.running)) {
+          setSystemError(cc.actionTimedOut)
+        }
       } catch (error) {
         setSystemError(error instanceof Error ? error.message : String(error))
       } finally {
         setSystemActionStarting(false)
+
         if (kind === 'restart' && actionSucceeded) {
           // Gateway startup can finish after the action process exits. Keep
           // the status card in sync instead of leaving a stale "stopped" pill.

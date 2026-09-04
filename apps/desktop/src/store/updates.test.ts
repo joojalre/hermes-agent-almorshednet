@@ -62,11 +62,15 @@ vi.mock('@/store/connections', () => ({
 const checkHermesUpdateSpy = vi.fn()
 const updateHermesSpy = vi.fn()
 const getActionStatusSpy = vi.fn()
+const getHermesConfigRecordSpy = vi.fn()
+const saveHermesConfigRecordSpy = vi.fn()
 
 vi.mock('@/hermes', () => ({
   checkHermesUpdate: (...args: unknown[]) => checkHermesUpdateSpy(...args),
   updateHermes: (...args: unknown[]) => updateHermesSpy(...args),
-  getActionStatus: (...args: unknown[]) => getActionStatusSpy(...args)
+  getActionStatus: (...args: unknown[]) => getActionStatusSpy(...args),
+  getHermesConfigRecord: (...args: unknown[]) => getHermesConfigRecordSpy(...args),
+  saveHermesConfigRecord: (...args: unknown[]) => saveHermesConfigRecordSpy(...args)
 }))
 
 // A successful backend apply must nudge the gateway reconnect handler — the
@@ -1331,6 +1335,8 @@ describe('startUpdatePoller', () => {
     storage.clear()
     checkMock.mockReset()
     onProgressMock.mockReset()
+    getHermesConfigRecordSpy.mockReset()
+    saveHermesConfigRecordSpy.mockReset()
     Object.keys(listeners).forEach(k => delete listeners[k])
     checkMock.mockResolvedValue({
       supported: true,
@@ -1338,10 +1344,12 @@ describe('startUpdatePoller', () => {
       targetSha: 'sha-abc',
       fetchedAt: 0
     })
+    getHermesConfigRecordSpy.mockResolvedValue({ desktop: { automatic_update_checks: true } })
+    saveHermesConfigRecordSpy.mockResolvedValue({ ok: true })
     $updateStatus.set(null)
     setAutomaticUpdateChecksEnabled(true)
     ;(globalThis as unknown as { window: unknown }).window = {
-      hermesDesktop: { updates: { check: checkMock, onProgress: onProgressMock } },
+      hermesDesktop: { api: vi.fn(), updates: { check: checkMock, onProgress: onProgressMock } },
       addEventListener: vi.fn((event: string, handler: Function) => {
         listeners[event] = handler
       }),
@@ -1398,13 +1406,18 @@ describe('startUpdatePoller', () => {
 
     expect($automaticUpdateChecksEnabled.get()).toBe(false)
     expect(checkMock).not.toHaveBeenCalled()
-    expect(storage.get('hermes:automatic-update-checks')).toBe('false')
+    await vi.waitFor(() =>
+      expect(saveHermesConfigRecordSpy).toHaveBeenCalledWith(
+        { desktop: { automatic_update_checks: false } }
+      )
+    )
 
     setAutomaticUpdateChecksEnabled(true)
     await vi.advanceTimersByTimeAsync(0)
 
     expect($automaticUpdateChecksEnabled.get()).toBe(true)
     expect(checkMock).toHaveBeenCalled()
-    expect(storage.get('hermes:automatic-update-checks')).toBe('true')
+    await vi.waitFor(() => expect(saveHermesConfigRecordSpy).toHaveBeenCalled())
+    expect(saveHermesConfigRecordSpy).toHaveBeenLastCalledWith({ desktop: { automatic_update_checks: true } })
   })
 })

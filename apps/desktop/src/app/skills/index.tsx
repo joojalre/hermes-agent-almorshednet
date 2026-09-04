@@ -470,11 +470,22 @@ export function SkillsView({
 
   // Provenance counts make it clear why a skill appears in this list (agent,
   // bundled, or Skills Hub) instead of implying that only one source exists.
+  // Older backends do not send provenance at all; do not fabricate an
+  // `agent` count because that would turn missing metadata into a false claim.
   const provenanceSummary = useMemo(() => {
+    if (!skills || skills.some(skill => !skill.provenance)) {
+      return null
+    }
+
     const counts = { agent: 0, bundled: 0, hub: 0 }
 
-    for (const skill of skills ?? []) {
-      const provenance = skill.provenance ?? 'agent'
+    for (const skill of skills) {
+      const provenance = skill.provenance
+
+      if (!provenance) {
+        return null
+      }
+
       counts[provenance] += 1
     }
 
@@ -916,9 +927,11 @@ export function SkillsView({
                   <ListColumn
                     header={
                       <>
-                        <div className="border-b border-(--ui-stroke-secondary) px-3 py-1 text-[0.65rem] text-(--ui-text-tertiary)">
-                          {provenanceSummary}
-                        </div>
+                        {provenanceSummary ? (
+                          <div className="border-b border-(--ui-stroke-secondary) px-3 py-1 text-[0.65rem] text-(--ui-text-tertiary)">
+                            {provenanceSummary}
+                          </div>
+                        ) : null}
                         <ListStrip
                           left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
                           right={

@@ -91,10 +91,12 @@ export function MaintenancePanel() {
         }
 
         const normalized = localPath.replace(/\\/g, '/')
+
         const encoded = normalized
           .split('/')
           .map(part => encodeURIComponent(part))
           .join('/')
+
         const url = `file://${encoded.startsWith('/') ? encoded : `/${encoded}`}`
 
         await window.hermesDesktop.openExternal(url)
@@ -370,6 +372,7 @@ export function MaintenancePanel() {
               label={mm.memoryFile}
               onOpen={() => void openMemoryFile(memory.builtin_paths?.memory)}
               onReset={() => void doResetMemory('memory', mm.memoryFile)}
+              openDisabled={!memory.builtin_paths?.memory}
               openLabel={mm.openFile}
               resetLabel={mm.resetMemory}
               size={memory.builtin_files.memory}
@@ -380,6 +383,7 @@ export function MaintenancePanel() {
               label={mm.userFile}
               onOpen={() => void openMemoryFile(memory.builtin_paths?.user)}
               onReset={() => void doResetMemory('user', mm.userFile)}
+              openDisabled={!memory.builtin_paths?.user}
               openLabel={mm.openFile}
               resetLabel={mm.resetUser}
               size={memory.builtin_files.user}
@@ -431,6 +435,7 @@ function MemoryFileRow({
   label,
   onOpen,
   onReset,
+  openDisabled,
   openLabel,
   resetLabel,
   size,
@@ -440,6 +445,7 @@ function MemoryFileRow({
   label: string
   onOpen: () => void
   onReset: () => void
+  openDisabled?: boolean
   openLabel: string
   resetLabel: string
   size: number
@@ -454,7 +460,7 @@ function MemoryFileRow({
         </span>
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
-        <Button disabled={busy || size <= 0} onClick={onOpen} size="xs" variant="text">
+        <Button disabled={busy || size <= 0 || openDisabled} onClick={onOpen} size="xs" variant="text">
           {openLabel}
         </Button>
         <Button

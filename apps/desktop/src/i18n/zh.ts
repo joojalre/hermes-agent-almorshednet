@@ -1871,6 +1871,7 @@ export const zh: Translations = {
     actionDone: '完成',
     actionFailed: '失败',
     actionStartedWaiting: '操作已启动，等待状态…',
+    actionTimedOut: '操作仍在运行；请查看最近日志以确认最终状态。',
     loadingStatus: '正在加载状态…',
     recentLogs: '最近日志',
     noLogs: '尚未加载日志。',

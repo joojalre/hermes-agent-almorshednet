@@ -1545,7 +1545,7 @@ try {
     # safety refusal. Do not spend another full update cycle producing the same
     # result; retain the non-zero code so the update is not reported as complete,
     # but give the user the exact, non-destructive next step.
-    $parkedBranchSkipped = $res.Output -match '(?im)CODE UPDATE SKIPPED|checkout is parked on|working tree has uncommitted changes'
+    $parkedBranchSkipped = $res.Output -match '(?im)CODE UPDATE SKIPPED'
 
     if ($parkedBranchSkipped) {
         $shouldRetry = $false
@@ -1561,7 +1561,7 @@ try {
         Publish-UiProgress "Retrying update"
         $res = Invoke-HermesStep $pythonExe $updateArgs "update"
         Write-HandoffLog "retry exit code: $($res.Code)"
-        $parkedBranchSkipped = $res.Output -match '(?im)CODE UPDATE SKIPPED|checkout is parked on|working tree has uncommitted changes'
+        $parkedBranchSkipped = $res.Output -match '(?im)CODE UPDATE SKIPPED'
     }
 
     # -- 4. Truthful completion: don't trust exit 0 -------------------------

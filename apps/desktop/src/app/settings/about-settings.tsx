@@ -72,7 +72,12 @@ export function AboutSettings() {
   const updateAvailable = behind > 0 || Boolean(status?.updateAvailable)
   const supported = status?.supported !== false
   const applying = apply.applying || apply.stage === 'restart'
-  const updateParked = updateAvailable && Boolean(status?.dirty)
+  // A dirty working tree is safe to stash on the configured branch. The
+  // updater is parked only when the checkout is on a different branch/ref,
+  // which is the condition that requires an explicit operator choice.
+
+  const updateParked =
+    updateAvailable && Boolean(status?.currentBranch && status?.branch && status.currentBranch !== status.branch)
 
   const handleCheck = async () => {
     setJustChecked(false)

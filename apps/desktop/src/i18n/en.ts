@@ -1700,6 +1700,7 @@ export const en: Translations = {
     actionDone: 'done',
     actionFailed: 'failed',
     actionStartedWaiting: 'Action started, waiting for status...',
+    actionTimedOut: 'Action is still running; check recent logs for the final status.',
     loadingStatus: 'Loading status...',
     recentLogs: 'Recent logs',
     noLogs: 'No logs loaded yet.',

@@ -682,7 +682,17 @@ export function annotateLocalRosterRoutes(
 
     const live = liveId ? candidates.find(candidate => candidate.connectionId === liveId) : undefined
     const local = candidates.filter(candidate => candidate.mode === 'local')
-    const route = live || (candidates.length === 1 ? candidates[0] : local.length === 1 ? local[0] : undefined)
+    // Once an active connection is known, never silently retarget its row to
+    // a same-named route on another connection. Leaving it unscoped is safer
+    // than presenting a live remote bot as local (or vice versa).
+
+    const route = liveId
+      ? live
+      : candidates.length === 1
+        ? candidates[0]
+        : local.length === 1
+          ? local[0]
+          : undefined
 
     if (!route) {
       return row

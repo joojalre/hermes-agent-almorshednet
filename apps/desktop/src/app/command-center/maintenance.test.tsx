@@ -121,4 +121,23 @@ describe('MaintenancePanel memory files', () => {
     await waitFor(() => expect(mocks.downloadGatewayMediaFile).toHaveBeenCalledWith(remoteMemoryPath))
     expect(mocks.openExternal).not.toHaveBeenCalled()
   })
+
+  it('disables opening when the backend reports bytes without a file path', async () => {
+    mocks.isRemoteGateway.mockReturnValue(false)
+    mocks.getMemoryStatus.mockResolvedValue({
+      active: 'builtin',
+      builtin_files: { memory: 42, user: 0 },
+      providers: [],
+      builtin_paths: {}
+    })
+    const { MaintenancePanel } = await import('./maintenance')
+
+    render(<MaintenancePanel />)
+    expect(await screen.findByText('Agent memory (MEMORY.md)')).toBeTruthy()
+
+    const [openMemory] = screen.getAllByRole('button', { name: 'Open file' })
+    expect((openMemory as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(openMemory!)
+    expect(mocks.openExternal).not.toHaveBeenCalled()
+  })
 })
