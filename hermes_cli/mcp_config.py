@@ -753,7 +753,7 @@ def cmd_mcp_test(args):
         available = list(servers.keys())
         if available:
             _info(f"Available: {', '.join(available)}")
-        return
+        return 1
 
     cfg = servers[name]
     print()
@@ -792,7 +792,7 @@ def cmd_mcp_test(args):
     except Exception as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
         _error(f"Connection failed ({elapsed_ms:.0f}ms): {exc}")
-        return
+        return 1
 
     _success(f"Connected ({elapsed_ms:.0f}ms)")
     _success(f"Tools discovered: {len(tools)}")
@@ -803,6 +803,7 @@ def cmd_mcp_test(args):
             short = desc[:55] + "..." if len(desc) > 55 else desc
             print(f"    {color(tool_name, Colors.GREEN):36s} {short}")
     print()
+    return 0
 
 
 # ─── hermes mcp login ────────────────────────────────────────────────────────
@@ -1166,13 +1167,15 @@ def mcp_command(args):
             _sys.exit(rc)
         return
 
+    if action == "test":
+        return cmd_mcp_test(args)
+
     handlers = {
         "add": cmd_mcp_add,
         "remove": cmd_mcp_remove,
         "rm": cmd_mcp_remove,
         "list": cmd_mcp_list,
         "ls": cmd_mcp_list,
-        "test": cmd_mcp_test,
         "configure": cmd_mcp_configure,
         "config": cmd_mcp_configure,
         "login": cmd_mcp_login,

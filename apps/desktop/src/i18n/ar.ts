@@ -693,8 +693,10 @@ export const ar = defineLocale({
       updateReadyUnknown: 'تحديث جديد جاهز.',
       lastChecked: age => `آخر تحقق ${age}`,
       justNowSuffix: 'الآن',
-      automaticUpdates: 'التحديثات التلقائية',
-      automaticUpdatesDesc: 'اسمح لـ Hermes بالتحقق من التحديثات وتثبيتها.',
+      automaticUpdates: 'التحقق التلقائي من التحديثات',
+      automaticUpdatesDesc: 'تحقق من التحديثات وأرسل تنبيهاً في الخلفية. التثبيت يبقى إجراءً يدوياً.',
+      updateParked: 'التحديث متوقف مؤقتاً بانتظار بيئة آمنة.',
+      updateParkedDesc: 'تغييرات الإصلاح المحلية محفوظة. راجعها أو انقلها قبل تثبيت تحديث المصدر.',
       branchCommit: (branch, commit) => `${branch} عند ${commit}`,
       never: 'أبدا',
       justNow: 'الآن',
@@ -1031,7 +1033,8 @@ export const ar = defineLocale({
     toolsetEnabled: 'تم تفعيل مجموعة الأدوات',
     toolsetDisabled: 'تم تعطيل مجموعة الأدوات',
     appliesToNewSessions: name => `ينطبق على الجلسات الجديدة في ${name}`,
-    failedToUpdate: name => `فشل تحديث ${name}`
+    failedToUpdate: name => `فشل تحديث ${name}`,
+    provenanceSummary: (agent, bundled, hub) => `${agent} متعلّمة · ${bundled} مدمجة · ${hub} من Hub`
   },
   agents: {
     close: 'إغلاق الوكلاء',
@@ -1203,6 +1206,7 @@ export const ar = defineLocale({
     actionDone: 'اكتمل الإجراء',
     actionFailed: 'فشل الإجراء',
     actionStartedWaiting: 'بدأ الإجراء، جار الانتظار...',
+    actionTimedOut: 'ما زال الإجراء يعمل؛ راجع السجلات الأخيرة لمعرفة حالته النهائية.',
     loadingStatus: 'جار تحميل الحالة',
     recentLogs: 'السجلات الأخيرة',
     noLogs: 'لا توجد سجلات',
@@ -1223,7 +1227,10 @@ export const ar = defineLocale({
     noModelUsage: 'لا يوجد استخدام نماذج',
     topSkills: 'أكثر المهارات استخداما',
     noSkillActivity: 'لا يوجد نشاط مهارات',
-    actions: count => `${count} إجراء`
+    actions: count => `${count} إجراء`,
+    maintenance: {
+      openFile: 'فتح الملف'
+    }
   },
   messaging: {
     search: 'بحث',
