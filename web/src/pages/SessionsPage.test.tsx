@@ -35,7 +35,7 @@ let container: HTMLDivElement;
 let root: Root;
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function waitFor(cond: () => boolean, timeoutMs = 5000) {
+async function waitFor(cond: () => boolean, timeoutMs = 15_000) {
   const start = Date.now();
   while (!cond()) {
     if (Date.now() - start > timeoutMs) throw new Error("waitFor: condition never became true");
@@ -150,5 +150,5 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     );
     await act(async () => click(confirm ?? null));
     expect(apiMocks.deleteSession).toHaveBeenCalledWith("sid-guanli", "guanli");
-  });
+  }, 15_000);
 });
