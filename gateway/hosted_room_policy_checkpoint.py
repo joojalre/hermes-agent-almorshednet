@@ -296,6 +296,45 @@ class HostedRoomPolicyCheckpoint:
         ).fetchall()
         return [self._event_from_room_row(row) for row in rows]
 
+    def _with_authority_lineage(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        room_id: str,
+        through_seq: int,
+        events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Include durable ownership transitions needed to validate history."""
+
+        epochs = [
+            int(event["authority_epoch"])
+            for event in events
+            if isinstance(event.get("authority_epoch"), int)
+            and not isinstance(event.get("authority_epoch"), bool)
+        ]
+        if not epochs:
+            return events
+        oldest_epoch = min(epochs)
+        rows = conn.execute(
+            """SELECT room_id, seq, event_id, kind, actor_json,
+                      authority_epoch, payload_json, created_at
+               FROM hosted_room_events
+               WHERE room_id=?
+                 AND kind IN ('authority.claimed', 'authority.lost')
+                 AND authority_epoch>?
+                 AND seq<=?
+               ORDER BY seq""",
+            (room_id, oldest_epoch, through_seq),
+        ).fetchall()
+        events_by_seq = {int(event["seq"]): event for event in events}
+        events_by_seq.update(
+            {
+                int(row["seq"]): self._event_from_room_row(row)
+                for row in rows
+            }
+        )
+        return [events_by_seq[seq] for seq in sorted(events_by_seq)]
+
     def _apply_event(self, conn: sqlite3.Connection, event: Mapping[str, Any]) -> None:
         room_id = str(event["room_id"])
         seq = int(event["seq"])
@@ -316,7 +355,9 @@ class HostedRoomPolicyCheckpoint:
                    ON CONFLICT(room_id, thread_id) DO UPDATE SET
                        discussion_event_id=excluded.discussion_event_id,
                        latest_user_seq=excluded.latest_user_seq,
-                       completed=0""",
+                       completed=0
+                   WHERE excluded.latest_user_seq >
+                         hosted_room_policy_threads.latest_user_seq""",
                 (room_id, thread_id, event_id, seq),
             )
             self._store_active_event(
@@ -482,6 +523,12 @@ class HostedRoomPolicyCheckpoint:
                     (room_id, _TRANSCRIPT_SCHEMA_VERSION),
                 )
         if cursor > latest_seq:
+            # Callers can race a newer sync and carry an older room snapshot.
+            # A durable cursor only becomes invalid when it is ahead of the
+            # actual event log, not merely ahead of this caller's snapshot.
+            durable = hosted_rooms.room_state(self.db_path, room_id=room_id)
+            if cursor <= int(durable["latest_seq"]):
+                return cursor
             raise RuntimeError("room policy cursor is ahead of the durable log")
 
         while cursor < latest_seq:
@@ -492,9 +539,12 @@ class HostedRoomPolicyCheckpoint:
                 limit=hosted_rooms.MAX_LOG_LIMIT,
             )
             rows = [
-                event for event in page.get("events", []) if isinstance(event, Mapping)
+                event
+                for event in page.get("events", [])
+                if isinstance(event, Mapping)
+                and int(event.get("seq") or 0) <= latest_seq
             ]
-            next_cursor = int(page.get("cursor") or cursor)
+            next_cursor = int(rows[-1].get("seq") or cursor) if rows else cursor
             if not rows or next_cursor <= cursor:
                 raise RuntimeError("hosted room policy cursor did not advance")
             with self._connect() as conn:
@@ -504,15 +554,28 @@ class HostedRoomPolicyCheckpoint:
                     (room_id,),
                 ).fetchone() is None:
                     raise hosted_rooms.RoomNotFoundError("hosted room not found")
+                current = conn.execute(
+                    "SELECT through_seq FROM hosted_room_policy_cursors "
+                    "WHERE room_id=?",
+                    (room_id,),
+                ).fetchone()
+                if current is None:
+                    raise RuntimeError("room policy cursor disappeared during replay")
+                current_cursor = int(current["through_seq"])
+                if current_cursor != cursor:
+                    cursor = current_cursor
+                    continue
                 for event in rows:
                     self._apply_event(conn, event)
                 updated = conn.execute(
                     """UPDATE hosted_room_policy_cursors
-                       SET through_seq=?, updated_at=? WHERE room_id=?""",
+                       SET through_seq=?, updated_at=?
+                       WHERE room_id=? AND through_seq=?""",
                     (
                         next_cursor,
                         float(rows[-1].get("created_at") or 0),
                         room_id,
+                        cursor,
                     ),
                 )
                 if updated.rowcount != 1:
@@ -562,23 +625,29 @@ class HostedRoomPolicyCheckpoint:
                 room_id=room_id,
                 thread_id=str(thread["thread_id"]),
             )
+            events_by_seq = {
+                int(event["seq"]): event
+                for event in (
+                    *transcript_events,
+                    *(json.loads(row["event_json"]) for row in active_rows),
+                )
+            }
+            events = self._with_authority_lineage(
+                conn,
+                room_id=room_id,
+                through_seq=through_seq,
+                events=[events_by_seq[seq] for seq in sorted(events_by_seq)],
+            )
             watermark_rows = conn.execute(
                 """SELECT member_id, seen_through_seq
                    FROM hosted_room_policy_watermarks
                    WHERE room_id=? AND thread_id=?""",
                 (room_id, str(thread["thread_id"])),
             ).fetchall()
-        events_by_seq = {
-            int(event["seq"]): event
-            for event in (
-                *transcript_events,
-                *(json.loads(row["event_json"]) for row in active_rows),
-            )
-        }
         return PolicySnapshot(
             through_seq=through_seq,
             stopped_through_seq=stopped_through_seq,
-            events=tuple(events_by_seq[seq] for seq in sorted(events_by_seq)),
+            events=tuple(events),
             watermarks={
                 (str(thread["thread_id"]), str(row["member_id"])): int(
                     row["seen_through_seq"]
@@ -649,16 +718,31 @@ class HostedRoomPolicyCheckpoint:
                 room_id=room_id,
                 thread_id=str(source["thread_id"]),
             )
+            events_by_seq = {
+                int(event["seq"]): event
+                for event in (
+                    *transcript_events,
+                    *(json.loads(row["event_json"]) for row in active_rows),
+                )
+            }
+            cursor = conn.execute(
+                "SELECT through_seq FROM hosted_room_policy_cursors WHERE room_id=?",
+                (room_id,),
+            ).fetchone()
+            through_seq = (
+                int(cursor["through_seq"])
+                if cursor is not None
+                else max(events_by_seq, default=0)
+            )
+            events = self._with_authority_lineage(
+                conn,
+                room_id=room_id,
+                through_seq=through_seq,
+                events=[events_by_seq[seq] for seq in sorted(events_by_seq)],
+            )
         if len(active_rows) > MAX_ACTIVE_POLICY_EVENTS:
             raise RuntimeError("task policy projection exceeded its bound")
-        events_by_seq = {
-            int(event["seq"]): event
-            for event in (
-                *transcript_events,
-                *(json.loads(row["event_json"]) for row in active_rows),
-            )
-        }
-        return [events_by_seq[seq] for seq in sorted(events_by_seq)]
+        return events
 
     def compact_completed(self, *, room_id: str) -> None:
         """Drop any completed projections left by an interrupted sync."""

@@ -9,6 +9,7 @@ from .method_ctx import HandlerRegistry
 
 import os
 import threading
+import uuid
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -48,7 +49,7 @@ def bind_server(server) -> None:
     server._profile_execution_policy = _profile_execution_policy
 
 
-def start_hosted_room_service():
+def start_hosted_room_service(*, start_allowed: threading.Event | None = None):
     """Start one process-owned hosted room service idempotently."""
 
     global _service
@@ -59,6 +60,8 @@ def start_hosted_room_service():
 
     db_path = default_db_path()
     with _service_lock:
+        if start_allowed is not None and not start_allowed.is_set():
+            return None
         if _service is not None and _service.db_path != db_path:
             _service.stop(timeout=1.0)
             _service = None
@@ -621,9 +624,13 @@ def _(rid, params: dict) -> dict:
 @method("groups.disband")
 def _(rid, params: dict) -> dict:
     """Permanently tombstone a hosted room id."""
+    import time
+
+    from gateway import hosted_room_driver as driver
     from gateway.hosted_rooms import (
         AuthorityConflictError,
         HostedRoomError,
+        RoomConflictError,
         RoomHistoryExpiredError,
         disband_room,
         local_authority_gateway_id,
@@ -635,8 +642,10 @@ def _(rid, params: dict) -> dict:
         if service is None:
             return _err(rid, 4123, _WORKER_UNAVAILABLE)
 
+        local_gateway_id = local_authority_gateway_id()
+        disband_barrier_reason = "room-disband"
+
         def disband_with_state(state: dict | None = None) -> dict:
-            local_gateway_id = local_authority_gateway_id()
             if state is not None and (
                 str(state["authority_gateway_id"]) != local_gateway_id
             ):
@@ -666,9 +675,46 @@ def _(rid, params: dict) -> dict:
         if existing.get("disbanded_at") is not None:
             tombstone = disband_with_state(existing)
             return _ok(rid, {"tombstone": tombstone})
+        expected_epoch = int(existing["authority_epoch"])
+        try:
+            barrier = driver.block_room_admissions(
+                service.db_path,
+                room_id=params.get("room_id"),
+                reason=disband_barrier_reason,
+                expected_gateway_id=local_gateway_id,
+                expected_epoch=expected_epoch,
+                clock=time.time,
+            )
+        except driver.RoomUnavailableError:
+            try:
+                raced = room_state(
+                    service.db_path,
+                    room_id=params.get("room_id"),
+                    include_disbanded=True,
+                )
+            except RoomHistoryExpiredError:
+                tombstone = disband_with_state()
+                return _ok(rid, {"tombstone": tombstone})
+            if raced.get("disbanded_at") is None:
+                raise
+            tombstone = disband_with_state(raced)
+            return _ok(rid, {"tombstone": tombstone})
+        except driver.StaleLeaseError as exc:
+            raise AuthorityConflictError("stale hosted room authority") from exc
+        if (
+            str(barrier.get("gateway_id") or "") != local_gateway_id
+            or int(barrier.get("authority_epoch") or 0) != expected_epoch
+        ):
+            raise AuthorityConflictError("stale hosted room authority")
+        if barrier.get("reason") != disband_barrier_reason:
+            raise RoomConflictError(
+                "room authority epoch is blocked for a different reason"
+            )
         service.stop_room(
             str(params.get("room_id") or ""),
-            cancel_id=str(params.get("cancel_id") or "room-disbanded"),
+            cancel_id=str(
+                params.get("cancel_id") or f"desktop-disband:{uuid.uuid4().hex}"
+            ),
             require_acknowledged=True,
         )
         service.revoke_room_routes(str(params.get("room_id") or ""))
@@ -691,7 +737,9 @@ def _(rid, params: dict) -> dict:
     try:
         count = service.stop_room(
             str(params.get("room_id") or ""),
-            cancel_id=str(params.get("cancel_id") or "desktop-stop"),
+            cancel_id=str(
+                params.get("cancel_id") or f"desktop-stop:{uuid.uuid4().hex}"
+            ),
         )
         return _ok(rid, {"cancelled": count})
     except Exception as exc:
@@ -845,22 +893,25 @@ def _(rid, params: dict) -> dict:
 @method("groups.demote")
 def _(rid, params: dict) -> dict:
     """Fence this gateway's stale room authority against a proven newer epoch."""
-    from gateway.hosted_room_replicas import ReplicaError, demote_room
-    from gateway.hosted_rooms import default_db_path
+    from gateway.hosted_room_replicas import ReplicaError
+    from gateway.hosted_rooms import HostedRoomError
 
     try:
-        result = demote_room(
-            default_db_path(),
-            room_id=params.get("room_id"),
+        service = get_hosted_room_service()
+        if service is None:
+            return _err(rid, 4123, _WORKER_UNAVAILABLE)
+        result = service.demote_room(
+            params.get("room_id"),
             observed_gateway_id=params.get("observed_gateway_id"),
             observed_epoch=params.get("observed_epoch"),
         )
         return _ok(rid, result)
     except ReplicaError as exc:
         return _err(rid, 4119, str(exc))
+    except HostedRoomError as exc:
+        return _err(rid, 4119, str(exc))
     except Exception as exc:
         return _err(rid, 5119, str(exc))
-
 
 def register(server) -> None:
     _registry.install(server)

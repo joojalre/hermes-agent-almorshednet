@@ -16308,6 +16308,12 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    # Keep this custom-provider regression independent of real local OAuth
+    # sessions (for example Claude Code credentials on a developer machine).
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
+    )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -16565,6 +16571,117 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     # Text stays empty — we did NOT fabricate an "Error:" string
     text = payload.get("text", "")
     assert text in {"", None}, f"expected empty text, got {text!r}"
+
+
+def test_hosted_prompt_persists_terminal_receipt_before_callback_failure(
+    monkeypatch,
+    tmp_path,
+):
+    """The real prompt RPC leaves exact durable proof if its callback dies."""
+
+    from gateway import hosted_room_driver as driver_state
+    from gateway import hosted_rooms
+    from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
+
+    class _Agent:
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            **_kwargs,
+        ):
+            return {
+                "final_response": "durable answer",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+    db_path = tmp_path / "state.db"
+    hosted_rooms.create_room(
+        db_path,
+        room_id="room-1",
+        name="Release room",
+        members=[{"member_id": "ops", "profile": "ops", "handle": "ops"}],
+        authority_gateway_id="gateway-a",
+        now=90,
+    )
+    identity = driver_state.TaskIdentity(
+        room_id="room-1",
+        task_id="task-1",
+        thread_id="thread-1",
+        turn_id="turn-1",
+    )
+    driver_state.admit_task(
+        db_path,
+        identity,
+        payload={
+            "target_profile": "ops",
+            "prompt": "Inspect the release candidate.",
+            "source_event_seq": 1,
+        },
+        clock=lambda: 100.0,
+    )
+    lease = driver_state.acquire_lease(
+        db_path,
+        room_id="room-1",
+        gateway_id="gateway-a",
+        authority_epoch=1,
+        process_generation="process-a",
+        ttl_seconds=30,
+        clock=lambda: 100.0,
+    )
+    attempt = driver_state.start_task(
+        db_path,
+        identity,
+        lease,
+        expected_cancel_generation=0,
+        clock=lambda: 100.0,
+    )
+
+    monkeypatch.setattr(hosted_rooms, "default_db_path", lambda: db_path)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    session_id = "hosted-terminal-proof"
+    server._sessions[session_id] = _session(
+        agent=_Agent(),
+        session_key=session_id,
+        source="bot_room",
+        profile="ops",
+        title="Group: room-1",
+        hidden=True,
+    )
+
+    def callback_failure(_receipt):
+        raise RuntimeError("process-local terminal callback failed")
+
+    try:
+        rpc = HostedRoomServerRPC(server)
+        rpc.submit(
+            profile="ops",
+            session_id=session_id,
+            prompt="Inspect the release candidate.",
+            source="bot_room",
+            task=identity,
+            execution_generation=attempt.execution_generation,
+            on_terminal=callback_failure,
+        )
+
+        receipt = driver_state.get_terminal_receipt(
+            db_path,
+            identity,
+            execution_generation=attempt.execution_generation,
+        )
+        assert receipt is not None
+        assert receipt["status"] == "settled"
+        assert receipt["result"]["text"] == "durable answer"
+        assert "_hosted_room_task" not in server._sessions[session_id]
+    finally:
+        server._sessions.pop(session_id, None)
 
 
 # ── active live TUI sessions ─────────────────────────────────────────
