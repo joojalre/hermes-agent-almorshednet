@@ -726,7 +726,7 @@ def _install_startup_entry(script_path: Path) -> Path:
     return entry
 
 
-def _remove_startup_fallback() -> tuple[list[Path], list[tuple[Path, OSError]]]:
+def _remove_startup_fallback() -> tuple[list[Path], list[tuple[Path, Exception]]]:
     """Remove obsolete Startup-folder entries after Scheduled Task recovery.
 
     A Startup entry is a fallback for machines where Task Scheduler could not
@@ -739,8 +739,20 @@ def _remove_startup_fallback() -> tuple[list[Path], list[tuple[Path, OSError]]]:
     Scheduled Task installation fail.
     """
     removed: list[Path] = []
-    failures: list[tuple[Path, OSError]] = []
-    for entry in (get_startup_entry_path(), _legacy_startup_entry_path()):
+    failures: list[tuple[Path, Exception]] = []
+    for label, resolver in (
+        ("current Startup fallback", get_startup_entry_path),
+        ("legacy Startup fallback", _legacy_startup_entry_path),
+    ):
+        # Path resolution itself depends on the user environment.  The task is
+        # already authoritative at this point, so an unusual shell that lacks
+        # an AppData/Home variable must not make a successful Task install look
+        # like a failure or skip its start/next-step handling.
+        try:
+            entry = resolver()
+        except Exception as exc:
+            failures.append((Path(f"<{label}>"), exc))
+            continue
         try:
             entry.unlink()
         except FileNotFoundError:
