@@ -28,7 +28,7 @@ import { _electron, type ElectronApplication, type Page } from '@playwright/test
 
 import { resolveElectronBinary } from './electron-binary'
 import { buildAppEnvFromParent } from './fixtures-env'
-import { startMockServer, type MockServerOptions } from './mock-server'
+import { type MockServerOptions, startMockServer } from './mock-server'
 import { installErrorBannerGuard } from './test'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
@@ -295,6 +295,8 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
+  /** Customize the mock inference server for an E2E scenario. */
+  mockServer?: MockServerOptions
 }
 
 /**
@@ -304,10 +306,6 @@ export interface MockBackendOptions {
  *   3. Launch the desktop app
  *   4. Return handles for test interaction
  */
-export interface MockBackendOptions {
-  mockServer?: MockServerOptions
-}
-
 export async function setupMockBackend(options: MockBackendOptions = {}): Promise<MockBackendFixture> {
   // 1. Start mock server
   const mock = await startMockServer(options.mockServer)
