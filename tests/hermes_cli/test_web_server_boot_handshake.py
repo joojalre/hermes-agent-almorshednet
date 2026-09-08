@@ -33,6 +33,7 @@ from unittest.mock import patch
 import pytest
 
 import hermes_cli.web_server as web_server_mod
+import hermes_cli.web_server_lifecycle as _web_server_lifecycle
 
 SLOW_SECONDS = 1  # represents the Defender worst-case (scaled down for CI speed)
 
@@ -91,21 +92,30 @@ def test_hosted_room_recovery_cannot_block_or_abort_backend_startup(monkeypatch)
 
     started = threading.Event()
     release = threading.Event()
+    finished = threading.Event()
 
     def blocked_failure(*, start_allowed=None):
         assert start_allowed is not None and start_allowed.is_set()
         started.set()
-        release.wait(timeout=2.0)
-        raise RuntimeError("state.db is locked")
+        try:
+            assert release.wait(timeout=10.0)
+            raise RuntimeError("state.db is locked")
+        finally:
+            finished.set()
 
-    monkeypatch.setattr(web_server_mod, "_warm_gateway_module", lambda: None)
+    _isolate_lifespan_backgrounds(monkeypatch)
     monkeypatch.setattr(methods_groups, "start_hosted_room_service", blocked_failure)
     monkeypatch.setattr(methods_groups, "stop_hosted_room_service", lambda **_kwargs: True)
 
-    before = time.perf_counter()
-    with TestClient(web_server_mod.app, raise_server_exceptions=False):
-        assert started.wait(timeout=1.0)
-        assert time.perf_counter() - before < 1.0
+    try:
+        with TestClient(web_server_mod.app, raise_server_exceptions=False):
+            assert started.wait(timeout=5.0)
+            # The backend yielded while recovery is still blocked, regardless of
+            # unrelated host load. Synchronous recovery would finish before yield.
+            assert not finished.is_set()
+            release.set()
+            assert finished.wait(timeout=5.0)
+    finally:
         release.set()
 
 
@@ -138,6 +148,7 @@ async def test_lifespan_shutdown_keeps_event_loop_responsive(monkeypatch):
     start_finished = threading.Event()
     stop_started = threading.Event()
     stop_finished = threading.Event()
+    release_stop = threading.Event()
     stop_threads: list[int] = []
     loop_thread = threading.get_ident()
 
@@ -148,7 +159,7 @@ async def test_lifespan_shutdown_keeps_event_loop_responsive(monkeypatch):
     def slow_stop(*, timeout=5.0):
         stop_threads.append(threading.get_ident())
         stop_started.set()
-        time.sleep(0.25)
+        assert release_stop.wait(timeout=10.0)
         stop_finished.set()
         return True
 
@@ -157,20 +168,19 @@ async def test_lifespan_shutdown_keeps_event_loop_responsive(monkeypatch):
 
     lifespan = web_server_mod._lifespan(SimpleNamespace(state=SimpleNamespace()))
     await lifespan.__aenter__()
-    assert await asyncio.to_thread(start_finished.wait, 1.0)
+    assert await asyncio.to_thread(start_finished.wait, 10.0)
 
     shutdown = asyncio.create_task(lifespan.__aexit__(None, None, None))
-    await asyncio.sleep(0)
-    deadline = asyncio.get_running_loop().time() + 1.0
-    while not stop_started.is_set() and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.005)
+    try:
+        assert await asyncio.to_thread(stop_started.wait, 10.0)
+        await asyncio.sleep(0)
+        assert not stop_finished.is_set()
+        assert not shutdown.done()
+    finally:
+        release_stop.set()
+        await asyncio.wait_for(shutdown, timeout=10.0)
 
-    loop_progressed_while_stop_was_running = (
-        stop_started.is_set() and not stop_finished.is_set()
-    )
-    await asyncio.wait_for(shutdown, timeout=2.0)
-
-    assert loop_progressed_while_stop_was_running
+    assert stop_finished.is_set()
     assert stop_threads
     assert all(thread_id != loop_thread for thread_id in stop_threads)
 
@@ -300,7 +310,7 @@ def test_get_status_does_not_block_event_loop():
                 tg.create_task(_version())
 
     with patch.object(
-        web_server_mod, "_resolve_restart_drain_timeout", _make_slow_drain(SLOW_SECONDS)
+        _web_server_lifecycle, "_resolve_restart_drain_timeout", _make_slow_drain(SLOW_SECONDS)
     ):
         asyncio.run(_run())
 
@@ -355,7 +365,7 @@ def test_concurrent_status_probes_all_respond():
                     responses.append(r.status_code)
 
     with patch.object(
-        web_server_mod, "_resolve_restart_drain_timeout", _make_slow_drain(SLOW_SECONDS)
+        _web_server_lifecycle, "_resolve_restart_drain_timeout", _make_slow_drain(SLOW_SECONDS)
     ):
         asyncio.run(_run())
 

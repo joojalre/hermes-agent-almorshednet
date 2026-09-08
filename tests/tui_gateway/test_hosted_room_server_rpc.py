@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -119,25 +120,31 @@ def test_handler_calls_use_a_private_drop_transport_and_restore_the_caller():
 def test_info_and_interrupt_are_exact_task_scoped():
     server, calls = _server()
     lock = threading.Lock()
+    task = TaskIdentity("room", "task-a", "thread", "turn")
+    proof = {**asdict(task), "execution_generation": 2}
     server._sessions["runtime"] = {
         "history_lock": lock,
         "running": True,
-        "_hosted_room_task": {"task_id": "task-a"},
+        "_hosted_room_task": proof,
     }
     rpc = HostedRoomServerRPC(server)
 
     assert rpc.info(profile="ops", session_id="runtime", source="bot_room") == {
         "active": True,
         "task_id": "task-a",
+        "hosted_task": proof,
     }
     rpc.interrupt(
         profile="ops",
         session_id="runtime",
         source="bot_room",
         expected_task_id="task-a",
+        expected_task=task,
+        expected_execution_generation=2,
     )
     params = next(params for method, params in calls if method == "session.interrupt")
     assert params["expected_hosted_task_id"] == "task-a"
+    assert params["_expected_hosted_task"] == proof
 
 
 def test_local_approval_snapshot_and_response_use_exact_request():

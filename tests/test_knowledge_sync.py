@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import knowledge
+from tools.memory_tool_store import MemoryStore
 
 
 class _TrackingBytesIO(io.BytesIO):
@@ -338,7 +339,7 @@ def test_apply_holds_one_transaction_lock_through_memory_and_audit(
     monkeypatch.setenv("HERMES_HOME", str(home))
     manifest = _manifest(tmp_path / "transaction-lock.json")
     lock_depth = 0
-    real_lock = knowledge.MemoryStore._file_lock
+    real_lock = MemoryStore._file_lock
     real_write = knowledge._write_managed_memory
     real_append = knowledge._append_audit
 
@@ -361,7 +362,7 @@ def test_apply_holds_one_transaction_lock_through_memory_and_audit(
         return real_append(event)
 
     monkeypatch.setattr(
-        knowledge.MemoryStore, "_file_lock", staticmethod(tracking_lock)
+        MemoryStore, "_file_lock", staticmethod(tracking_lock)
     )
     monkeypatch.setattr(knowledge, "_write_managed_memory", checked_write)
     monkeypatch.setattr(knowledge, "_append_audit", checked_append)
@@ -1301,17 +1302,17 @@ def test_external_memory_change_between_save_and_readback_is_preserved(
     memory_path.write_text("existing", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     manifest = _manifest(tmp_path / "save-readback-race.json")
-    original_save = knowledge.MemoryStore.save_to_disk
+    original_write = MemoryStore._write_file
 
-    def save_then_change(store, target):
-        original_save(store, target)
+    def write_then_change(path, entries):
+        original_write(path, entries)
         applied = memory_path.read_text(encoding="utf-8")
         memory_path.write_text(
             applied + knowledge.ENTRY_DELIMITER + "external",
             encoding="utf-8",
         )
 
-    monkeypatch.setattr(knowledge.MemoryStore, "save_to_disk", save_then_change)
+    monkeypatch.setattr(MemoryStore, "_write_file", staticmethod(write_then_change))
     args = SimpleNamespace(
         manifest=str(manifest), dry_run=False, apply=True, json=True
     )
@@ -1368,10 +1369,10 @@ def test_memory_write_error_is_reported_without_traceback(
     monkeypatch.setenv("HERMES_HOME", str(home))
     manifest = _manifest(tmp_path / "write-error.json")
 
-    def fail_write(_store, _target):
+    def fail_write(_path, _entries):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(knowledge.MemoryStore, "save_to_disk", fail_write)
+    monkeypatch.setattr(MemoryStore, "_write_file", staticmethod(fail_write))
     args = SimpleNamespace(
         manifest=str(manifest), dry_run=False, apply=True, json=True
     )
