@@ -7,8 +7,10 @@ around the real callback/observer; receipt writes and public publication stay in
 from __future__ import annotations
 
 import sqlite3
+import sys
 import threading
 import time
+import traceback
 from dataclasses import asdict
 from pathlib import Path
 
@@ -59,6 +61,10 @@ class _Model:
     def clear_interrupt(self):
         self.interrupted.clear()
 
+    def switch_model(self, *, new_model, new_provider, **kwargs):
+        self.model = new_model
+        self.provider = new_provider
+
     def hard_interrupt(self):
         if self.harness.interrupt_hook is not None:
             self.harness.interrupt_hook(self)
@@ -96,6 +102,7 @@ class _Harness:
         self.prompt_dispatched = threading.Event()
         self.allow_build = threading.Event()
         self.calls = []
+        self.call_errors = []
         self.frames = _Frames()
         self.service = HostedRoomService(server, db_path=self.db_path)
         self.rpc = self.service.rpc
@@ -154,6 +161,12 @@ class _Harness:
     def member_replies(self):
         return [e for e in self.service._events(self.binding.room_id) if e["kind"] == "message.member"]
 
+    def admission_diagnostics(self, worker):
+        frame = sys._current_frames().get(worker.ident)
+        return (f"calls={self.calls!r}\ncall_errors={self.call_errors!r}\n"
+                f"runtime={self.runtime.status()!r}\nworker_alive={worker.is_alive()}\n"
+                + ("".join(traceback.format_stack(frame)) if frame is not None else "no worker frame"))
+
     def execute(self, attempt):
         self.accepted.clear()
         worker = threading.Thread(target=self.runtime._execute_attempt, args=(
@@ -171,6 +184,8 @@ def installed_runtime(tmp_path, monkeypatch):
     profile.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Native metadata probes must not discover a repository above this empty fixture.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
     # These are path/registry isolation, not substitutes for the installed handlers or DB.
     monkeypatch.setattr(server, "_hermes_home", home)
     monkeypatch.setattr(server, "_CRASH_LOG", str(tmp_path / "turn-crash.log"))
@@ -196,7 +211,11 @@ def installed_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_run_after_agent_ready", observe_dispatch)
 
     def observe_call(method, params):
-        result = real_call(method, params)
+        try:
+            result = real_call(method, params)
+        except Exception as exc:
+            harness.call_errors.append((method, type(exc).__name__, str(exc)))
+            raise
         harness.calls.append((method, params, result))
         if method == "prompt.submit":
             assert result["status"] == "streaming"
@@ -300,7 +319,8 @@ def test_installed_terminal_receipt_and_observer_replay(installed_runtime, monke
     worker = threading.Thread(target=h.runtime._process_room, args=(h.binding,), daemon=True)
     worker.start()
     try:
-        assert h.accepted.wait(WAIT), h.calls
+        if not h.accepted.wait(WAIT):
+            pytest.fail(h.admission_diagnostics(worker))
         # session.create is lazy, but FIRST prompt persistence pins the real profile row,
         # before model readiness, private receipt or publication.
         with SessionDB(h.home / "profiles" / "ops" / "state.db") as profile_db:
@@ -655,6 +675,157 @@ def test_installed_callback_publication_failure_replays_bounded_result(installed
     finally:
         recovered.runtime.stop()
         recovered.runtime._drop_lease(h.binding.room_id)
+
+
+def test_installed_stop_before_worker_keeps_admission_claim(installed_runtime, monkeypatch):
+    from tui_gateway.hosted_room_server_rpc import HostedRoomSessionError
+
+    h = installed_runtime
+    identity = h.enqueue()
+    attempt = _start_attempt(h, identity)
+    persisted, release_submit = threading.Event(), threading.Event()
+    real_persist = server._persist_session_row_for_submit
+    failures = []
+
+    def persist_then_pause(*args, **kwargs):
+        result = real_persist(*args, **kwargs)
+        if not persisted.is_set():
+            persisted.set()
+            assert release_submit.wait(WAIT)
+        return result
+
+    def submit_old():
+        try:
+            h.execute(attempt)
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(server, "_persist_session_row_for_submit", persist_then_pause)
+    worker = threading.Thread(target=submit_old, name="old-hosted-submit", daemon=True)
+    worker.start()
+    try:
+        assert persisted.wait(WAIT)
+        assert h.session.get("_run_thread") is None
+        assert h.runtime.cancel(identity, cancel_id="stop-before-worker")["status"] == "cancelled"
+        next_identity = state.TaskIdentity(h.binding.room_id, "replacement", "thread-2", "turn-2")
+        state.admit_task(h.db_path, next_identity,
+                         payload={"target_profile": "ops", "target_member_id": "ops",
+                                  "source_event_seq": 1, "prompt": "inspect next release"},
+                         clock=h.runtime.clock)
+        replacement = _start_attempt(h, next_identity)
+        with pytest.raises(HostedRoomSessionError) as busy:
+            _submit_attempt(h, replacement)
+        assert busy.value.code == 4091
+        assert h.session["running"]
+        assert h.session["_hosted_room_task"] == {
+            **asdict(identity), "execution_generation": attempt.execution_generation}
+    finally:
+        release_submit.set()
+        h.allow_build.set()
+        _join(worker)
+        h.finish_turn()
+    assert failures == []
+    assert h.model_calls == []
+    assert state.get_terminal_receipt(h.db_path, identity,
+                                      execution_generation=attempt.execution_generation) is None
+
+
+def test_installed_stop_before_turn_admission_never_clears_interrupt(installed_runtime, monkeypatch):
+    h = installed_runtime
+    identity = h.enqueue()
+    attempt = _start_attempt(h, identity)
+    admitting, release_admit = threading.Event(), threading.Event()
+    real_admit = server._admit_prompt_turn
+
+    def pause_before_admission(*args, **kwargs):
+        admitting.set()
+        assert release_admit.wait(WAIT)
+        return real_admit(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_admit_prompt_turn", pause_before_admission)
+    h.allow_build.set()
+    h.execute(attempt)
+    try:
+        assert admitting.wait(WAIT)
+        assert h.model_calls == []
+        assert h.runtime.cancel(identity, cancel_id="stop-before-admit")["status"] == "cancelled"
+        assert h.models[0].interrupted.is_set()
+    finally:
+        release_admit.set()
+        h.finish_turn()
+    assert h.model_calls == []
+    assert h.models[0].interrupted.is_set()
+    assert state.get_terminal_receipt(h.db_path, identity,
+                                      execution_generation=attempt.execution_generation) is None
+
+
+def test_cancelled_start_keeps_claim_until_model_restore_finishes(installed_runtime, monkeypatch):
+    from tui_gateway.hosted_room_server_rpc import HostedRoomSessionError
+
+    h = installed_runtime
+    identity = h.enqueue()
+    attempt = _start_attempt(h, identity)
+    admitted, release_admission, cleanup, release_cleanup = (threading.Event() for _ in range(4))
+    real_admit, real_finish = server._admit_prompt_turn, server._finish_turn
+    restore = {"model": "restored-test-model", "provider": "test"}
+
+    def pause_after_admission(*args, **kwargs):
+        result = real_admit(*args, **kwargs)
+        if not admitted.is_set():
+            assert result is not None
+            admitted.set()
+            assert release_admission.wait(WAIT)
+        return result
+
+    def pause_before_cleanup(sid, session, st):
+        if st.hosted_task["task_id"] == identity.task_id:
+            assert st.one_turn_restore == restore
+            cleanup.set()
+            assert release_cleanup.wait(WAIT)
+        return real_finish(sid, session, st)
+
+    monkeypatch.setattr(server, "_admit_prompt_turn", pause_after_admission)
+    monkeypatch.setattr(server, "_finish_turn", pause_before_cleanup)
+    h.allow_build.set()
+    h.execute(attempt)
+    old_thread = None
+    try:
+        assert admitted.wait(WAIT)
+        with h.session["history_lock"]:
+            h.session["one_turn_model_restore"] = restore
+        assert h.runtime.cancel(identity, cancel_id="stop-before-cleanup")["status"] == "cancelled"
+        release_admission.set()
+        assert cleanup.wait(WAIT)
+        old_thread = h.session["_run_thread"]
+        # The first discussion is cancelled, so use the real storage admission
+        # API for a separate attempt rather than waiting for discussion policy.
+        replacement_identity = state.TaskIdentity(h.binding.room_id, "replacement", "thread-2", "turn-2")
+        state.admit_task(h.db_path, replacement_identity,
+                         payload={"target_profile": "ops", "target_member_id": "ops",
+                                  "source_event_seq": 1, "prompt": "inspect next release"},
+                         clock=h.runtime.clock)
+        replacement = _start_attempt(h, replacement_identity)
+        with pytest.raises(HostedRoomSessionError) as busy:
+            _submit_attempt(h, replacement)
+        assert busy.value.code == 4091
+        assert h.session["running"]
+        assert h.session["_hosted_room_task"] == {
+            **asdict(identity), "execution_generation": attempt.execution_generation}
+        assert h.models[0].model == "test-model"
+    finally:
+        release_admission.set()
+        release_cleanup.set()
+        if old_thread is not None:
+            _join(old_thread)
+        h.finish_turn()
+    assert h.models[0].model == "restored-test-model"
+    assert h.model_calls == []
+    assert state.get_terminal_receipt(h.db_path, identity,
+                                      execution_generation=attempt.execution_generation) is None
+    assert not h.session["running"]
+    assert "_hosted_room_task" not in h.session
+    assert state.get_terminal_receipt(h.db_path, replacement.identity,
+                                      execution_generation=replacement.execution_generation) is None
 
 
 def test_finished_turn_cannot_clear_replacement_task_proof(installed_runtime, monkeypatch):

@@ -1972,9 +1972,9 @@ def _interrupt_exact_hosted_turn(sid: str, session: dict, expected: str, proof) 
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
         active_marker_key = str(session.pop("_active_turn_marker_key", "") or "")
         _retire_turn_marker(session, active_marker_key)
-        if (rt := session.get("_run_thread")) is None or not rt.is_alive():
-            session["running"] = False
-            _clear_inflight_turn(session)
+        # Admission precedes publication/start of the readiness thread. A missing
+        # or not-yet-alive handle is not proof that its accepted owner has exited.
+        # That owner retires running after observing this cancellation latch.
         session["_hosted_room_stop_claim"] = dict(proof)
     return True
 

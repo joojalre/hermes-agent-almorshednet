@@ -465,18 +465,32 @@ def _persist_session_row_for_submit(rid, session):
     return None
 
 
-def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback):
+def _run_after_agent_ready(
+    rid, sid, session, text, display_kind, hosted_terminal_callback, *, hosted_task=None):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
     # expires. See #63078.
+    if hosted_task is not None:
+        with session["history_lock"]:
+            if session.get("_hosted_room_task") != hosted_task:
+                return
+        if _finish_cancelled_hosted_start(session, hosted_task, hosted_terminal_callback):
+            return
     marker_key = _record_turn_marker(session, text) if hosted_terminal_callback is not None else ""
     err = _wait_agent_for_prompt(session, rid, sid)
+    if hosted_task is not None:
+        with session["history_lock"]:
+            if session.get("_hosted_room_task") != hosted_task:
+                return
+        if _finish_cancelled_hosted_start(session, hosted_task, hosted_terminal_callback, marker_key):
+            return
     if err:
         message = (err.get("error") or {}).get("message", "agent initialization failed")
         st = _TurnRun(session.get("agent"), None, hosted_terminal_callback,
-                      receipt_committed=hosted_terminal_callback is None, marker_key=marker_key)
+                      receipt_committed=hosted_terminal_callback is None, marker_key=marker_key,
+                      hosted_task=hosted_task)
         if hosted_terminal_callback is not None:
             try:
                 _deliver_hosted_terminal_receipt(session, st, {"status": "failed", "text": "", "error": message})
@@ -509,7 +523,7 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
-        terminal_callback=hosted_terminal_callback)
+        terminal_callback=hosted_terminal_callback, hosted_task=hosted_task)
 
 
 _TRUNCATION_PARAMS = (
@@ -522,6 +536,8 @@ def _lock_in_submit_turn(
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
     with session["history_lock"]:
+        if hosted_task is not None and session.get("running"):
+            return _err(rid, 4091, "hosted room member session is busy"), fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
@@ -572,6 +588,8 @@ def _(rid, params: dict) -> dict:
         if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
     if err is not None:
         return err
+    # Bind this accepted attempt independently of the mutable session dictionary.
+    hosted_task = dict(hosted_task) if hosted_task is not None else None
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         # Refused HERE — before the busy queue, db row and agent build — so a refusal
         # leaves the session untouched.  The reason travels as machine-readable data.
@@ -644,7 +662,7 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, hosted_terminal_callback),
+            rid, sid, session, text, display_kind, hosted_terminal_callback, hosted_task=hosted_task),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

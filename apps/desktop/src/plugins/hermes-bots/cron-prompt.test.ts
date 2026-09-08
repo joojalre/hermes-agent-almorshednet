@@ -29,6 +29,7 @@ function argvOf(prompt: string): string[] {
   // Windows ships Git Bash, not a `sh` executable on the desktop's PATH. Keep
   // a real shell oracle on both hosts: string assertions cannot prove quoting.
   const isWindows = process.platform === 'win32'
+
   const shell = isWindows
     ? findGitBash({ isWindows, env: process.env, fileExists: existsSync })
     : 'sh'
