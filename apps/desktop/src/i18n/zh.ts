@@ -1930,6 +1930,9 @@ export const zh: Translations = {
     actions: count => `${count} 次操作`,
     logFile: '日志文件',
     logLevel: '级别',
+    allLogLevels: '所有级别',
+    noMatchingLogs: '没有与搜索匹配的日志行。',
+    logTailHint: count => `显示所选文件和级别的最近日志，最多 ${count} 行。`,
     logSearchPlaceholder: '筛选日志行…',
     maintenance: {
       runOps: '诊断',
@@ -3017,6 +3020,7 @@ export const zh: Translations = {
   },
 
   updates: {
+    automaticUpdatesSaveFailed: '无法确认设置已保存。请重试。',
     stages: {
       idle: '准备中…',
       prepare: '准备中…',
