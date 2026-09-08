@@ -30,6 +30,7 @@ import { resolveElectronBinary } from './electron-binary'
 import { buildAppEnvFromParent } from './fixtures-env'
 import { type MockServerOptions, startMockServer } from './mock-server'
 import { installErrorBannerGuard } from './test'
+import { waitForPageWindowVisible } from './window-visibility'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
@@ -242,10 +243,12 @@ export function findElectron(): string {
  *
  * @param sandbox  - isolated HERMES_HOME + userData
  * @param env      - the process environment (already has HERMES_HOME etc.)
+ * @param onLaunched - optional early handle for specs that own setup-failure cleanup
  * @returns the ElectronApplication + first Page
  */
 export async function launchDesktop(
   env: Record<string, string>,
+  onLaunched?: (app: ElectronApplication) => void,
 ): Promise<{ app: ElectronApplication; page: Page }> {
   assertDistBuilt()
 
@@ -264,7 +267,25 @@ export async function launchDesktop(
     cwd: DESKTOP_ROOT,
   })
 
+  // Lifecycle-owning specs need the handle even if firstWindow fails.
+  onLaunched?.(app)
   const page = await app.firstWindow()
+
+  if (env.HERMES_DESKTOP_APP_NAME?.startsWith('HermesE2E')) {
+    // Clearly distinguish only our owned test windows. Keep document.title
+    // and renderer/tab captions untouched; retain the native title after a
+    // single prefix even when Chromium later updates the page title.
+    await app.evaluate(({ BrowserWindow }) => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        const label = (title: string) => title.startsWith('[E2E] ') ? title : `[E2E] ${title}`
+        window.setTitle(label(window.getTitle()))
+        window.on('page-title-updated', (event, title) => {
+          event.preventDefault()
+          window.setTitle(label(title))
+        })
+      }
+    })
+  }
 
   // Install the error-banner guard so any [role="alert"] that appears
   // during a test is collected and surfaced in afterEach.
@@ -560,6 +581,7 @@ export async function waitForAppReady(fixture: MockBackendFixture | NoProviderFi
       // `position: fixed; inset: 0`. If the hit element or an ancestor
       // is a full-viewport fixed overlay, we're still covered.
       let node: Element | null = el
+
       while (node) {
         const cs = window.getComputedStyle(node)
 
@@ -587,18 +609,7 @@ export async function waitForAppReady(fixture: MockBackendFixture | NoProviderFi
   // ready before that lands. Poll until the window is actually visible so
   // interactions (click, screenshot) don't hit a hidden surface.
   if (app) {
-    const deadline = Date.now() + timeoutMs
-
-    while (Date.now() < deadline) {
-      const visible = await app.evaluate(({ BrowserWindow }) => {
-        const w = BrowserWindow.getAllWindows()[0]
-
-        return w ? w.isVisible() : false
-      }).catch(() => false)
-
-      if (visible) {break}
-      await page.waitForTimeout(500)
-    }
+    await waitForPageWindowVisible(app, page, timeoutMs)
   }
 }
 
