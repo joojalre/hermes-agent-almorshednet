@@ -6,6 +6,7 @@ import hashlib
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -101,6 +102,8 @@ class FakeSessionRPC:
                 "active": active,
                 "task_id": task_id,
                 "execution_generation": None,
+                "hosted_task": ({**asdict(_identity(task_id)), "execution_generation": 1}
+                                if task_id else None),
                 "history": list(history or []),
                 "on_terminal": None,
                 "pending_approval": None,
@@ -194,6 +197,7 @@ class FakeSessionRPC:
             self.states[session_id]["active"] = True
             self.states[session_id]["task_id"] = task.task_id
             self.states[session_id]["execution_generation"] = execution_generation
+            self.states[session_id]["hosted_task"] = {**asdict(task), "execution_generation": execution_generation}
             self.states[session_id]["on_terminal"] = on_terminal
         self.submitted.set()
         if self.auto_complete:
@@ -227,6 +231,7 @@ class FakeSessionRPC:
             result = {
                 "active": session_state["active"],
                 "task_id": session_state["task_id"],
+                "hosted_task": session_state["hosted_task"],
             }
             if session_state.get("pending_approval"):
                 result["status"] = "waiting_for_approval"
@@ -242,6 +247,8 @@ class FakeSessionRPC:
         session_id: str,
         source: str,
         expected_task_id: str,
+        expected_task: state.TaskIdentity | None = None,
+        expected_execution_generation: int | None = None,
     ):
         params = {
             "profile": profile,
@@ -251,7 +258,9 @@ class FakeSessionRPC:
         }
         with self._lock:
             current = self.states[session_id]
-            if not current["active"] or current["task_id"] != expected_task_id:
+            exact = expected_task is None or current["hosted_task"] == {
+                **asdict(expected_task), "execution_generation": expected_execution_generation}
+            if not current["active"] or current["task_id"] != expected_task_id or not exact:
                 self.calls.append(("interrupt_skipped", params))
                 return {"interrupted": False}
             current["active"] = False
@@ -1735,10 +1744,14 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc, active_poll_interval_seconds=10.0)
+    # This tests wake/retry delivery, not expiry of the fixture's 0.4s lease.
+    # Keep authority time fixed while real thread barriers control the retry.
+    authority_now = time.time()
+    runtime = _runtime(db, rpc, active_poll_interval_seconds=10.0, clock=lambda: authority_now)
     original_interrupt = rpc.interrupt
     original_record_error = runtime._record_error
     attempts = 0
+    recorded_errors = []
     worker_failure_recorded = threading.Event()
     release_worker = threading.Event()
 
@@ -1750,6 +1763,7 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
         return original_interrupt(**kwargs)
 
     def block_worker_after_retry_failure(message: str) -> None:
+        recorded_errors.append(message)
         original_record_error(message)
         if message.startswith("stop retry remains pending"):
             worker_failure_recorded.set()
@@ -1758,18 +1772,24 @@ def test_transient_remote_stop_failure_stays_pending_and_retries(db: Path):
     rpc.interrupt = flaky_interrupt
     runtime._record_error = block_worker_after_retry_failure
     runtime.start()
-    assert rpc.submitted.wait(1.0)
-    stopping = runtime.cancel(identity, cancel_id="cancel-retry")
-    assert stopping["status"] == "stopping"
-    assert state.get_task(db, identity)["status"] == "stopping"
-    assert worker_failure_recorded.wait(1.0)
-    cycles = runtime.status()["cycles"]
-    runtime.wakeup()
-    release_worker.set()
-    _wait_for(lambda: runtime.status()["cycles"] > cycles)
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
-    assert attempts >= 3
-    assert runtime.stop(timeout=5.0)
+    try:
+        assert rpc.submitted.wait(1.0)
+        stopping = runtime.cancel(identity, cancel_id="cancel-retry")
+        assert stopping["status"] == "stopping"
+        assert state.get_task(db, identity)["status"] == "stopping"
+        assert worker_failure_recorded.wait(1.0)
+        cycles = runtime.status()["cycles"]
+        runtime.wakeup()
+        release_worker.set()
+        _wait_for(lambda: runtime.status()["cycles"] > cycles)
+        _wait_for(lambda: state.get_task(db, identity)["status"] == "cancelled")
+        assert attempts >= 3
+    except AssertionError as exc:
+        raise AssertionError({"attempts": attempts, "errors": recorded_errors,
+                              "runtime": runtime.status(), "task": state.get_task(db, identity)}) from exc
+    finally:
+        release_worker.set()
+        assert runtime.stop(timeout=5.0)
     assert state.get_task(db, identity)["status"] == "cancelled"
 
 
@@ -2024,8 +2044,6 @@ def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path
         return now[0]
 
     _admit(db, identity)
-    now = [100.0]
-    clock = lambda: now[0]
     old_lease = state.acquire_lease(
         db,
         room_id=ROOM_ID,
@@ -2245,13 +2263,16 @@ def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Pa
     _admit(db, identity)
     locks = RecordingTurnLocks()
     rpc = FakeSessionRPC(required_lock=locks)
-    runtime = _runtime(db, rpc, locks)
+    authority_now = time.time()
+    runtime = _runtime(db, rpc, locks, clock=lambda: authority_now)
 
-    runtime.start()
-    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    # Drive one actual scheduling cycle; a concurrent idle/recovery cycle is
+    # not part of the resolve/submit/terminal lock span asserted here.
+    runtime._run_cycle()
+    assert state.get_task(db, identity)["status"] == "settled"
     assert runtime.stop(timeout=5.0)
 
-    assert locks.events == [("lock-enter", PROFILE), ("lock-exit", PROFILE)]
+    assert locks.events == [("lock-enter", PROFILE), ("lock-exit", PROFILE)], runtime.status()
     methods = [method for method, _params in rpc.calls]
     assert methods.index("resolve_exact") < methods.index("submit")
     assert methods.index("submit") < methods.index("complete")
