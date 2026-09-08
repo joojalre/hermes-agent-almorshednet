@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
-from tools.memory_tool import ENTRY_DELIMITER, MemoryStore, load_on_disk_store
+from tools.memory_tool import load_on_disk_store
+from tools.memory_tool_store import ENTRY_DELIMITER, MemoryStore
 from tools.threat_patterns import scan_for_threats
 from utils import atomic_write_text
 
@@ -692,9 +693,8 @@ def _write_managed_memory(
                 raise KnowledgeError(
                     f"managed memory would exceed configured limit {effective_limit}"
                 )
-            store._set_entries("memory", entries)
             try:
-                store.save_to_disk("memory")
+                MemoryStore._write_file(path, entries)
                 raw_after = path.read_text(encoding="utf-8")
                 if raw_after != expected_after:
                     raise KnowledgeError(

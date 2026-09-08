@@ -8,6 +8,7 @@ import multiprocessing
 import sqlite3
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,7 +80,8 @@ class _FakeRPC:
     def info(self, *, profile, session_id, source):
         return {"active": False, "task_id": None}
 
-    def interrupt(self, *, profile, session_id, source, expected_task_id):
+    def interrupt(self, *, profile, session_id, source, expected_task_id,
+                  expected_task=None, expected_execution_generation=None):
         return {"interrupted": True}
 
     def approve(self, **kwargs):
@@ -310,9 +312,11 @@ class _InterruptibleRPC(_FakeRPC):
         self.started = threading.Event()
         self.interrupted = threading.Event()
         self.active_task_id: str | None = None
+        self.active_proof = None
 
     def submit(self, **kwargs):
         self.active_task_id = kwargs["task"].task_id
+        self.active_proof = {**asdict(kwargs["task"]), "execution_generation": kwargs["execution_generation"]}
         self.started.set()
         return {"accepted": True}
 
@@ -320,9 +324,11 @@ class _InterruptibleRPC(_FakeRPC):
         return {
             "active": self.active_task_id is not None,
             "task_id": self.active_task_id,
+            "hosted_task": self.active_proof,
         }
 
-    def interrupt(self, *, profile, session_id, source, expected_task_id):
+    def interrupt(self, *, profile, session_id, source, expected_task_id,
+                  expected_task=None, expected_execution_generation=None):
         if self.active_task_id != expected_task_id:
             return {"interrupted": False}
         if not self.acknowledge_interrupt:
@@ -1362,9 +1368,10 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
             self.active_task_id = None
 
         def info(self, *, profile, session_id, source):
-            return {"active": True, "task_id": self.active_task_id}
+            return {"active": True, "task_id": self.active_task_id, "hosted_task": self.active_proof}
 
-        def interrupt(self, *, profile, session_id, source, expected_task_id):
+        def interrupt(self, *, profile, session_id, source, expected_task_id,
+                      expected_task=None, expected_execution_generation=None):
             return None
 
     db = tmp_path / "state.db"
@@ -1406,6 +1413,7 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
     )
     rpc.sessions[("ops", "Group: room-1")] = {"session_id": "ops-session"}
     rpc.active_task_id = task["identity"].task_id
+    rpc.active_proof = {**asdict(task["identity"]), "execution_generation": 1}
 
     with pytest.raises(RuntimeError, match="still stopping"):
         service.stop_room(
@@ -1433,9 +1441,10 @@ def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
             self.expected_task_ids: list[str] = []
 
         def info(self, *, profile, session_id, source):
-            return {"active": True, "task_id": self.active_task_id}
+            return {"active": True, "task_id": self.active_task_id, "hosted_task": self.active_proof}
 
-        def interrupt(self, *, profile, session_id, source, expected_task_id):
+        def interrupt(self, *, profile, session_id, source, expected_task_id,
+                      expected_task=None, expected_execution_generation=None):
             self.expected_task_ids.append(expected_task_id)
             if not self.acknowledge:
                 return None
@@ -1482,6 +1491,7 @@ def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
     )
     rpc.sessions[("ops", "Group: room-1")] = {"session_id": "ops-session"}
     rpc.active_task_id = task["identity"].task_id
+    rpc.active_proof = {**asdict(task["identity"]), "execution_generation": 1}
     observed_gateway = "install:" + "b" * 32
     remote_db = tmp_path / "remote-state.db"
     replicas.ingest_page(

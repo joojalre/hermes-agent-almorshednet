@@ -6,6 +6,7 @@ import hashlib
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -101,6 +102,8 @@ class FakeSessionRPC:
                 "active": active,
                 "task_id": task_id,
                 "execution_generation": None,
+                "hosted_task": ({**asdict(_identity(task_id)), "execution_generation": 1}
+                                if task_id else None),
                 "history": list(history or []),
                 "on_terminal": None,
                 "pending_approval": None,
@@ -194,6 +197,7 @@ class FakeSessionRPC:
             self.states[session_id]["active"] = True
             self.states[session_id]["task_id"] = task.task_id
             self.states[session_id]["execution_generation"] = execution_generation
+            self.states[session_id]["hosted_task"] = {**asdict(task), "execution_generation": execution_generation}
             self.states[session_id]["on_terminal"] = on_terminal
         self.submitted.set()
         if self.auto_complete:
@@ -227,6 +231,7 @@ class FakeSessionRPC:
             result = {
                 "active": session_state["active"],
                 "task_id": session_state["task_id"],
+                "hosted_task": session_state["hosted_task"],
             }
             if session_state.get("pending_approval"):
                 result["status"] = "waiting_for_approval"
@@ -242,6 +247,8 @@ class FakeSessionRPC:
         session_id: str,
         source: str,
         expected_task_id: str,
+        expected_task: state.TaskIdentity | None = None,
+        expected_execution_generation: int | None = None,
     ):
         params = {
             "profile": profile,
@@ -251,7 +258,9 @@ class FakeSessionRPC:
         }
         with self._lock:
             current = self.states[session_id]
-            if not current["active"] or current["task_id"] != expected_task_id:
+            exact = expected_task is None or current["hosted_task"] == {
+                **asdict(expected_task), "execution_generation": expected_execution_generation}
+            if not current["active"] or current["task_id"] != expected_task_id or not exact:
                 self.calls.append(("interrupt_skipped", params))
                 return {"interrupted": False}
             current["active"] = False
@@ -2024,8 +2033,6 @@ def test_restart_acknowledges_inactive_local_stop_without_memory_marker(db: Path
         return now[0]
 
     _admit(db, identity)
-    now = [100.0]
-    clock = lambda: now[0]
     old_lease = state.acquire_lease(
         db,
         room_id=ROOM_ID,

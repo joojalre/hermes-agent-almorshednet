@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -88,6 +89,66 @@ def _admit(db, identity, clock, *, payload=None):
         payload=_payload() if payload is None else payload,
         clock=clock,
     )
+
+
+@pytest.mark.parametrize("owner_field", ["process_pid", "process_start_time"])
+def test_process_identity_fences_lease_and_running_attempt(db, owner_field):
+    clock = FakeClock()
+    identity = _identity()
+    _admit(db, identity, clock)
+    lease = _lease(db, clock)
+    impostor = replace(lease, **{owner_field: getattr(lease, owner_field) + 1})
+
+    with pytest.raises(driver.StaleLeaseError):
+        driver.renew_lease(db, impostor, ttl_seconds=30, clock=clock)
+    with pytest.raises(driver.StaleLeaseError):
+        driver.start_task(db, identity, impostor, expected_cancel_generation=0, clock=clock)
+    assert driver.get_task(db, identity)["status"] == "queued"
+
+    attempt = driver.start_task(db, identity, lease, expected_cancel_generation=0, clock=clock)
+    with pytest.raises(driver.StaleLeaseError):
+        driver.settle_task(
+            db, replace(attempt, lease=impostor), settlement_id="terminal-1",
+            status="settled", result={"text": "done"}, clock=clock)
+    assert driver.get_task(db, identity)["status"] == "running"
+    assert driver.settle_task(
+        db, attempt, settlement_id="terminal-1", status="settled",
+        result={"text": "done"}, clock=clock)["status"] == "settled"
+
+
+def test_stopping_settlement_rejects_another_rooms_lease_without_mutation(db):
+    clock = FakeClock()
+    rooms.create_room(
+        db, room_id="other-room", name="Other room",
+        members=[{"member_id": "other-ops", "profile": "ops", "handle": "ops"}],
+        authority_gateway_id="gateway-a", now=90)
+    source = rooms.append_event(
+        db, room_id="room-1", event_id="source", kind="message.user",
+        actor={"kind": "user", "id": "user"},
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+        authority_gateway_id="gateway-a", authority_epoch=1)
+    identity = _identity()
+    _admit(db, identity, clock, payload=_payload(source_event_seq=source["seq"]))
+    lease = _lease(db, clock)
+    foreign = driver.acquire_lease(
+        db, room_id="other-room", gateway_id="gateway-a", authority_epoch=1,
+        process_generation="other-process", ttl_seconds=30, clock=clock)
+    attempt = driver.start_task(db, identity, lease, expected_cancel_generation=0, clock=clock)
+    stopping = driver.begin_task_cancel(
+        db, identity, cancel_id="stop", expected_cancel_generation=0, clock=clock)
+    settlement = dict(
+        expected_execution_generation=attempt.execution_generation,
+        expected_cancel_generation=stopping["cancel_generation"],
+        settlement_id="completion", status="settled", result={"text": "done"}, clock=clock)
+
+    with pytest.raises(driver.DriverValidationError, match="different rooms"):
+        driver.settle_stopping_task(db, identity, foreign, **settlement)
+    assert driver.get_task(db, identity) == stopping
+
+    assert driver.settle_stopping_task(db, identity, lease, **settlement)["status"] == "settled"
+    assert driver.settle_stopping_task(db, identity, lease, **settlement)["idempotent"] is True
+    with pytest.raises(driver.DriverValidationError, match="different rooms"):
+        driver.settle_stopping_task(db, identity, foreign, **settlement)
 
 
 def test_task_admission_is_atomically_fenced_by_latest_stop(db):
