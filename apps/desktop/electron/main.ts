@@ -284,6 +284,7 @@ import {
   localRouteFallbackProfiles,
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
+import { ensurePoolBackendRuntime } from './pool-backend-startup'
 import { selectPoolEvictions } from './pool-eviction'
 import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS } from './pool-limits'
 import {
@@ -12599,7 +12600,13 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
-  const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+
+  const backend = await ensurePoolBackendRuntime({
+    backend: resolveHermesBackend(backendArgs),
+    ensureRuntime,
+    profile
+  })
+
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
