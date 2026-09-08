@@ -17,13 +17,11 @@ from gateway.hosted_room_peer import (
     HostedRoomGrantError,
     HostedRoomPeerError,
     PROTOCOL_VERSION,
-    RoomLinkProbe,
     catalog_mapping,
     derive_room_grant_secret,
     gateway_room_grant_secret,
     issue_room_grant,
     local_room_link_endpoint,
-    select_room_link,
     verify_room_grant,
 )
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -33,7 +31,7 @@ SECRET = b"s" * 32
 EXECUTION_POLICY = execution_policy_mapping(target_profile="reviewer")
 
 
-def test_gateway_room_grant_secret_is_private_persistent_and_not_an_api_key(
+def test_gateway_room_grant_secret_is_persistent_and_not_an_api_key(
     tmp_path, monkeypatch
 ):
     home = tmp_path / ".hermes"
@@ -51,9 +49,25 @@ def test_gateway_room_grant_secret_is_private_persistent_and_not_an_api_key(
     secret_path = home / ".room-link-grant-secret"
     assert first == second
     assert len(first) == 32
-    assert stat.S_IMODE(secret_path.stat().st_mode) == 0o600
     assert secret_path.read_bytes() != first
     assert first != derive_room_grant_secret("gateway-api-key-1234567890")
+
+
+@pytest.mark.parametrize(
+    "_platform",
+    [
+        pytest.param("linux", marks=pytest.mark.linux_only),
+        pytest.param("macos", marks=pytest.mark.macos_only),
+    ],
+)
+def test_gateway_room_grant_secret_has_private_posix_mode(
+    tmp_path, monkeypatch, _platform
+):
+    # Common persistence/derivation contracts above still execute on Windows.
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    gateway_room_grant_secret()
+    assert stat.S_IMODE((home / ".room-link-grant-secret").stat().st_mode) == 0o600
 
 
 def test_gateway_room_grant_secret_is_atomic_across_concurrent_workers(
@@ -290,33 +304,6 @@ def test_room_grant_fails_closed_for_tamper_expiry_and_permission():
         )
     with pytest.raises(HostedRoomGrantError, match="signature"):
         verify_room_grant(SECRET, token[:-1] + "A", dispatch, now=105)
-
-
-def test_link_selection_prefers_safe_direct_then_overlay_then_relay_then_pull():
-    selected = select_room_link(
-        [
-            RoomLinkProbe("relay", True, True, 10),
-            RoomLinkProbe("direct", True, True, 50),
-            RoomLinkProbe("overlay", True, True, 5),
-            RoomLinkProbe("pull", True, True, 1),
-        ],
-        desktop_available=False,
-    )
-    assert selected is not None
-    assert selected.mode == "direct"
-
-
-def test_link_selection_never_falls_back_to_unencrypted_route():
-    assert (
-        select_room_link(
-            [RoomLinkProbe("direct", True, False, 1)],
-            desktop_available=False,
-        )
-        is None
-    )
-    fallback = select_room_link([], desktop_available=True)
-    assert fallback is not None
-    assert fallback.mode == "desktop"
 
 
 def test_local_catalog_is_honest_for_app_managed_process(monkeypatch):

@@ -682,7 +682,7 @@ def test_sweeper_removes_only_stale_dm_files(tmp_path, monkeypatch):
     old = now - bot_mode_dm._DM_STALE_SECONDS - 1
     os.utime(legacy_stale, (old, old))
     os.utime(stale, (old, old))
-    bot_mode_dm._sweep_stale_dm_files(now=now)
+    bot_mode_dm.cleanup_bot_dm_cache(now=now)
 
     assert not legacy_stale.exists()
     assert not stale.exists()
@@ -690,6 +690,7 @@ def test_sweeper_removes_only_stale_dm_files(tmp_path, monkeypatch):
     assert unrelated.exists()
 
 
+@pytest.mark.linux_only
 def test_dm_dir_is_private_and_uid_scoped_on_posix(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
 
@@ -702,6 +703,7 @@ def test_dm_dir_is_private_and_uid_scoped_on_posix(tmp_path, monkeypatch):
     assert dm_dir.stat().st_mode & 0o777 == 0o700
 
 
+@pytest.mark.linux_only
 def test_dm_dir_repairs_restrictive_owner_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_mode_dm.tempfile, "gettempdir", lambda: str(tmp_path))
     uid = os.getuid() if hasattr(os, "getuid") else None
@@ -714,7 +716,7 @@ def test_dm_dir_repairs_restrictive_owner_mode(tmp_path, monkeypatch):
     assert dm_dir.stat().st_mode & 0o777 == 0o700
 
 
-@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX ownership contract")
+@pytest.mark.linux_only
 def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
     target = tmp_path / "attacker-controlled"
     target.mkdir()

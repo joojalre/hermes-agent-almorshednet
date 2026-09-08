@@ -13,7 +13,6 @@
 //      re-selected forever instead of falling through to bootstrap.
 
 import assert from 'node:assert/strict'
-import path from 'node:path'
 
 import { test } from 'vitest'
 
@@ -174,7 +173,7 @@ test('resolveVenvHermesCommand: is case-insensitive on hermes.exe and the Script
 // ── getVenvSitePackagesEntries ─────────────────────────────────────────────
 
 test('getVenvSitePackagesEntries: returns Lib/site-packages on Windows when it exists', () => {
-  const expected = path.join('C:\\venv', 'Lib', 'site-packages')
+  const expected = 'C:\\venv\\Lib\\site-packages'
 
   const result = getVenvSitePackagesEntries('C:\\venv', {
     isWindows: true,
@@ -197,7 +196,10 @@ test('getVenvSitePackagesEntries: reads pyvenv.cfg version on POSIX and resolves
   const result = getVenvSitePackagesEntries('/venv', {
     isWindows: false,
     directoryExists: p => p === '/venv/lib/python3.12/site-packages',
-    readFile: () => 'version_info = 3.12.1\n'
+    readFile: p => {
+      assert.equal(p, '/venv/pyvenv.cfg')
+      return 'version_info = 3.12.1\n'
+    }
   })
 
   assert.deepEqual(result, ['/venv/lib/python3.12/site-packages'])

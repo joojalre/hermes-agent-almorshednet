@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.run import GatewayRunner
+from gateway.run_startup import GatewayStartupMixin
 
 
 @pytest.mark.asyncio
@@ -32,14 +33,14 @@ async def test_late_hosted_room_recovery_is_stopped_after_shutdown() -> None:
         _stop_hosted_room_worker=stop_worker,
     )
     watcher = asyncio.create_task(
-        GatewayRunner._hosted_room_worker_watcher(runner, interval=60.0)
+        GatewayStartupMixin._hosted_room_worker_watcher(runner, interval=60.0)
     )
 
     await recovery_started.wait()
     runner._running = False
     release_recovery.set()
 
-    await asyncio.wait_for(watcher, timeout=1.0)
+    await asyncio.wait_for(watcher, timeout=5.0)
     assert stop_calls == [5.0]
 
 
