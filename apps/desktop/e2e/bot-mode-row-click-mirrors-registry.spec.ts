@@ -78,7 +78,10 @@ async function seedBot(hermesHome: string, mockUrl: string, name: string, markCh
   }
 }
 
+// Seeding two durable sessions and booting the real Electron/backend chain can
+// exceed Playwright's default 90-second hook budget on a cold Windows install.
 test.beforeAll(async () => {
+  test.setTimeout(300_000)
   const sandbox = createSandbox('bots-sync')
   fixture = await setupOwnedBotFixture({
     sandbox,

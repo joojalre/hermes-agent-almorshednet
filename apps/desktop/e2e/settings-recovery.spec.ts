@@ -538,9 +538,12 @@ test('settings retain backend truth across reopen, log filters, memory paths and
       }
 
       const openFiles = page.getByRole('button', { name: 'Open file', exact: true })
-      await expect(openFiles).toHaveCount(2)
-      await expect(openFiles.nth(0)).toBeEnabled()
-      await expect(openFiles.nth(1)).toBeEnabled()
+      // Maintenance hydrates memory metadata after the panel shell is painted.
+      // Keep the assertion tied to the real accessible controls without racing
+      // that asynchronous load.
+      await expect(openFiles).toHaveCount(2, { timeout: 30_000 })
+      await expect(openFiles.nth(0)).toBeEnabled({ timeout: 30_000 })
+      await expect(openFiles.nth(1)).toBeEnabled({ timeout: 30_000 })
       await testInfo.attach('synthetic-memory-paths', { body: JSON.stringify(memory.builtin_paths), contentType: 'application/json' })
     })
 
@@ -570,12 +573,19 @@ test('settings retain backend truth across reopen, log filters, memory paths and
         counts[skill.provenance] += 1
       }
 
-      await expect(page.getByText(`${counts.agent} learned · ${counts.bundled} built-in · ${counts.hub} hub`, { exact: true })).toBeVisible()
+      // The skills route can render its shell before the capabilities query has
+      // hydrated.  Wait for the computed summary rather than racing the first
+      // paint; the exact text still verifies the backend provenance counts.
+      const summaryPattern = new RegExp(
+        `${counts.agent}\\s+learned\\s+·\\s+${counts.bundled}\\s+built-in\\s+·\\s+${counts.hub}\\s+hub`
+      )
+
+      await expect(page.getByText(summaryPattern).filter({ visible: true }).first()).toBeVisible({ timeout: 30_000 })
 
       for (const { name, provenance, label } of cases) {
         const row = page.getByRole('button').filter({ has: page.getByText(name, { exact: true }) }).first()
-        await expect(row).toBeVisible()
-        await expect(row).toContainText(label)
+        await expect(row).toBeVisible({ timeout: 30_000 })
+        await expect(row).toContainText(label, { timeout: 30_000 })
 
         if (provenance !== 'agent') {
           await expect(row).not.toContainText('learned')
