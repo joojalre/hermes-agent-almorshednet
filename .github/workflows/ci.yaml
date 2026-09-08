@@ -15,6 +15,7 @@ name: CI
 # main-only automation uses protected environments in its own workflows.
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -32,12 +33,12 @@ concurrency:
 jobs:
   # ─────────────────────────────────────────────────────────────────────
   # detect: run the classifier once. Every downstream job reads its outputs
-  # to decide whether to run. Upstream pushes fail open (all lanes true),
+  # to decide whether to run. Manual runs and upstream pushes fail open,
   # while fork pushes skip the validation that already passed on the PR.
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
-    if: github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 1
     outputs:
@@ -63,8 +64,6 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
         with:
-          sparse-checkout: scripts/ci/classify_changes.py
-          sparse-checkout-cone-mode: false
           github-token: ${{ github.token }}
 
   # ─────────────────────────────────────────────────────────────────────
@@ -218,7 +217,7 @@ jobs:
 
   osv-scanner:
     name: OSV scan
-    if: github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.repository == 'NousResearch/hermes-agent'
     uses: ./.github/workflows/osv-scanner.yml
 
   # ─────────────────────────────────────────────────────────────────────
@@ -246,6 +245,7 @@ jobs:
       - history-check
       - contributor-check
       - uv-lockfile
+      - infographic-check
       - case-collision-check
       - lockfile-diff
       - docker-lint
@@ -257,7 +257,7 @@ jobs:
       # its own check. It was never required here, because it is too slow
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
-    if: always() && (github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent')
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.repository == 'NousResearch/hermes-agent')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -303,7 +303,7 @@ jobs:
   ci-timings:
     name: CI timing report
     needs: [all-checks-pass]
-    if: always() && (github.event_name == 'pull_request' || github.repository == 'NousResearch/hermes-agent')
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.repository == 'NousResearch/hermes-agent')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
