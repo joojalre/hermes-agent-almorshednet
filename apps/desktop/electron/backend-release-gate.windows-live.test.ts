@@ -44,12 +44,18 @@ async function spawnSleeper(): Promise<{ pid: number; kill: () => Promise<void> 
   return {
     pid: child.pid,
     kill: async () => {
-      if (child.exitCode !== null || child.signalCode !== null) return
+      if (child.exitCode !== null || child.signalCode !== null) {
+        return
+      }
 
       const exited = once(child, 'exit')
       let timer: ReturnType<typeof setTimeout> | undefined
+
       try {
-        if (child.exitCode === null && !child.killed) child.kill()
+        if (child.exitCode === null && !child.killed) {
+          child.kill()
+        }
+
         await Promise.race([
           exited,
           new Promise<never>((_, reject) => {
@@ -66,6 +72,7 @@ async function spawnSleeper(): Promise<{ pid: number; kill: () => Promise<void> 
 async function taskkillOwned(pid: number, tree: boolean): Promise<void> {
   const args = ['/PID', String(pid), '/F', ...(tree ? ['/T'] : [])]
   const binary = path.join(process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows', 'System32', 'taskkill.exe')
+
   try {
     // Synchronous taskkill blocks Vitest's own timeout timer. Bound the native
     // command separately and surface timeout/nonzero exit as a test failure.
