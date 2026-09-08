@@ -156,6 +156,7 @@ import {
 import type { RosterProfileMetadata } from './connection-registry'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
+import { registerDeepLinkProtocolOutsideTests } from './deep-link-protocol-registration'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
 import { resolveDesktopRemoteRoute, v1SshTerminalPoolKey } from './desktop-remote-route'
@@ -18009,21 +18010,23 @@ ipcMain.handle('hermes:deep-link-ready', () => {
 })
 
 function registerDeepLinkProtocol() {
-  try {
-    if (process.defaultApp && process.argv.length >= 2) {
-      // Dev: register with the electron exec path + entry script so the OS can
-      // relaunch us with the URL. argv[1] is usually "." when launched via
-      // `electron .` from apps/desktop — resolve against cwd.
-      const entry = path.resolve(process.argv[1])
-      app.setAsDefaultProtocolClient(HERMES_PROTOCOL, process.execPath, [entry])
-    } else {
-      app.setAsDefaultProtocolClient(HERMES_PROTOCOL)
-    }
+  registerDeepLinkProtocolOutsideTests(process.env.TEST_WORKER_INDEX, () => {
+    try {
+      if (process.defaultApp && process.argv.length >= 2) {
+        // Dev: register with the electron exec path + entry script so the OS can
+        // relaunch us with the URL. argv[1] is usually "." when launched via
+        // `electron .` from apps/desktop — resolve against cwd.
+        const entry = path.resolve(process.argv[1])
+        app.setAsDefaultProtocolClient(HERMES_PROTOCOL, process.execPath, [entry])
+      } else {
+        app.setAsDefaultProtocolClient(HERMES_PROTOCOL)
+      }
 
-    rememberLog(`[deeplink] registered ${HERMES_PROTOCOL}:// handler`)
-  } catch (err) {
-    rememberLog(`[deeplink] protocol registration failed: ${err.message}`)
-  }
+      rememberLog(`[deeplink] registered ${HERMES_PROTOCOL}:// handler`)
+    } catch (err) {
+      rememberLog(`[deeplink] protocol registration failed: ${err.message}`)
+    }
+  })
 }
 
 // Single-instance lock: deep links on a running app (Win/Linux) arrive as a
