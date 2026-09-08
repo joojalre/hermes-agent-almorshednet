@@ -1836,6 +1836,9 @@ export const ru = defineLocale({
     actions: count => `${count} ${RU_NOUN(count, 'действие', 'действия', 'действий')}`,
     logFile: 'Файл журнала',
     logLevel: 'Уровень',
+    allLogLevels: 'Все уровни',
+    noMatchingLogs: 'Нет строк журнала, соответствующих поиску.',
+    logTailHint: count => `Показано не более ${count} последних строк выбранного файла и уровня.`,
     logSearchPlaceholder: 'Фильтр строк журнала...',
     maintenance: {
       runOps: 'Диагностика',
@@ -2889,6 +2892,7 @@ export const ru = defineLocale({
     }
   },
   updates: {
+    automaticUpdatesSaveFailed: 'Не удалось подтвердить сохранение настройки. Повторите попытку.',
     stages: {
       idle: 'Готовимся…',
       prepare: 'Готовимся…',
