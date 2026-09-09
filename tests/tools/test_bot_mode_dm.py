@@ -393,8 +393,7 @@ def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatc
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("hello", encoding="utf-8")
     argv = ["hermes", "-p", "researcher"]
-    assert bot_mode_dm._run_delivery(argv, str(dm_file), stdin_file=False) == 0
-    queued = json.loads(capsys.readouterr().out)
+    queued = bot_mode_dm._admit_live_dm(target, str(dm_file))
     assert queued["status"] == "queued"
     claimed = live.claim_pending_delivery(target, owner)
     assert claimed is not None
@@ -405,6 +404,25 @@ def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatc
     assert failed["status"] == "failed"
     assert failed["delivery_id"] == queued["delivery_id"]
     assert dm_file.read_text(encoding="utf-8") == "hello"
+
+
+def test_live_waiter_keeps_reply_notification_after_fast_wait_window(tmp_path, monkeypatch, capsys):
+    from tools import bot_live_delivery as live
+
+    owner = dict(profile_home=str(tmp_path.resolve()), session_id="bot",
+                 lease_id="lease", live_session_id="live")
+    queued = live.deliver_to_live_owner(tmp_path, owner, "long task")
+    monkeypatch.setattr(bot_mode_dm, "_LIVE_WAIT_SECONDS", 0)
+
+    def settle_after_wait(_seconds):
+        claimed = live.claim_pending_delivery(tmp_path, owner)
+        live.complete_delivery(tmp_path, claimed["delivery_id"], status="settled", reply="late answer")
+
+    monkeypatch.setattr(bot_mode_dm.time, "sleep", settle_after_wait)
+    assert bot_mode_dm._wait_live_dm(str(tmp_path), queued["delivery_id"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "settled"
+    assert result["reply"] == "late answer"
 
 
 # ── plaintext tempfile lifecycle ─────────────────────────────────────────────

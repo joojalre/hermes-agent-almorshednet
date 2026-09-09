@@ -435,21 +435,26 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str) -> dict | None:
 
 
 def _wait_live_dm(home: str, delivery_id: str) -> int:
+    """Keep the background completion owner alive until its durable receipt settles.
+
+    The initial window bounds fast polling, not notification ownership. A busy
+    Bot Chat can legitimately claim and answer long after that window expires.
+    """
     from tools.bot_live_delivery import read_delivery_result
 
     deadline = time.monotonic() + _LIVE_WAIT_SECONDS
     while True:
         record = read_delivery_result(home, delivery_id)
         status = record["status"] if record else "ambiguous"
-        if status not in ("queued", "claimed") or time.monotonic() >= deadline:
+        if status not in ("queued", "claimed"):
             break
-        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+        time.sleep(0.5 if time.monotonic() < deadline else 5.0)
     payload = {key: record[key] for key in ("reply", "error", "reason") if record and record.get(key)}
     payload.update(status=status, delivery_id=delivery_id)
-    if status in ("queued", "claimed", "ambiguous"):
+    if status == "ambiguous":
         payload["detail"] = "Delivery remains pending or its outcome is unknown. Do not resend; receipt is retained."
     print(json.dumps(payload))
-    return 0 if status in ("settled", "queued", "claimed") else 1
+    return 0 if status == "settled" else 1
 
 
 def _local_delivery_home(argv: list[str]) -> Path | None:

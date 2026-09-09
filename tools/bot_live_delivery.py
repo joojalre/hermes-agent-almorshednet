@@ -34,24 +34,27 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     from hermes_state import SessionDB
 
     home = Path(profile_home).resolve()
-    if not (home / "state.db").is_file():
-        return None
-    db = SessionDB(db_path=home / "state.db", read_only=True)
-    try:
-        row = db.get_session_by_title("Bot Chat")
-        session_id = db.get_compression_tip(row["id"]) if row else None
-    finally:
-        db.close()
-    if not session_id:
-        return None
+    session_id = None
+    if (home / "state.db").is_file():
+        db = SessionDB(db_path=home / "state.db", read_only=True)
+        try:
+            row = db.get_session_by_title("Bot Chat")
+            session_id = db.get_compression_tip(row["id"]) if row else None
+        finally:
+            db.close()
+    candidates = []
     for entry in active_session_registry_snapshot(registry_home=home):
         meta = entry.get("metadata") or {}
-        if (entry["session_id"] == session_id
+        # The first admitted turn owns a lease before it creates its DB row.
+        # Persisted canonical identity takes precedence over any pending title.
+        canonical = (entry["session_id"] == session_id if session_id
+                     else meta.get("pending_title") == "Bot Chat")
+        if (canonical
                 and meta.get("bot_live_delivery_consumer") is True
                 and meta.get("live_session_id")):
-            return dict(profile_home=str(home), session_id=session_id,
-                        lease_id=entry["lease_id"], live_session_id=meta["live_session_id"])
-    return None
+            candidates.append(dict(profile_home=str(home), session_id=entry["session_id"],
+                                   lease_id=entry["lease_id"], live_session_id=meta["live_session_id"]))
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
