@@ -1216,7 +1216,7 @@ def _probe_state_file(state_path: Path) -> None:
         _probe(5, False, f"gateway_state.json present but unreadable: {exc}")
 
 
-def _probe_exit_diag(diag_path: Path) -> None:
+def _probe_exit_diag(diag_path: Path, pid_path: Path) -> None:
     if _probe_missing(6, diag_path, "exit-diag log"):
         return
     try:
@@ -1231,10 +1231,46 @@ def _probe_exit_diag(diag_path: Path) -> None:
             return
         try:
             event = json.loads(last_event)
-            tag = event.get("tag", "?")
-            _probe(6, tag in ("gateway.start",), f"Last lifecycle event: tag={tag} pid={event.get('pid', '?')} ts={event.get('ts', '?')}")
-        except Exception:
-            _probe(6, False, f"Last lifecycle line not JSON: {last_event[:120]}")
+            if not isinstance(event, dict):
+                raise ValueError("expected an event object")
+            tag, pid, ts = event.get("tag"), event.get("pid"), event.get("ts")
+            if not isinstance(tag, str) or type(pid) is not int or pid <= 0 or not isinstance(ts, str):
+                raise ValueError("missing or malformed tag, PID, or timestamp")
+            event_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if event_time.tzinfo is None:
+                raise ValueError("lifecycle timestamp has no timezone")
+        except (TypeError, ValueError) as exc:
+            _probe(6, False, f"Last lifecycle event malformed: {exc}")
+            return
+
+        message = f"Last lifecycle event: tag={tag} pid={pid} ts={ts}"
+        previous_unclean = tag == "gateway.previous_unclean_exit"
+        if previous_unclean:
+            message += (
+                f"; WARNING: previous gateway exited uncleanly"
+                f" prior_pid={event.get('prior_pid', '?')}"
+                f" prior_started_at={event.get('prior_started_at', '?')}"
+                f" state_db_integrity={event.get('state_db_integrity', '?')}"
+            )
+        try:
+            from gateway.status import get_running_pid_identity_strict
+
+            identity = get_running_pid_identity_strict(pid_path)
+        except Exception as exc:
+            _probe(6, False, f"{message}; live gateway identity unverified: {exc}")
+            return
+        # record_startup reports the previous life AFTER gateway.start. Its PID and
+        # timestamp belong to the new process, whose exact creation time rules out reuse.
+        current_event = (
+            identity is not None and pid == identity[0]
+            and identity[1] <= event_time.timestamp() <= datetime.now(timezone.utc).timestamp()
+        )
+        healthy_event = tag == "gateway.start" or (
+            previous_unclean and event.get("state_db_integrity") in ("ok", "absent")
+        )
+        if not current_event:
+            message += "; event does not identify the verified live gateway"
+        _probe(6, current_event and healthy_event, message)
     except Exception as exc:
         _probe(6, False, f"exit-diag log unreadable: {exc}")
 
@@ -1249,7 +1285,7 @@ def _print_deep_probes() -> None:
     running_pid = _probe_running_pid()
     _probe_pid_exists(running_pid if running_pid is not None else pid_value)
     _probe_state_file(home / "gateway_state.json")
-    _probe_exit_diag(home / "logs" / "gateway-exit-diag.log")
+    _probe_exit_diag(home / "logs" / "gateway-exit-diag.log", home / "gateway.pid")
 
 
 def status(deep: bool = False) -> None:
