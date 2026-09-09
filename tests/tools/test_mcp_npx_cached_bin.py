@@ -21,9 +21,9 @@ import pytest
 from tools.mcp_tool import _npx_cached_bin
 
 
-def _cache(tmp_path, *, package, deps=None, bin_field, make_bin=True, entry="abc123"):
+def _cache(tmp_path, *, package, deps=None, bin_field, make_bin=True, entry="abc123", cache_dir=None):
     """Build a fake npx cache entry the way npm lays one out."""
-    root = tmp_path / ".npm" / "_npx" / entry
+    root = (cache_dir or tmp_path / ".npm") / "_npx" / entry
     (root / "node_modules" / package).mkdir(parents=True)
     (root / "package.json").write_text(
         json.dumps({"dependencies": deps if deps is not None else {package: "^1.0.0"}}),
@@ -35,9 +35,10 @@ def _cache(tmp_path, *, package, deps=None, bin_field, make_bin=True, entry="abc
     bindir = root / "node_modules" / ".bin"
     bindir.mkdir(parents=True, exist_ok=True)
     name = bin_field if isinstance(bin_field, str) else list(bin_field)[0]
-    target = bindir / (os.path.basename(package) if isinstance(bin_field, str) else name)
+    launcher = os.path.basename(package) if isinstance(bin_field, str) else name
+    target = bindir / (launcher + ".cmd" if os.name == "nt" else launcher)
     if make_bin:
-        target.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+        target.write_text("@echo off\n" if os.name == "nt" else "#!/usr/bin/env node\n", encoding="utf-8")
         target.chmod(0o755)
     return target
 
@@ -108,6 +109,22 @@ def test_no_cache_directory_at_all(tmp_path, monkeypatch):
     monkeypatch.setenv("npm_config_cache", str(tmp_path / "nope"))
 
     assert _npx_cached_bin(["-y", "mcp-linear"]) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows npm uses LOCALAPPDATA for its default cache")
+def test_windows_default_localappdata_cache_is_used_without_override(tmp_path, monkeypatch):
+    """A normal Windows npm install should not fall back to a slow resident npx process."""
+    local_app_data = tmp_path / "AppData" / "Local"
+    target = _cache(
+        tmp_path,
+        package="mcp-linear",
+        bin_field={"mcp-linear": "dist/index.js"},
+        cache_dir=local_app_data / "npm-cache",
+    )
+    monkeypatch.delenv("npm_config_cache", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+
+    assert _npx_cached_bin(["-y", "mcp-linear"]) == (str(target), [])
 
 
 def test_corrupt_cache_manifest_is_skipped(tmp_path):
@@ -188,10 +205,15 @@ def test_windows_selects_launchers_never_the_sh_script():
     from tools.mcp_tool_config import _npx_bin_candidates
 
     win = _npx_bin_candidates("/c/bin", "mcp-linear", windows=True)
-    assert win == ["/c/bin/mcp-linear.cmd", "/c/bin/mcp-linear.exe"]
+    assert win == [
+        os.path.join("/c/bin", "mcp-linear.cmd"),
+        os.path.join("/c/bin", "mcp-linear.exe"),
+    ]
     assert not any(c.endswith("mcp-linear") for c in win), "sh script must not be a candidate"
 
-    assert _npx_bin_candidates("/bin", "mcp-linear", windows=False) == ["/bin/mcp-linear"]
+    assert _npx_bin_candidates("/bin", "mcp-linear", windows=False) == [
+        os.path.join("/bin", "mcp-linear")
+    ]
 
 
 def test_posix_resolution_uses_the_helper(tmp_path):

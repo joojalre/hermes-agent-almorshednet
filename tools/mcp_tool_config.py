@@ -198,40 +198,53 @@ def _npx_cached_bin(args: list) -> Optional[tuple]:
     if not spec or spec.startswith("-"):
         return None
 
-    cache_root = os.environ.get("npm_config_cache") or os.path.join(os.path.expanduser("~"), ".npm")
-    npx_root = os.path.join(cache_root, "_npx")
-    if not os.path.isdir(npx_root):
-        return None
-    try:
-        entries = os.listdir(npx_root)
-    except OSError:
-        return None
+    configured_cache = os.environ.get("npm_config_cache")
+    if configured_cache:
+        cache_roots = [configured_cache]
+    elif os.name == "nt":
+        # npm's Windows default is %LOCALAPPDATA%\npm-cache, not ~/.npm.
+        # Falling back to ~/.npm keeps old/portable layouts working without
+        # overriding an explicit npm_config_cache selected by the user.
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        cache_roots = [os.path.join(local_app_data, "npm-cache")] if local_app_data else []
+        cache_roots.append(os.path.join(os.path.expanduser("~"), ".npm"))
+    else:
+        cache_roots = [os.path.join(os.path.expanduser("~"), ".npm")]
 
-    for entry in entries:
-        manifest = os.path.join(npx_root, entry, "package.json")
+    for cache_root in cache_roots:
+        npx_root = os.path.join(cache_root, "_npx")
+        if not os.path.isdir(npx_root):
+            continue
         try:
-            with open(manifest, "r", encoding="utf-8") as fh:
-                deps = (json.load(fh) or {}).get("dependencies") or {}
-        except (OSError, ValueError, TypeError):
+            entries = os.listdir(npx_root)
+        except OSError:
             continue
-        if spec not in deps:
-            continue
-        pkg_json = os.path.join(npx_root, entry, "node_modules", spec, "package.json")
-        try:
-            with open(pkg_json, "r", encoding="utf-8") as fh:
-                bin_field = (json.load(fh) or {}).get("bin")
-        except (OSError, ValueError, TypeError):
-            continue
-        if isinstance(bin_field, str):
-            names = [os.path.basename(spec)]
-        elif isinstance(bin_field, dict) and len(bin_field) == 1:
-            names = list(bin_field.keys())
-        else:
-            continue  # zero or several bins: which one npx would pick is not ours to guess
-        bin_dir = os.path.join(npx_root, entry, "node_modules", ".bin")
-        for candidate in _npx_bin_candidates(bin_dir, names[0]):
-            if os.path.exists(candidate) and os.access(candidate, os.X_OK):
-                return candidate, rest[1:]
+
+        for entry in entries:
+            manifest = os.path.join(npx_root, entry, "package.json")
+            try:
+                with open(manifest, "r", encoding="utf-8") as fh:
+                    deps = (json.load(fh) or {}).get("dependencies") or {}
+            except (OSError, ValueError, TypeError):
+                continue
+            if spec not in deps:
+                continue
+            pkg_json = os.path.join(npx_root, entry, "node_modules", spec, "package.json")
+            try:
+                with open(pkg_json, "r", encoding="utf-8") as fh:
+                    bin_field = (json.load(fh) or {}).get("bin")
+            except (OSError, ValueError, TypeError):
+                continue
+            if isinstance(bin_field, str):
+                names = [os.path.basename(spec)]
+            elif isinstance(bin_field, dict) and len(bin_field) == 1:
+                names = list(bin_field.keys())
+            else:
+                continue  # zero or several bins: which one npx would pick is not ours to guess
+            bin_dir = os.path.join(npx_root, entry, "node_modules", ".bin")
+            for candidate in _npx_bin_candidates(bin_dir, names[0]):
+                if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                    return candidate, rest[1:]
     return None
 
 
