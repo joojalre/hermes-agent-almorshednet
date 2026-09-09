@@ -10,6 +10,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV
 from hermes_cli import gateway_windows
 
 
@@ -20,12 +21,15 @@ def _launchers(monkeypatch, tmp_path, exit_code):
     child.write_text(
         "import ctypes, ctypes.wintypes, json, os, sys, time\n"
         "from pathlib import Path\n"
+        "from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV, is_gateway_supervisor_process\n"
         "root = Path(sys.argv[1])\n"
         "ctypes.windll.kernel32.GetConsoleWindow.restype = ctypes.wintypes.HWND\n"
         "ctypes.windll.user32.IsWindowVisible.argtypes = [ctypes.wintypes.HWND]\n"
         "window = ctypes.windll.kernel32.GetConsoleWindow()\n"
         "visible = bool(window and ctypes.windll.user32.IsWindowVisible(window))\n"
-        "(root / 'started.tmp').write_text(json.dumps({'pid': os.getpid(), 'visible': visible}), encoding='utf-8')\n"
+        "state = {'pid': os.getpid(), 'visible': visible, 'supervised': is_gateway_supervisor_process(), "
+        "'supervisor_marker': os.environ.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, '')}\n"
+        "(root / 'started.tmp').write_text(json.dumps(state), encoding='utf-8')\n"
         "(root / 'started.tmp').replace(root / 'started.json')\n"
         "deadline = time.monotonic() + 60\n"
         "while not (root / 'release').exists() and time.monotonic() < deadline:\n"
@@ -67,6 +71,8 @@ def _exercise_launcher(command, root, exit_code, *, supervised):
         else:
             assert wrapper.wait(timeout=10) == 0
             assert child.is_running(), "The async launcher must leave its child running"
+        assert state["supervised"] is supervised, "In-chat restart must preserve the launcher's ownership"
+        assert state["supervisor_marker"] == ("1" if supervised else "")
     finally:
         (root / "release").touch()
         wrapper.wait(timeout=30)
@@ -75,8 +81,9 @@ def _exercise_launcher(command, root, exit_code, *, supervised):
 
 
 @pytest.mark.windows_only
-@pytest.mark.parametrize("exit_code", [75, 0])
-def test_scheduled_action_waits_for_hidden_child_and_returns_its_exit_code(monkeypatch, tmp_path, exit_code):
+@pytest.mark.parametrize(("exit_code", "task_result"), [(78, 0), (0, 0), (75, 75), (1, 1)])
+def test_scheduled_action_waits_for_hidden_child_and_applies_restart_policy(monkeypatch, tmp_path, exit_code, task_result):
+    monkeypatch.delenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
     script_path = _launchers(monkeypatch, tmp_path, exit_code)
     captured = {}
 
@@ -90,12 +97,14 @@ def test_scheduled_action_waits_for_hidden_child_and_returns_its_exit_code(monke
     action = ET.fromstring(captured["xml"]).find("{*}Actions/{*}Exec")
     executable = action.findtext("{*}Command")
     arguments = action.findtext("{*}Arguments")
-    _exercise_launcher(f'"{executable}" {arguments}', script_path.parent, exit_code, supervised=True)
+    _exercise_launcher(f'"{executable}" {arguments}', script_path.parent, task_result, supervised=True)
     assert str(script_path.with_suffix(".vbs")) not in arguments
 
 
 @pytest.mark.windows_only
-def test_shared_launcher_remains_detached_and_startup_uses_it(monkeypatch, tmp_path):
+@pytest.mark.parametrize("inherited_supervisor", ["", "1"])
+def test_shared_launcher_remains_detached_and_startup_uses_it(monkeypatch, tmp_path, inherited_supervisor):
+    monkeypatch.setenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, inherited_supervisor)
     script_path = _launchers(monkeypatch, tmp_path, 75)
     shared = script_path.with_suffix(".vbs")
     _exercise_launcher(

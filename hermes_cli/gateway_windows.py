@@ -343,9 +343,11 @@ def _build_gateway_vbs_script(
     No cmd.exe anywhere in the chain. Mirrors ``_build_gateway_cmd_script`` (same env + argv via
     ``_resolve_detached_python``).
 
-    Scheduled Tasks wait for the child and return its exit code so RestartOnFailure can observe
-    gateway crashes. Other callers keep the detached launcher behavior.
+    Scheduled Tasks wait for the child and return transient failures so RestartOnFailure can
+    observe gateway crashes, but do not retry fatal configuration errors. Other callers detach.
     """
+    from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV, GATEWAY_FATAL_CONFIG_EXIT_CODE
+
     python_exe_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
     # list2cmdline gives CreateProcess-correct quoting for WScript.Shell.Run.
     command_line = subprocess.list2cmdline(_gateway_run_argv(python_exe_path, profile_arg))
@@ -359,6 +361,8 @@ def _build_gateway_vbs_script(
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({q('HERMES_HOME')}) = {q(hermes_home)}",
         *[f"env.Item({q(k)}) = {q(v)}" for k, v in _GATEWAY_ENV],
+        # A detached child must not inherit task ownership from its launching gateway.
+        f"env.Item({q(EXTERNAL_GATEWAY_SUPERVISOR_ENV)}) = {q('1' if wait_for_exit else '')}",
         f"env.Item({q('VIRTUAL_ENV')}) = {q(_preserve_hermes_home_path(venv_dir))}",
         # Mirror the cmd wrapper's ``PYTHONPATH=<static>;%PYTHONPATH%`` at runtime.
         f"existing_pp = env.Item({q('PYTHONPATH')})",
@@ -369,7 +373,9 @@ def _build_gateway_vbs_script(
         "End If",
         f"sh.CurrentDirectory = {q(working_dir)}",
         # Both modes keep the same hidden console; only the task owns the child's lifetime.
-        *([f"exitCode = sh.Run({q(command_line)}, 0, True)", "WScript.Quit exitCode"]
+        *([f"exitCode = sh.Run({q(command_line)}, 0, True)",
+           f"If exitCode = {GATEWAY_FATAL_CONFIG_EXIT_CODE} Then exitCode = 0",
+           "WScript.Quit exitCode"]
           if wait_for_exit else [f"sh.Run {q(command_line)}, 0, False"]),
     ]
     return "\r\n".join(lines) + "\r\n"
