@@ -231,7 +231,7 @@ def _sanitize_filename(value: str) -> str:
 
 def get_task_script_path() -> Path:
     """The generated ``gateway.cmd`` wrapper under ``<HERMES_HOME>/gateway-service/`` (per-profile
-    installs stay self-contained); the VBS launcher lives beside it."""
+    installs stay self-contained); the async and supervised VBS launchers live beside it."""
     _assert_windows()
     script_dir = _hermes_home() / "gateway-service"
     script_dir.mkdir(parents=True, exist_ok=True)
@@ -324,7 +324,9 @@ def _build_gateway_cmd_script(python_path: str, working_dir: str, hermes_home: s
     return "\r\n".join(lines) + "\r\n"
 
 
-def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: str, profile_arg: str) -> str:
+def _build_gateway_vbs_script(
+    python_path: str, working_dir: str, hermes_home: str, profile_arg: str, *, wait_for_exit: bool = False,
+) -> str:
     """Build the hidden-console ``gateway.vbs`` launcher (CRLF-terminated).
 
     Run via ``wscript.exe``, not ``cmd.exe``: at logon Windows broadcasts CTRL_CLOSE_EVENT to console
@@ -340,6 +342,9 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
     (#54220/#56747; the previous console-less pythonw.exe gateway forced exactly that per-descendant flash).
     No cmd.exe anywhere in the chain. Mirrors ``_build_gateway_cmd_script`` (same env + argv via
     ``_resolve_detached_python``).
+
+    Scheduled Tasks wait for the child and return its exit code so RestartOnFailure can observe
+    gateway crashes. Other callers keep the detached launcher behavior.
     """
     python_exe_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
     # list2cmdline gives CreateProcess-correct quoting for WScript.Shell.Run.
@@ -349,7 +354,7 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp" + (", exitCode" if wait_for_exit else ""),
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({q('HERMES_HOME')}) = {q(hermes_home)}",
@@ -363,8 +368,9 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
         f"  env.Item({q('PYTHONPATH')}) = {q(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {q(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async.
-        f"sh.Run {q(command_line)}, 0, False",
+        # Both modes keep the same hidden console; only the task owns the child's lifetime.
+        *([f"exitCode = sh.Run({q(command_line)}, 0, True)", "WScript.Quit exitCode"]
+          if wait_for_exit else [f"sh.Run {q(command_line)}, 0, False"]),
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -389,15 +395,19 @@ def _build_startup_launcher(script_path: Path) -> str:
 
 def _write_task_script() -> Path:
     """Generate the gateway.cmd wrapper (kept as a compatibility artifact) and the console-less .vbs
-    launcher used by the Scheduled Task and Startup fallback. Return the .cmd path."""
+    launchers for detached callers and Task Scheduler supervision. Return the .cmd path."""
     _assert_windows()
     settings = _launcher_settings()
     script_path = get_task_script_path()
     _atomic_write(script_path, _build_gateway_cmd_script(*settings), script_path.with_suffix(".tmp"))
-    # Also render the console-less .vbs launcher used by Scheduled Task and the Startup-folder fallback via
-    # wscript.exe (issue #45599 fix A). The .cmd wrapper stays as a generated helper/compatibility artifact.
+    # Keep the shared async launcher for Startup fallback and existing external callers.
     vbs_path = script_path.with_suffix(".vbs")
     _atomic_write(vbs_path, _build_gateway_vbs_script(*settings), vbs_path.with_name(vbs_path.name + ".tmp"))
+    task_vbs_path = script_path.with_suffix(".task.vbs")
+    _atomic_write(
+        task_vbs_path, _build_gateway_vbs_script(*settings, wait_for_exit=True),
+        task_vbs_path.with_name(task_vbs_path.name + ".tmp"),
+    )
     return script_path
 
 
@@ -488,8 +498,8 @@ def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, st
         return (False, f"schtasks /Delete failed (code {delete_code}): {delete_detail}")
     # Other /Delete failures are non-fatal: /Create /F may still replace it; keep the detail.
     user = _resolve_task_user()
-    launcher_path = script_path.with_suffix(".vbs")   # the task launches the console-less .vbs
-    xml_path = launcher_path.with_suffix(".task.xml")
+    launcher_path = script_path.with_suffix(".task.vbs")
+    xml_path = script_path.with_suffix(".task.xml")
     xml_path.write_text(_build_scheduled_task_xml(task_name, launcher_path, user), encoding="utf-16", newline="")
     # Immediate manual starts use _spawn_detached(). See #45599.
     base = ["/Create", "/F", "/TN", task_name, "/XML", str(xml_path)]
@@ -1063,7 +1073,8 @@ def uninstall() -> None:
 
     for path, label in (
         (get_startup_entry_path(), "Windows login item"), (_legacy_startup_entry_path(), "legacy Windows login item"),
-        (script_path, "Task script"), (script_path.with_suffix(".vbs"), "Task launcher"),
+        (script_path, "Task script"), (script_path.with_suffix(".vbs"), "Async launcher"),
+        (script_path.with_suffix(".task.vbs"), "Task launcher"),
     ):
         try:
             path.unlink()
