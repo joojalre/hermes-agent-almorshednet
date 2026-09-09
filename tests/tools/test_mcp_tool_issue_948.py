@@ -152,10 +152,11 @@ def test_run_stdio_malware_check_times_out_fail_open():
 
 
 @pytest.mark.windows_only
-@pytest.mark.skipif(os.name != "nt", reason="per-server npm cache selection is Windows-specific")
 def test_run_stdio_uses_the_per_server_npm_cache(tmp_path):
-    """The cached swap must honor the exact environment passed to the child."""
-    cache_root = tmp_path / "configured-npm-cache"
+    """The cache override is case-insensitive and relative to the child working directory."""
+    child_cwd = tmp_path / "child-cwd"
+    child_cwd.mkdir()
+    cache_root = child_cwd / "configured-npm-cache"
     entry = cache_root / "_npx" / "configured" / "node_modules"
     package = entry / "mcp-linear"
     package.mkdir(parents=True)
@@ -179,10 +180,12 @@ def test_run_stdio_uses_the_per_server_npm_cache(tmp_path):
             await server.start({
                 "command": "npx",
                 "args": ["-y", "mcp-linear"],
-                "env": {"npm_config_cache": str(cache_root)},
+                "env": {"NPM_CONFIG_CACHE": "configured-npm-cache"},
+                "cwd": str(child_cwd),
             })
             assert params.call_args.kwargs["command"] == str(bin_path)
-            assert params.call_args.kwargs["env"]["npm_config_cache"] == str(cache_root)
+            assert params.call_args.kwargs["env"]["NPM_CONFIG_CACHE"] == "configured-npm-cache"
+            assert params.call_args.kwargs["cwd"] == str(child_cwd)
             await server.shutdown()
 
     asyncio.run(_test())

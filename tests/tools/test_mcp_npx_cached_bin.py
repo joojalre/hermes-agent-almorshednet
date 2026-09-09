@@ -114,7 +114,6 @@ def test_no_cache_directory_at_all(tmp_path, monkeypatch):
 
 
 @pytest.mark.windows_only
-@pytest.mark.skipif(os.name != "nt", reason="Windows npm uses LOCALAPPDATA for its default cache")
 def test_windows_default_localappdata_cache_is_used_without_override(tmp_path, monkeypatch):
     """A normal Windows npm install should not fall back to a slow resident npx process."""
     local_app_data = tmp_path / "AppData" / "Local"
@@ -171,8 +170,8 @@ def test_preflight_checks_npx_before_using_its_cached_binary():
         events.append(("osv", command, list(args)))
         return None
 
-    def _cached(args, *, env=None):
-        events.append(("cached", list(args), env))
+    def _cached(args, *, env=None, cwd=None):
+        events.append(("cached", list(args), env, cwd))
         return "cached-server", ["--from-cache"]
 
     with patch("tools.osv_check.check_package_for_malware", side_effect=_check), \
@@ -180,12 +179,13 @@ def test_preflight_checks_npx_before_using_its_cached_binary():
         from tools.mcp_tool import _preflight_stdio_command
 
         command, args = asyncio.run(_preflight_stdio_command(
-            "server", "npx", ["-y", "mcp-linear"], env={"npm_config_cache": "configured"}))
+            "server", "npx", ["-y", "mcp-linear"], env={"npm_config_cache": "configured"},
+            cwd="server-cwd"))
 
     assert (command, args) == ("cached-server", ["--from-cache"])
     assert events == [
         ("osv", "npx", ["-y", "mcp-linear"]),
-        ("cached", ["-y", "mcp-linear"], {"npm_config_cache": "configured"}),
+        ("cached", ["-y", "mcp-linear"], {"npm_config_cache": "configured"}, "server-cwd"),
     ]
 
 

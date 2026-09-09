@@ -170,7 +170,25 @@ def _npx_bin_candidates(bin_dir: str, name: str, *, windows: Optional[bool] = No
     return [os.path.join(bin_dir, name)]
 
 
-def _npx_cached_bin(args: list, env: Optional[dict] = None) -> Optional[tuple]:
+def _env_value(env: dict, name: str):
+    """Read one child-environment value using Windows' case-insensitive key rules.
+
+    ``_build_safe_env`` starts from the current process environment and then appends the
+    server's explicit ``env`` mapping. A server can therefore legitimately override a
+    baseline ``npm_config_cache`` using the conventional uppercase spelling. Iterating all
+    matches on Windows deliberately keeps the last mapping entry, matching that override.
+    """
+    if os.name != "nt":
+        return env.get(name)
+    value = None
+    folded_name = name.casefold()
+    for key, candidate in env.items():
+        if isinstance(key, str) and key.casefold() == folded_name:
+            value = candidate
+    return value
+
+
+def _npx_cached_bin(args: list, env: Optional[dict] = None, cwd: Optional[str] = None) -> Optional[tuple]:
     """Resolve ``npx -y <pkg>`` to the already-installed binary, or None.
 
     ``npx`` resolves the package and then FORKS, staying resident as the real server's parent
@@ -178,9 +196,10 @@ def _npx_cached_bin(args: list, env: Optional[dict] = None) -> Optional[tuple]:
     child (shared death supervisor). When the package is in npx's cache we spawn its binary
     directly. Deliberately conservative — None (caller keeps plain ``npx``, so a cold machine
     still installs) for a cache miss, a version pin (``pkg@1.2.3``), extra npx flags, a manifest
-    without one obvious bin, or any unreadable cache entry. ``env`` is the exact
-    stdio-child environment when supplied, so a per-server ``npm_config_cache``
-    selects the same package cache that the original ``npx`` command would use.
+    without one obvious bin, or any unreadable cache entry. ``env`` and ``cwd`` are
+    the exact stdio-child settings when supplied, so a per-server
+    ``npm_config_cache`` selects the same package cache that the original ``npx``
+    command would use, including a relative configured cache path.
     Returns ``(binary_path, remaining_args)``."""
     if not isinstance(args, list) or not args:
         return None
@@ -202,14 +221,16 @@ def _npx_cached_bin(args: list, env: Optional[dict] = None) -> Optional[tuple]:
         return None
 
     cache_env = os.environ if env is None else env
-    configured_cache = cache_env.get("npm_config_cache")
+    configured_cache = _env_value(cache_env, "npm_config_cache")
     if configured_cache:
+        if not os.path.isabs(configured_cache):
+            configured_cache = os.path.abspath(os.path.join(cwd or os.getcwd(), configured_cache))
         cache_roots = [configured_cache]
     elif os.name == "nt":
         # npm's Windows default is %LOCALAPPDATA%\npm-cache, not ~/.npm.
         # Falling back to ~/.npm keeps old/portable layouts working without
         # overriding an explicit npm_config_cache selected by the user.
-        local_app_data = cache_env.get("LOCALAPPDATA")
+        local_app_data = _env_value(cache_env, "LOCALAPPDATA")
         cache_roots = [os.path.join(local_app_data, "npm-cache")] if local_app_data else []
         cache_roots.append(os.path.join(os.path.expanduser("~"), ".npm"))
     else:
