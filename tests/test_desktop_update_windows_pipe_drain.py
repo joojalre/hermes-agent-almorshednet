@@ -83,6 +83,16 @@ class TestIdleWatchdogCountsUpdateLogGrowth:
         src = self._src()
         assert '$script:StepProgressLogPath = Join-Path $LogDir "update.log"' in src
 
+    def test_profile_scoped_update_logs_are_candidates(self):
+        src = self._src()
+        assert "function Get-StepProgressLogPaths" in src
+        assert 'Join-Path $HermesHome "profiles"' in src
+        assert 'Join-Path $profileDir.FullName "logs\\update.log"' in src
+        assert "$logStallDir" in src, (
+            "The executable watchdog fixture must write its progress into a "
+            "profile-scoped logs/update.log, matching a Desktop update."
+        )
+
     def test_progress_log_overridable_for_self_test(self):
         assert "HERMES_UPDATE_PROGRESS_LOG" in self._src()
 
@@ -151,10 +161,10 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
     output, and report quiescence only after both processes are gone. This is the
     invariant that permits retry.
 
-    *logstall* -- a step that is silent on its pipes but appends to the
-    progress log (pointed at the fixture's own file) every second, exiting 3.
-    This is the shape of every real ``hermes update`` build: output streams to
-    ``logs/update.log``, not stdout, for 40+ minutes. The idle watchdog must
+    *logstall* -- a step that is silent on its pipes but appends to a
+    profile-scoped ``profiles/fixture/logs/update.log`` every second, exiting
+    3. This is the shape of a Desktop update: output streams to the active
+    profile's update log, not stdout, for 40+ minutes. The idle watchdog must
     count that growth as progress and let the step run to its natural exit
     instead of killing it at the ceiling with 124.
 
@@ -178,9 +188,16 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         # how long the leaking grandchild lives. hold >> grace is what makes a
         # regression measurable rather than lucky.
         "HERMES_UPDATE_PIPE_DRAIN_SECONDS": "3",
-        "HERMES_UPDATE_STEP_IDLE_SECONDS": "3",
+        # Windows can take several seconds to schedule a newly-created
+        # console child under load.  Keep the fixture's watchdog below the
+        # 45-second hold while leaving enough launch headroom for its first
+        # profile-scoped log write to become observable.
+        "HERMES_UPDATE_STEP_IDLE_SECONDS": "15",
         "HERMES_SELFTEST_HOLD_SECONDS": "45",
     }
+    # The fixture must prove profile discovery rather than an explicit single
+    # progress-log override inherited from a caller.
+    env.pop("HERMES_UPDATE_PROGRESS_LOG", None)
 
     result = subprocess.run(
         [
