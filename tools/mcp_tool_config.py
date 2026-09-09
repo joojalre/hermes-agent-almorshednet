@@ -170,7 +170,7 @@ def _npx_bin_candidates(bin_dir: str, name: str, *, windows: Optional[bool] = No
     return [os.path.join(bin_dir, name)]
 
 
-def _npx_cached_bin(args: list) -> Optional[tuple]:
+def _npx_cached_bin(args: list, env: Optional[dict] = None) -> Optional[tuple]:
     """Resolve ``npx -y <pkg>`` to the already-installed binary, or None.
 
     ``npx`` resolves the package and then FORKS, staying resident as the real server's parent
@@ -178,7 +178,10 @@ def _npx_cached_bin(args: list) -> Optional[tuple]:
     child (shared death supervisor). When the package is in npx's cache we spawn its binary
     directly. Deliberately conservative — None (caller keeps plain ``npx``, so a cold machine
     still installs) for a cache miss, a version pin (``pkg@1.2.3``), extra npx flags, a manifest
-    without one obvious bin, or any unreadable cache entry. Returns ``(binary_path, remaining_args)``."""
+    without one obvious bin, or any unreadable cache entry. ``env`` is the exact
+    stdio-child environment when supplied, so a per-server ``npm_config_cache``
+    selects the same package cache that the original ``npx`` command would use.
+    Returns ``(binary_path, remaining_args)``."""
     if not isinstance(args, list) or not args:
         return None
 
@@ -198,14 +201,15 @@ def _npx_cached_bin(args: list) -> Optional[tuple]:
     if not spec or spec.startswith("-"):
         return None
 
-    configured_cache = os.environ.get("npm_config_cache")
+    cache_env = os.environ if env is None else env
+    configured_cache = cache_env.get("npm_config_cache")
     if configured_cache:
         cache_roots = [configured_cache]
     elif os.name == "nt":
         # npm's Windows default is %LOCALAPPDATA%\npm-cache, not ~/.npm.
         # Falling back to ~/.npm keeps old/portable layouts working without
         # overriding an explicit npm_config_cache selected by the user.
-        local_app_data = os.environ.get("LOCALAPPDATA")
+        local_app_data = cache_env.get("LOCALAPPDATA")
         cache_roots = [os.path.join(local_app_data, "npm-cache")] if local_app_data else []
         cache_roots.append(os.path.join(os.path.expanduser("~"), ".npm"))
     else:

@@ -13,8 +13,10 @@ installs normally.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -111,6 +113,7 @@ def test_no_cache_directory_at_all(tmp_path, monkeypatch):
     assert _npx_cached_bin(["-y", "mcp-linear"]) is None
 
 
+@pytest.mark.windows_only
 @pytest.mark.skipif(os.name != "nt", reason="Windows npm uses LOCALAPPDATA for its default cache")
 def test_windows_default_localappdata_cache_is_used_without_override(tmp_path, monkeypatch):
     """A normal Windows npm install should not fall back to a slow resident npx process."""
@@ -160,36 +163,30 @@ def test_osv_preflight_runs_before_the_swap():
     assert _infer_ecosystem("/home/u/.npm/_npx/abc/node_modules/.bin/mcp-linear") is None
 
 
-def test_swap_happens_after_the_osv_call_in_source():
-    """Structural guard for the ordering above.
+def test_preflight_checks_npx_before_using_its_cached_binary():
+    """The malware scan sees the original invocation before the direct swap."""
+    events = []
 
-    The swap and the preflight live in one async function; a future edit that
-    moves the swap earlier would disable the malware gate silently, and no
-    unit test of either piece alone would notice.
-    """
-    from pathlib import Path as _P
+    def _check(command, args):
+        events.append(("osv", command, list(args)))
+        return None
 
-    src = _P(__file__).resolve().parents[2] / "tools" / "mcp_tool.py"
-    text = src.read_text(encoding="utf-8")
-    osv_needle = "check_package_for_malware, command, args"
-    swap_needle = "cached = _npx_cached_bin(args)"
-    # Report a rename explicitly: a bare .index() ValueError here reads like a
-    # broken test rather than "someone renamed the thing this guards".
-    assert osv_needle in text, (
-        f"cannot find the OSV preflight call ({osv_needle!r}) — it was renamed; "
-        "update this guard and re-verify the swap still happens after it"
-    )
-    assert swap_needle in text, (
-        f"cannot find the npx swap ({swap_needle!r}) — it was renamed; update "
-        "this guard and re-verify it still happens after the OSV preflight"
-    )
+    def _cached(args, *, env=None):
+        events.append(("cached", list(args), env))
+        return "cached-server", ["--from-cache"]
 
-    assert text.index(osv_needle) < text.index(swap_needle), (
-        "the npx swap now precedes the OSV malware preflight, which silently "
-        "disables it: _infer_ecosystem keys off the command basename being "
-        "npx/uvx/pipx, so a rewritten command yields no ecosystem and "
-        "check_package_for_malware returns None"
-    )
+    with patch("tools.osv_check.check_package_for_malware", side_effect=_check), \
+         patch("tools.mcp_tool._npx_cached_bin", side_effect=_cached):
+        from tools.mcp_tool import _preflight_stdio_command
+
+        command, args = asyncio.run(_preflight_stdio_command(
+            "server", "npx", ["-y", "mcp-linear"], env={"npm_config_cache": "configured"}))
+
+    assert (command, args) == ("cached-server", ["--from-cache"])
+    assert events == [
+        ("osv", "npx", ["-y", "mcp-linear"]),
+        ("cached", ["-y", "mcp-linear"], {"npm_config_cache": "configured"}),
+    ]
 
 
 def test_windows_selects_launchers_never_the_sh_script():

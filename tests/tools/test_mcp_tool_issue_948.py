@@ -4,6 +4,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from tools.mcp_tool import MCPServerTask, _MCP_AVAILABLE
 from tools.mcp_tool_errors import _format_connect_error
@@ -146,5 +147,42 @@ def test_run_stdio_malware_check_times_out_fail_open():
             await server.shutdown()
         # Returned shortly after the 0.2s timeout (fail-open), not the 0.5s hang.
         assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
+
+    asyncio.run(_test())
+
+
+@pytest.mark.windows_only
+@pytest.mark.skipif(os.name != "nt", reason="per-server npm cache selection is Windows-specific")
+def test_run_stdio_uses_the_per_server_npm_cache(tmp_path):
+    """The cached swap must honor the exact environment passed to the child."""
+    cache_root = tmp_path / "configured-npm-cache"
+    entry = cache_root / "_npx" / "configured" / "node_modules"
+    package = entry / "mcp-linear"
+    package.mkdir(parents=True)
+    (entry.parent / "package.json").write_text(
+        '{"dependencies":{"mcp-linear":"^1.0.0"}}', encoding="utf-8")
+    (package / "package.json").write_text(
+        '{"bin":{"mcp-linear":"dist/index.js"}}', encoding="utf-8")
+    bin_path = entry / ".bin" / "mcp-linear.cmd"
+    bin_path.parent.mkdir()
+    bin_path.write_text("@echo off\n", encoding="utf-8")
+    bin_path.chmod(0o755)
+
+    mock_stdio_cm, mock_session_cm = _stdio_mocks()
+
+    async def _test():
+        with patch("tools.osv_check.check_package_for_malware", return_value=None), \
+             patch("tools.mcp_tool.StdioServerParameters") as params, \
+             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
+             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
+            server = MCPServerTask("srv")
+            await server.start({
+                "command": "npx",
+                "args": ["-y", "mcp-linear"],
+                "env": {"npm_config_cache": str(cache_root)},
+            })
+            assert params.call_args.kwargs["command"] == str(bin_path)
+            assert params.call_args.kwargs["env"]["npm_config_cache"] == str(cache_root)
+            await server.shutdown()
 
     asyncio.run(_test())
