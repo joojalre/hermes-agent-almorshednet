@@ -28,7 +28,7 @@ import { _electron, type ElectronApplication, type Page } from '@playwright/test
 
 import { resolveElectronBinary } from './electron-binary'
 import { buildAppEnvFromParent } from './fixtures-env'
-import { type MockServerOptions, startMockServer } from './mock-server'
+import { startMockServer, type MockServerOptions } from '../../../tests-js/scripts/mock-server'
 import { installErrorBannerGuard } from './test'
 import { waitForPageWindowVisible } from './window-visibility'
 
