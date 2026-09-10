@@ -29,6 +29,7 @@ from tools.mcp_tool_config import (
     _effective_npx_cache_env,
     _get_mcp_stderr_log,
     _npx_cached_bin,
+    _npx_cached_invocation,
 )
 from tools.mcp_tool_sampling import ElicitationHandler, SamplingHandler
 from tools.mcp_tool_transport import MCPServerTransportMixin
@@ -48,8 +49,8 @@ async def _preflight_stdio_command(
     cached-npx swap. The preflight must see the REAL command/args: anything that rewrites argv to a
     wrapper or resolved binary has to happen after it, or the check silently inspects the wrapper
     and becomes a no-op (``_infer_ecosystem`` keys off the command basename being npx/uvx/pipx).
-    When ``env`` is a child-environment mapping, a successful npm cache lookup pins its resolved
-    value there before the command is spawned."""
+    When a cache-backed direct launch succeeds, its resolved npm cache is pinned in the child
+    environment before that replacement command is spawned."""
     from tools.osv_check import check_package_for_malware
     try:
         malware_error = await asyncio.wait_for(
@@ -65,7 +66,7 @@ async def _preflight_stdio_command(
     # npx resolves the package and then FORKS, staying resident as the real server's parent for
     # nothing (~48 MB per server, measured). Hermes already supervises the child (shared death
     # supervisor), so a cached package is spawned directly; a cache miss leaves npx untouched.
-    if os.path.basename(command).lower().startswith("npx"):
+    if os.path.basename(command).lower().startswith("npx") and _npx_cached_invocation(args) is not None:
         # npm can select its cache through a project/user .npmrc.  Establish that effective
         # configuration before looking at _npx; otherwise a stale platform-default cache could
         # launch a binary that the original npx invocation would not have selected.  Both the
@@ -79,12 +80,6 @@ async def _preflight_stdio_command(
             # when configuration may change the cache root.
             cache_env = dict(os.environ if env is None else env)
             default_cache_only = True
-        if cache_env is not None and env is not None and cache_env is not env:
-            # The direct launcher and its server must share npm's resolved cache value.  Without
-            # this in-place update, the preflight can find a launcher from `.npmrc` while the
-            # server process sees neither the equivalent environment setting nor its resolved path.
-            env.clear()
-            env.update(cache_env)
         cached = (
             await asyncio.to_thread(
                 _npx_cached_bin, args, env=cache_env, cwd=cwd, default_cache_only=default_cache_only,
@@ -93,6 +88,12 @@ async def _preflight_stdio_command(
             else None
         )
         if cached:
+            if cache_env is not None and env is not None and cache_env is not env:
+                # The direct launcher and its server must share npm's resolved cache value.
+                # Keep the original child environment untouched unless the direct replacement
+                # actually happens, so npx can still honor its own CLI config flags on fallback.
+                env.clear()
+                env.update(cache_env)
             direct_command, direct_args = cached
             logger.debug("MCP server '%s': using cached npx binary %s (skipping the "
                          "resident `npm exec` parent)", server_name, direct_command)

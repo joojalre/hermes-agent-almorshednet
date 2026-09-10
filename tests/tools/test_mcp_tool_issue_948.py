@@ -198,6 +198,8 @@ for line in sys.stdin:
     if request_id is None:
         continue
     if request.get("method") == "initialize":
+        with open(os.environ["HERMES_EVENT_MARKER"], "a", encoding="utf-8") as event:
+            event.write("server-initialize\\n")
         with open(os.environ["HERMES_FIXTURE_MARKER"], "w", encoding="utf-8") as marker:
             json.dump({
                 "argv": sys.argv[1:],
@@ -222,11 +224,12 @@ for line in sys.stdin:
         encoding="utf-8",
     )
     cache_marker = tmp_path / "cache-launch.txt"
+    event_marker = tmp_path / "launch-events.txt"
     fixture_marker = tmp_path / "fixture-launch.json"
-    fallback_marker = tmp_path / "npx-fallback.txt"
     bin_path.write_text(
         "@echo off\r\n"
         "> \"%HERMES_CACHE_MARKER%\" echo %*\r\n"
+        ">> \"%HERMES_EVENT_MARKER%\" echo cached-launch\r\n"
         "\"%HERMES_TEST_PYTHON%\" -u \"%HERMES_FIXTURE_SERVER%\" %*\r\n",
         encoding="utf-8",
     )
@@ -235,24 +238,38 @@ for line in sys.stdin:
     npx_dir.mkdir()
     (npx_dir / "npx.cmd").write_text(
         "@echo off\r\n"
-        "> \"%HERMES_NPX_FALLBACK_MARKER%\" echo npx-fallback\r\n"
+        ">> \"%HERMES_EVENT_MARKER%\" echo npx-fallback\r\n"
         "exit /b 1\r\n",
+        encoding="utf-8",
+    )
+    npm_config_server = tmp_path / "fixture_npm_config.py"
+    npm_config_server.write_text(
+        """
+import os
+import re
+import sys
+from pathlib import Path
+
+
+npmrc = (Path.cwd() / ".npmrc").read_text(encoding="utf-8")
+cache = re.search(r"^\\s*cache\\s*=\\s*(.+?)\\s*$", npmrc, flags=re.MULTILINE)
+if cache is None:
+    raise SystemExit(2)
+Path(os.environ["HERMES_NPM_CONFIG_MARKER"]).write_text(os.getcwd(), encoding="utf-8")
+with open(os.environ["HERMES_EVENT_MARKER"], "a", encoding="utf-8") as marker:
+    marker.write("npm-config\\n")
+sys.stdout.write(cache.group(1) + "\\n")
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (npx_dir / "node.cmd").write_text(
+        "@echo off\r\n"
+        "\"%HERMES_TEST_PYTHON%\" -u \"%HERMES_NPM_CONFIG_SERVER%\" %*\r\n",
         encoding="utf-8",
     )
     npm_cli = npx_dir / "node_modules" / "npm" / "bin" / "npm-cli.js"
     npm_cli.parent.mkdir(parents=True)
-    npm_cli.write_text(
-        """
-const fs = require("fs");
-const path = require("path");
-const npmrc = fs.readFileSync(path.join(process.cwd(), ".npmrc"), "utf8");
-const cache = npmrc.match(/^\\s*cache\\s*=\\s*(.+?)\\s*$/mi);
-if (!cache) process.exit(2);
-fs.writeFileSync(process.env.HERMES_NPM_CONFIG_MARKER, process.cwd());
-process.stdout.write(cache[1] + "\\n");
-""".lstrip(),
-        encoding="utf-8",
-    )
+    npm_cli.write_text("// paired npm fixture\n", encoding="utf-8")
     npm_config_marker = tmp_path / "npm-config.txt"
 
     async def _test():
@@ -264,12 +281,14 @@ process.stdout.write(cache[1] + "\\n");
                 "connect_timeout": 5,
                 "env": {
                     "HERMES_CACHE_MARKER": str(cache_marker),
+                    "HERMES_EVENT_MARKER": str(event_marker),
                     "HERMES_FIXTURE_MARKER": str(fixture_marker),
                     "HERMES_FIXTURE_SERVER": str(fixture_server),
                     "HERMES_HOME": str(hermes_home),
-                    "HERMES_NPX_FALLBACK_MARKER": str(fallback_marker),
+                    "HERMES_NPM_CONFIG_SERVER": str(npm_config_server),
                     "HERMES_NPM_CONFIG_MARKER": str(npm_config_marker),
                     "HERMES_TEST_PYTHON": sys.executable,
+                    "PATHEXT": ".COM;.EXE;.BAT;.CMD",
                     "PATH": str(npx_dir) + os.pathsep + os.environ.get("PATH", ""),
                 },
                 "cwd": str(child_cwd),
@@ -283,7 +302,9 @@ process.stdout.write(cache[1] + "\\n");
                 "hermes_home": str(hermes_home),
             }
             assert npm_config_marker.read_text(encoding="utf-8") == str(child_cwd)
-            assert not fallback_marker.exists()
+            assert event_marker.read_text(encoding="utf-8").splitlines() == [
+                "npm-config", "cached-launch", "server-initialize",
+            ]
             assert [tool.name for tool in server._tools] == ["fixture_tool"]
         finally:
             await server.shutdown()

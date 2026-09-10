@@ -150,6 +150,25 @@ def test_windows_uppercase_server_cache_override_is_relative_to_child_cwd(tmp_pa
     ) == (str(target), [])
 
 
+@pytest.mark.linux_only
+def test_linux_uppercase_server_cache_override_is_relative_to_child_cwd(tmp_path):
+    """npm's conventional uppercase cache setting is honored on POSIX too."""
+    child_cwd = tmp_path / "child-cwd"
+    child_cwd.mkdir()
+    target = _cache(
+        tmp_path,
+        package="mcp-linear",
+        bin_field={"mcp-linear": "dist/index.js"},
+        cache_dir=child_cwd / "configured-npm-cache",
+    )
+
+    assert _npx_cached_bin(
+        ["-y", "mcp-linear"],
+        env={"NPM_CONFIG_CACHE": "configured-npm-cache"},
+        cwd=str(child_cwd),
+    ) == (str(target), [])
+
+
 @pytest.mark.windows_only
 def test_windows_default_cache_only_rejects_portable_home_cache(tmp_path, monkeypatch):
     """A failed npm-config probe must not substitute the old portable cache on Windows."""
@@ -273,7 +292,8 @@ def test_default_cache_guard_rejects_an_unreadable_custom_config_source(tmp_path
     assert not _can_use_default_npx_cache(env, str(tmp_path), str(tmp_path / "npx.cmd"))
 
 
-def test_preflight_uses_default_cache_when_effective_lookup_fails_without_override():
+@pytest.mark.windows_only
+def test_preflight_uses_default_windows_cache_when_effective_lookup_fails_without_override():
     """A known default cache remains available when npm's config process is transiently broken."""
     from tools.mcp_tool import _preflight_stdio_command
 
@@ -288,6 +308,46 @@ def test_preflight_uses_default_cache_when_effective_lookup_fails_without_overri
     assert (command, args) == ("cached-server", ["--from-cache"])
     cached.assert_called_once_with(
         ["-y", "mcp-linear"], env=env, cwd="server-cwd", default_cache_only=True)
+
+
+@pytest.mark.linux_only
+def test_preflight_keeps_npx_when_effective_lookup_fails_on_linux(tmp_path):
+    """A failed POSIX npm probe never guesses the default cache root."""
+    from tools.mcp_tool import _preflight_stdio_command
+
+    with patch("tools.osv_check.check_package_for_malware", return_value=None), \
+         patch("tools.mcp_tool._effective_npx_cache_env", return_value=None), \
+         patch("tools.mcp_tool._npx_cached_bin") as cached:
+        command, args = asyncio.run(_preflight_stdio_command(
+            "server", "npx", ["-y", "mcp-linear"], env={"HOME": str(tmp_path)}, cwd=str(tmp_path)))
+
+    assert (command, args) == ("npx", ["-y", "mcp-linear"])
+    cached.assert_not_called()
+
+
+def test_preflight_keeps_custom_npx_config_flag_and_child_env():
+    """An invocation that npx owns never probes or pins a different cache."""
+    from tools.mcp_tool import _preflight_stdio_command
+
+    env = {"PATH": "C:/fixture/bin", "UNCHANGED": "1"}
+    original_env = dict(env)
+    with patch("tools.osv_check.check_package_for_malware", return_value=None), \
+         patch("tools.mcp_tool._effective_npx_cache_env") as effective, \
+         patch("tools.mcp_tool._can_use_default_npx_cache") as default_cache, \
+         patch("tools.mcp_tool._npx_cached_bin") as cached:
+        command, args = asyncio.run(_preflight_stdio_command(
+            "server",
+            "npx",
+            ["--userconfig", "C:/fixture/custom.npmrc", "-y", "mcp-linear"],
+            env=env,
+            cwd="C:/fixture/project",
+        ))
+
+    assert (command, args) == ("npx", ["--userconfig", "C:/fixture/custom.npmrc", "-y", "mcp-linear"])
+    assert env == original_env
+    effective.assert_not_called()
+    default_cache.assert_not_called()
+    cached.assert_not_called()
 
 
 @pytest.mark.windows_only

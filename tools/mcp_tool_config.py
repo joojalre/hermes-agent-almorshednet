@@ -175,15 +175,19 @@ def _npx_bin_candidates(bin_dir: str, name: str, *, windows: Optional[bool] = No
     return [os.path.join(bin_dir, name)]
 
 
-def _env_value(env: Mapping[str, str], name: str) -> Optional[str]:
-    """Read one child-environment value using Windows' case-insensitive key rules.
+def _env_value(
+    env: Mapping[str, str], name: str, *, case_insensitive: bool = False,
+) -> Optional[str]:
+    """Read one child-environment value using the platform or explicit key rules.
 
     ``_build_safe_env`` starts from the current process environment and then appends the
     server's explicit ``env`` mapping. A server can therefore legitimately override a
-    baseline ``npm_config_cache`` using the conventional uppercase spelling. Iterating all
-    matches on Windows deliberately keeps the last mapping entry, matching that override.
+    baseline ``npm_config_cache`` using the conventional uppercase spelling. npm treats its
+    ``npm_config_*`` variables case-insensitively on every host, while ordinary child
+    environment lookups retain the platform's native behavior. Iterating all matching keys
+    deliberately keeps the last mapping entry, matching that override.
     """
-    if os.name != "nt":
+    if os.name != "nt" and not case_insensitive:
         return env.get(name)
     value = None
     folded_name = name.casefold()
@@ -242,7 +246,7 @@ def _effective_npx_cache_env(
     platform-default cache.
     """
     cache_env = dict(os.environ if env is None else env)
-    if _env_value(cache_env, "npm_config_cache"):
+    if _env_value(cache_env, "npm_config_cache", case_insensitive=True):
         return cache_env
 
     npm_command = _npx_sibling_npm_command(npx_command, cache_env)
@@ -278,12 +282,9 @@ def _effective_npx_cache_env(
     if not os.path.isabs(configured_cache):
         configured_cache = os.path.abspath(os.path.join(cwd or os.getcwd(), configured_cache))
 
-    if os.name == "nt":
-        for key in list(cache_env):
-            if isinstance(key, str) and key.casefold() == "npm_config_cache":
-                del cache_env[key]
-    else:
-        cache_env.pop("npm_config_cache", None)
+    for key in list(cache_env):
+        if isinstance(key, str) and key.casefold() == "npm_config_cache":
+            del cache_env[key]
     cache_env["npm_config_cache"] = configured_cache
     return cache_env
 
@@ -322,7 +323,13 @@ def _can_use_default_npx_cache(
     directive keeps the original ``npx`` command instead.
     """
     cache_env = dict(os.environ if env is None else env)
-    if _env_value(cache_env, "npm_config_cache"):
+    if _env_value(cache_env, "npm_config_cache", case_insensitive=True):
+        return False
+
+    # On POSIX, npm may read a prefix-owned global npmrc that cannot be safely inferred from
+    # the npx shim alone. If its authoritative config probe failed, retain npx rather than scan
+    # the documented default cache and potentially launch a different package.
+    if os.name != "nt":
         return False
 
     candidate_paths: list[str] = []
@@ -348,9 +355,9 @@ def _can_use_default_npx_cache(
             break
         project_dir = parent_dir
 
-    user_config = _env_value(cache_env, "npm_config_userconfig")
-    global_config = _env_value(cache_env, "npm_config_globalconfig")
-    prefix = _env_value(cache_env, "npm_config_prefix")
+    user_config = _env_value(cache_env, "npm_config_userconfig", case_insensitive=True)
+    global_config = _env_value(cache_env, "npm_config_globalconfig", case_insensitive=True)
+    prefix = _env_value(cache_env, "npm_config_prefix", case_insensitive=True)
     if prefix:
         # A custom prefix can point npm at a global config outside the locations below.  Without
         # successfully asking npm for its effective cache, keep npx instead of guessing.
@@ -384,6 +391,32 @@ def _can_use_default_npx_cache(
     return not any(_npmrc_declares_cache(path) for path in candidate_paths)
 
 
+def _npx_cached_invocation(args: list) -> Optional[tuple[str, list]]:
+    """Return a cache-safe npx package spec and server args, or ``None``.
+
+    The direct launcher only implements ``npx -y <package> [server args]``. Any npx-specific
+    flag, version pin, or ambiguous invocation stays with npx, including before configuration
+    probing so a caller's ``--userconfig`` choice cannot be overwritten.
+    """
+    if not isinstance(args, list) or not args:
+        return None
+
+    rest = list(args)
+    while rest and rest[0] in ("-y", "--yes"):
+        rest.pop(0)
+    if not rest:
+        return None
+    # `npx pkg -y` (flag AFTER the spec) would hand the server a flag npx would have eaten.
+    if any(str(arg) in ("-y", "--yes") for arg in rest[1:]):
+        return None
+
+    spec = str(rest[0])
+    # Scoped names keep their leading '@', so only an '@' AFTER the scope is a version separator.
+    if not spec or spec.startswith("-") or "@" in (spec[1:] if spec.startswith("@") else spec):
+        return None
+    return spec, rest[1:]
+
+
 def _npx_cached_bin(
     args: list,
     env: Optional[dict] = None,
@@ -405,27 +438,13 @@ def _npx_cached_bin(
     reserved for a failed ``npm config`` probe: on Windows it prevents the legacy portable
     ``~/.npm`` compatibility root from being mistaken for npm's documented default cache.
     Returns ``(binary_path, remaining_args)``."""
-    if not isinstance(args, list) or not args:
+    invocation = _npx_cached_invocation(args)
+    if invocation is None:
         return None
-
-    rest = list(args)
-    while rest and rest[0] in ("-y", "--yes"):
-        rest.pop(0)
-    if not rest:
-        return None
-    # `npx pkg -y` (flag AFTER the spec) would hand the server a flag npx would have eaten.
-    if any(str(a) in ("-y", "--yes") for a in rest[1:]):
-        return None
-
-    spec = str(rest[0])
-    # Scoped names keep their leading '@', so only an '@' AFTER the scope is a version separator.
-    if "@" in (spec[1:] if spec.startswith("@") else spec):
-        return None
-    if not spec or spec.startswith("-"):
-        return None
+    spec, server_args = invocation
 
     cache_env = os.environ if env is None else env
-    configured_cache = _env_value(cache_env, "npm_config_cache")
+    configured_cache = _env_value(cache_env, "npm_config_cache", case_insensitive=True)
     if configured_cache:
         if not os.path.isabs(configured_cache):
             configured_cache = os.path.abspath(os.path.join(cwd or os.getcwd(), configured_cache))
@@ -474,7 +493,7 @@ def _npx_cached_bin(
             bin_dir = os.path.join(npx_root, entry, "node_modules", ".bin")
             for candidate in _npx_bin_candidates(bin_dir, names[0]):
                 if os.path.exists(candidate) and os.access(candidate, os.X_OK):
-                    return candidate, rest[1:]
+                    return candidate, server_args
     return None
 
 
