@@ -244,6 +244,34 @@ def test_effective_cache_reads_the_paired_npm_configuration(tmp_path):
 
 
 @pytest.mark.windows_only
+def test_effective_cache_uses_managed_node_when_paired_npx_omits_one(tmp_path):
+    """A paired npm CLI never resolves an arbitrary system Node from PATH."""
+    from tools.mcp_tool_config import _effective_npx_cache_env
+
+    npx, node, npm_cli = _paired_windows_npm_layout(tmp_path)
+    node.unlink()
+    managed_node = tmp_path / "hermes-node" / "node.exe"
+    managed_node.parent.mkdir()
+    managed_node.write_bytes(b"")
+    observed = {}
+
+    def _run(argv, **_kwargs):
+        observed["argv"] = argv
+        return SimpleNamespace(returncode=0, stdout=str(tmp_path / "npm-cache") + "\n")
+
+    with patch("tools.mcp_tool_config.find_node_executable", return_value=str(managed_node)) as find_node, \
+         patch("tools.mcp_tool_config.subprocess.run", side_effect=_run):
+        env = _effective_npx_cache_env(str(npx), {"PATH": str(npx.parent)}, str(tmp_path))
+
+    assert env is not None
+    assert env["npm_config_cache"] == str(tmp_path / "npm-cache")
+    assert observed["argv"] == [
+        str(managed_node), str(npm_cli), "--silent", "--no-update-notifier", "--offline", "config", "get", "cache",
+    ]
+    find_node.assert_called_once_with("node")
+
+
+@pytest.mark.windows_only
 def test_effective_cache_expands_a_home_alias_from_the_child_environment(tmp_path):
     """A paired npm result uses the server's HOME, not Hermes's or the cwd."""
     from tools.mcp_tool_config import _effective_npx_cache_env

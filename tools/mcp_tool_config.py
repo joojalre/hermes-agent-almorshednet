@@ -12,6 +12,7 @@ import sys
 import threading
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
+from hermes_constants import find_node_executable
 from tools.mcp_tool_common import _env_ref_name, _prepend_path
 
 logger = logging.getLogger("tools.mcp_tool")
@@ -218,16 +219,18 @@ def _npx_sibling_npm_command(npx_command: str, env: dict) -> Optional[list[str]]
         npm_cli = os.path.join(npx_dir, "node_modules", "npm", "bin", "npm-cli.js")
         if not os.path.isfile(npm_cli):
             return None
-        path_arg = _env_value(env, "PATH")
-        node_candidates = [os.path.join(npx_dir, "node.exe")]
-        node_on_path = shutil.which("node", path=path_arg)
-        if node_on_path is None:
-            node_on_path = _which_with_config_pathext("node", path_arg, env)
-        if node_on_path:
-            node_candidates.append(node_on_path)
-        for node in node_candidates:
+        # Prefer a Node launcher installed alongside npx.  If that layout omits
+        # one, use Hermes's managed resolver rather than probing an arbitrary
+        # PATH: the latter can select an unrelated system Node even while
+        # Hermes owns the runtime that launches its MCP servers.
+        for node_name in ("node.exe", "node.cmd", "node.bat", "node.com"):
+            node = os.path.join(npx_dir, node_name)
             if os.path.isfile(node):
                 return [node, npm_cli]
+
+        managed_node = find_node_executable("node")
+        if managed_node and os.path.isfile(managed_node):
+            return [managed_node, npm_cli]
         return None
 
     npm = os.path.join(npx_dir, "npm")
