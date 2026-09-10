@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -109,6 +110,8 @@ def test_run_stdio_malware_check_does_not_block_event_loop():
 
     async def _test():
         with patch("tools.osv_check.check_package_for_malware", side_effect=slow_check), \
+             patch("tools.mcp_tool._effective_npx_cache_env", return_value=None), \
+             patch("tools.mcp_tool._can_use_default_npx_cache", return_value=False), \
              patch("tools.mcp_tool.StdioServerParameters"), \
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
@@ -137,6 +140,8 @@ def test_run_stdio_malware_check_times_out_fail_open():
     async def _test():
         with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \
              patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.2), \
+             patch("tools.mcp_tool._effective_npx_cache_env", return_value=None), \
+             patch("tools.mcp_tool._can_use_default_npx_cache", return_value=False), \
              patch("tools.mcp_tool.StdioServerParameters"), \
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
@@ -152,10 +157,18 @@ def test_run_stdio_malware_check_times_out_fail_open():
 
 
 @pytest.mark.windows_only
-def test_run_stdio_uses_the_per_server_npm_cache(tmp_path):
-    """The cache override is case-insensitive and relative to the child working directory."""
+def test_run_stdio_spawns_the_cached_windows_launcher(tmp_path, monkeypatch):
+    """Exercise .npmrc cache resolution through the actual Windows stdio process boundary."""
+    pytest.importorskip("mcp")
+
+    monkeypatch.delenv("npm_config_cache", raising=False)
+    monkeypatch.delenv("NPM_CONFIG_CACHE", raising=False)
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     child_cwd = tmp_path / "child-cwd"
     child_cwd.mkdir()
+    (child_cwd / ".npmrc").write_text("cache=configured-npm-cache\n", encoding="utf-8")
     cache_root = child_cwd / "configured-npm-cache"
     entry = cache_root / "_npx" / "configured" / "node_modules"
     package = entry / "mcp-linear"
@@ -166,26 +179,114 @@ def test_run_stdio_uses_the_per_server_npm_cache(tmp_path):
         '{"bin":{"mcp-linear":"dist/index.js"}}', encoding="utf-8")
     bin_path = entry / ".bin" / "mcp-linear.cmd"
     bin_path.parent.mkdir()
-    bin_path.write_text("@echo off\n", encoding="utf-8")
-    bin_path.chmod(0o755)
+    fixture_server = tmp_path / "fixture_mcp_server.py"
+    fixture_server.write_text(
+        """
+import json
+import os
+import sys
 
-    mock_stdio_cm, mock_session_cm = _stdio_mocks()
+
+def reply(request_id, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}) + "\\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if request.get("method") == "initialize":
+        with open(os.environ["HERMES_FIXTURE_MARKER"], "w", encoding="utf-8") as marker:
+            json.dump({
+                "argv": sys.argv[1:],
+                "cache": os.environ.get("NPM_CONFIG_CACHE"),
+                "cwd": os.getcwd(),
+                "hermes_home": os.environ.get("HERMES_HOME"),
+            }, marker)
+        reply(request_id, {
+            "protocolVersion": request["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fixture", "version": "1.0.0"},
+        })
+    elif request.get("method") == "tools/list":
+        reply(request_id, {"tools": [{
+            "name": "fixture_tool",
+            "description": "fixture tool",
+            "inputSchema": {"type": "object", "properties": {}},
+        }]})
+    elif request.get("method") == "ping":
+        reply(request_id, {})
+""".lstrip(),
+        encoding="utf-8",
+    )
+    cache_marker = tmp_path / "cache-launch.txt"
+    fixture_marker = tmp_path / "fixture-launch.json"
+    fallback_marker = tmp_path / "npx-fallback.txt"
+    bin_path.write_text(
+        "@echo off\r\n"
+        "> \"%HERMES_CACHE_MARKER%\" echo %*\r\n"
+        "\"%HERMES_TEST_PYTHON%\" -u \"%HERMES_FIXTURE_SERVER%\" %*\r\n",
+        encoding="utf-8",
+    )
+
+    npx_dir = tmp_path / "npx-bin"
+    npx_dir.mkdir()
+    (npx_dir / "npx.cmd").write_text(
+        "@echo off\r\n"
+        "> \"%HERMES_NPX_FALLBACK_MARKER%\" echo npx-fallback\r\n"
+        "exit /b 1\r\n",
+        encoding="utf-8",
+    )
+    npm_cli = npx_dir / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    npm_cli.parent.mkdir(parents=True)
+    npm_cli.write_text(
+        """
+const fs = require("fs");
+const path = require("path");
+const npmrc = fs.readFileSync(path.join(process.cwd(), ".npmrc"), "utf8");
+const cache = npmrc.match(/^\\s*cache\\s*=\\s*(.+?)\\s*$/mi);
+if (!cache) process.exit(2);
+fs.writeFileSync(process.env.HERMES_NPM_CONFIG_MARKER, process.cwd());
+process.stdout.write(cache[1] + "\\n");
+""".lstrip(),
+        encoding="utf-8",
+    )
+    npm_config_marker = tmp_path / "npm-config.txt"
 
     async def _test():
-        with patch("tools.osv_check.check_package_for_malware", return_value=None), \
-             patch("tools.mcp_tool.StdioServerParameters") as params, \
-             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
-             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
-            server = MCPServerTask("srv")
+        server = MCPServerTask("windows-cached-launcher-fixture")
+        try:
             await server.start({
                 "command": "npx",
-                "args": ["-y", "mcp-linear"],
-                "env": {"NPM_CONFIG_CACHE": "configured-npm-cache"},
+                "args": ["-y", "mcp-linear", "--fixture-arg"],
+                "connect_timeout": 5,
+                "env": {
+                    "HERMES_CACHE_MARKER": str(cache_marker),
+                    "HERMES_FIXTURE_MARKER": str(fixture_marker),
+                    "HERMES_FIXTURE_SERVER": str(fixture_server),
+                    "HERMES_HOME": str(hermes_home),
+                    "HERMES_NPX_FALLBACK_MARKER": str(fallback_marker),
+                    "HERMES_NPM_CONFIG_MARKER": str(npm_config_marker),
+                    "HERMES_TEST_PYTHON": sys.executable,
+                    "PATH": str(npx_dir) + os.pathsep + os.environ.get("PATH", ""),
+                },
                 "cwd": str(child_cwd),
             })
-            assert params.call_args.kwargs["command"] == str(bin_path)
-            assert params.call_args.kwargs["env"]["NPM_CONFIG_CACHE"] == "configured-npm-cache"
-            assert params.call_args.kwargs["cwd"] == str(child_cwd)
+            launched = json.loads(fixture_marker.read_text(encoding="utf-8"))
+            assert cache_marker.read_text(encoding="utf-8").strip() == "--fixture-arg"
+            assert launched == {
+                "argv": ["--fixture-arg"],
+                "cache": str(cache_root),
+                "cwd": str(child_cwd),
+                "hermes_home": str(hermes_home),
+            }
+            assert npm_config_marker.read_text(encoding="utf-8") == str(child_cwd)
+            assert not fallback_marker.exists()
+            assert [tool.name for tool in server._tools] == ["fixture_tool"]
+        finally:
             await server.shutdown()
 
-    asyncio.run(_test())
+    with patch("tools.osv_check.check_package_for_malware", return_value=None):
+        asyncio.run(asyncio.wait_for(_test(), timeout=15))

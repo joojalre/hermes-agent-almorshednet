@@ -7,16 +7,18 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 from tools.mcp_tool_common import _env_ref_name, _prepend_path
 
 logger = logging.getLogger("tools.mcp_tool")
 
 _mcp_stderr_log_fh: Optional[Any] = None
 _mcp_stderr_log_lock = threading.Lock()
+_NPM_CONFIG_CACHE_TIMEOUT_S = 2.0
 
 
 def _get_mcp_stderr_log() -> Any:
@@ -95,10 +97,13 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     """Filtered env for stdio subprocesses so API keys/tokens don't leak: the safe baseline
     keys, ``XDG_*``, vars injected by an external secret source (users configured that backend
     precisely so subprocesses can consume them), plus the server config's own ``env``."""
+    get_secret_source: Optional[Callable[[str], Optional[str]]]
     try:
-        from hermes_cli.env_loader import get_secret_source
+        from hermes_cli.env_loader import get_secret_source as _get_secret_source
     except Exception:  # pragma: no cover — early bootstrap/import fallback
         get_secret_source = None
+    else:
+        get_secret_source = _get_secret_source
     env = {
         key: value for key, value in os.environ.items()
         if key in _SAFE_ENV_KEYS or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
@@ -170,7 +175,7 @@ def _npx_bin_candidates(bin_dir: str, name: str, *, windows: Optional[bool] = No
     return [os.path.join(bin_dir, name)]
 
 
-def _env_value(env: dict, name: str):
+def _env_value(env: Mapping[str, str], name: str) -> Optional[str]:
     """Read one child-environment value using Windows' case-insensitive key rules.
 
     ``_build_safe_env`` starts from the current process environment and then appends the
@@ -188,7 +193,204 @@ def _env_value(env: dict, name: str):
     return value
 
 
-def _npx_cached_bin(args: list, env: Optional[dict] = None, cwd: Optional[str] = None) -> Optional[tuple]:
+def _npx_sibling_npm_command(npx_command: str, env: dict) -> Optional[list[str]]:
+    """Return a local npm CLI command paired with the resolved ``npx`` command.
+
+    The cached-binary shortcut must use the same config source that ``npx`` would use.  On
+    Windows, npm/npx are normally ``.cmd`` shims, which ``subprocess`` cannot execute directly;
+    invoking the paired ``npm-cli.js`` through Node avoids a shell and console flash.  A layout we
+    cannot identify is deliberately left to the original npx command.
+    """
+    npx_path = os.path.abspath(os.path.expanduser(str(npx_command)))
+    npx_dir = os.path.dirname(npx_path)
+    if not npx_dir or not os.path.isdir(npx_dir):
+        return None
+
+    if os.name == "nt":
+        if os.path.splitext(npx_path)[1].lower() == ".exe":
+            npm_exe = os.path.join(npx_dir, "npm.exe")
+            return [npm_exe] if os.path.isfile(npm_exe) else None
+
+        npm_cli = os.path.join(npx_dir, "node_modules", "npm", "bin", "npm-cli.js")
+        if not os.path.isfile(npm_cli):
+            return None
+        path_arg = _env_value(env, "PATH")
+        node_candidates = [os.path.join(npx_dir, "node.exe")]
+        node_on_path = shutil.which("node", path=path_arg)
+        if node_on_path is None:
+            node_on_path = _which_with_config_pathext("node", path_arg, env)
+        if node_on_path:
+            node_candidates.append(node_on_path)
+        for node in node_candidates:
+            if os.path.isfile(node):
+                return [node, npm_cli]
+        return None
+
+    npm = os.path.join(npx_dir, "npm")
+    return [npm] if os.path.isfile(npm) else None
+
+
+def _effective_npx_cache_env(
+    npx_command: str, env: Optional[dict] = None, cwd: Optional[str] = None,
+) -> Optional[dict]:
+    """Return the child env with npm's effective cache pinned, or ``None`` to keep npx.
+
+    An explicit ``npm_config_cache`` already wins.  Otherwise ask the npm installation paired
+    with the resolved npx command for its local, user, and project ``.npmrc`` result.  This is an
+    offline config read, not an install or registry operation.  If its result cannot be established
+    within the small bound, the caller must retain npx instead of guessing a potentially stale
+    platform-default cache.
+    """
+    cache_env = dict(os.environ if env is None else env)
+    if _env_value(cache_env, "npm_config_cache"):
+        return cache_env
+
+    npm_command = _npx_sibling_npm_command(npx_command, cache_env)
+    if npm_command is None:
+        logger.debug("Unable to resolve npm paired with npx command %s; keeping npx", npx_command)
+        return None
+
+    try:
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        result = subprocess.run(
+            [*npm_command, "--silent", "--no-update-notifier", "--offline", "config", "get", "cache"],
+            cwd=cwd,
+            env=cache_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_NPM_CONFIG_CACHE_TIMEOUT_S,
+            check=False,
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("Unable to read npm cache configuration for %s: %s", npx_command, exc)
+        return None
+
+    configured_cache = result.stdout.strip()
+    if result.returncode != 0 or not configured_cache or configured_cache.lower() in {"null", "undefined"}:
+        logger.debug("npm cache configuration was unavailable for %s (exit %s)", npx_command, result.returncode)
+        return None
+    if not os.path.isabs(configured_cache):
+        configured_cache = os.path.abspath(os.path.join(cwd or os.getcwd(), configured_cache))
+
+    if os.name == "nt":
+        for key in list(cache_env):
+            if isinstance(key, str) and key.casefold() == "npm_config_cache":
+                del cache_env[key]
+    else:
+        cache_env.pop("npm_config_cache", None)
+    cache_env["npm_config_cache"] = configured_cache
+    return cache_env
+
+
+def _npmrc_declares_cache(path: str) -> bool:
+    """Return whether an npmrc file may override npm's default cache.
+
+    The fallback path only needs to distinguish an absent/default cache configuration from one
+    that could select another cache.  A malformed or unreadable present file is intentionally
+    treated as an override so the caller keeps ``npx`` rather than launching from a cache it may
+    not use.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                value = line.lstrip("\ufeff").strip()
+                if not value or value.startswith(("#", ";")):
+                    continue
+                if re.match(r"cache\s*=", value, flags=re.IGNORECASE):
+                    return True
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError):
+        return True
+    return False
+
+
+def _can_use_default_npx_cache(
+    env: Optional[dict] = None, cwd: Optional[str] = None, npx_command: Optional[str] = None,
+) -> bool:
+    """Whether it is safe to use npm's documented default cache after a config-probe failure.
+
+    ``npm config get cache`` is the authoritative path for a custom ``.npmrc``.  If that local
+    probe fails, we preserve the direct-launch optimisation only when read-only inspection finds
+    no explicit cache selection.  Any unknown custom config source, unreadable config, or cache
+    directive keeps the original ``npx`` command instead.
+    """
+    cache_env = dict(os.environ if env is None else env)
+    if _env_value(cache_env, "npm_config_cache"):
+        return False
+
+    candidate_paths: list[str] = []
+    seen_paths: set[str] = set()
+
+    def _add(path: Optional[str]) -> None:
+        if not path:
+            return
+        expanded = os.path.abspath(os.path.expanduser(str(path)))
+        normalized = os.path.normcase(os.path.normpath(expanded))
+        if normalized not in seen_paths:
+            seen_paths.add(normalized)
+            candidate_paths.append(expanded)
+
+    # npm applies a project .npmrc from the current workspace upward.  Walking ancestors is
+    # deliberately conservative: a false positive retains npx, while a missed override could
+    # select the wrong cached package.
+    project_dir = os.path.abspath(cwd or os.getcwd())
+    while True:
+        _add(os.path.join(project_dir, ".npmrc"))
+        parent_dir = os.path.dirname(project_dir)
+        if parent_dir == project_dir:
+            break
+        project_dir = parent_dir
+
+    user_config = _env_value(cache_env, "npm_config_userconfig")
+    global_config = _env_value(cache_env, "npm_config_globalconfig")
+    prefix = _env_value(cache_env, "npm_config_prefix")
+    if prefix:
+        # A custom prefix can point npm at a global config outside the locations below.  Without
+        # successfully asking npm for its effective cache, keep npx instead of guessing.
+        return False
+    for configured_path in (user_config, global_config):
+        if configured_path:
+            expanded_path = os.path.abspath(os.path.expanduser(str(configured_path)))
+            if not os.path.isfile(expanded_path):
+                return False
+    _add(user_config)
+    _add(global_config)
+
+    home = _env_value(cache_env, "HOME") or _env_value(cache_env, "USERPROFILE")
+    if home:
+        _add(os.path.join(home, ".npmrc"))
+
+    if os.name == "nt":
+        app_data = _env_value(cache_env, "APPDATA")
+        if app_data:
+            _add(os.path.join(app_data, "npm", "etc", "npmrc"))
+        program_files = _env_value(cache_env, "ProgramFiles")
+        if program_files:
+            _add(os.path.join(program_files, "nodejs", "etc", "npmrc"))
+
+    # npm's built-in config sits with the paired npx shim.  It is normally read-only and lacks a
+    # cache setting, but a present unreadable/custom file is still a reason to retain npx.
+    if npx_command:
+        npx_dir = os.path.dirname(os.path.abspath(os.path.expanduser(str(npx_command))))
+        _add(os.path.join(npx_dir, "node_modules", "npm", "npmrc"))
+
+    return not any(_npmrc_declares_cache(path) for path in candidate_paths)
+
+
+def _npx_cached_bin(
+    args: list,
+    env: Optional[dict] = None,
+    cwd: Optional[str] = None,
+    *,
+    default_cache_only: bool = False,
+) -> Optional[tuple]:
     """Resolve ``npx -y <pkg>`` to the already-installed binary, or None.
 
     ``npx`` resolves the package and then FORKS, staying resident as the real server's parent
@@ -199,7 +401,9 @@ def _npx_cached_bin(args: list, env: Optional[dict] = None, cwd: Optional[str] =
     without one obvious bin, or any unreadable cache entry. ``env`` and ``cwd`` are
     the exact stdio-child settings when supplied, so a per-server
     ``npm_config_cache`` selects the same package cache that the original ``npx``
-    command would use, including a relative configured cache path.
+    command would use, including a relative configured cache path.  ``default_cache_only`` is
+    reserved for a failed ``npm config`` probe: on Windows it prevents the legacy portable
+    ``~/.npm`` compatibility root from being mistaken for npm's documented default cache.
     Returns ``(binary_path, remaining_args)``."""
     if not isinstance(args, list) or not args:
         return None
@@ -232,7 +436,8 @@ def _npx_cached_bin(args: list, env: Optional[dict] = None, cwd: Optional[str] =
         # overriding an explicit npm_config_cache selected by the user.
         local_app_data = _env_value(cache_env, "LOCALAPPDATA")
         cache_roots = [os.path.join(local_app_data, "npm-cache")] if local_app_data else []
-        cache_roots.append(os.path.join(os.path.expanduser("~"), ".npm"))
+        if not default_cache_only:
+            cache_roots.append(os.path.join(os.path.expanduser("~"), ".npm"))
     else:
         cache_roots = [os.path.join(os.path.expanduser("~"), ".npm")]
 

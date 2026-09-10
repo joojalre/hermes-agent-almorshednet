@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -129,6 +131,217 @@ def test_windows_default_localappdata_cache_is_used_without_override(tmp_path, m
     assert _npx_cached_bin(["-y", "mcp-linear"]) == (str(target), [])
 
 
+@pytest.mark.windows_only
+def test_windows_uppercase_server_cache_override_is_relative_to_child_cwd(tmp_path):
+    """Windows treats a server's uppercase cache setting as the same npm setting."""
+    child_cwd = tmp_path / "child-cwd"
+    child_cwd.mkdir()
+    target = _cache(
+        tmp_path,
+        package="mcp-linear",
+        bin_field={"mcp-linear": "dist/index.js"},
+        cache_dir=child_cwd / "configured-npm-cache",
+    )
+
+    assert _npx_cached_bin(
+        ["-y", "mcp-linear"],
+        env={"NPM_CONFIG_CACHE": "configured-npm-cache"},
+        cwd=str(child_cwd),
+    ) == (str(target), [])
+
+
+@pytest.mark.windows_only
+def test_windows_default_cache_only_rejects_portable_home_cache(tmp_path, monkeypatch):
+    """A failed npm-config probe must not substitute the old portable cache on Windows."""
+    portable_target = _cache(
+        tmp_path,
+        package="mcp-linear",
+        bin_field={"mcp-linear": "dist/index.js"},
+        cache_dir=tmp_path / ".npm",
+    )
+    monkeypatch.delenv("npm_config_cache", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    env = {"LOCALAPPDATA": str(tmp_path / "local-app-data")}
+
+    assert _npx_cached_bin(
+        ["-y", "mcp-linear"], env=env, default_cache_only=True) is None
+    assert _npx_cached_bin(["-y", "mcp-linear"], env=env) == (str(portable_target), [])
+
+
+def _paired_windows_npm_layout(tmp_path):
+    """Build the local npx/npm files needed to mock only npm's config response."""
+    bin_dir = tmp_path / "node-bin"
+    bin_dir.mkdir()
+    npx = bin_dir / "npx.cmd"
+    node = bin_dir / "node.exe"
+    npm_cli = bin_dir / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    npx.write_text("@echo off\n", encoding="utf-8")
+    node.write_bytes(b"")
+    npm_cli.parent.mkdir(parents=True)
+    npm_cli.write_text("// fixture\n", encoding="utf-8")
+    return npx, node, npm_cli
+
+
+@pytest.mark.windows_only
+def test_effective_cache_honors_uppercase_server_override_without_npm_probe(tmp_path):
+    """The conventional Windows spelling bypasses npm config and remains the child setting."""
+    from tools.mcp_tool_config import _effective_npx_cache_env
+
+    env = {"NPM_CONFIG_CACHE": "configured-npm-cache"}
+    with patch("tools.mcp_tool_config.subprocess.run") as run:
+        resolved = _effective_npx_cache_env("npx", env, str(tmp_path))
+
+    assert resolved == env
+    run.assert_not_called()
+
+
+@pytest.mark.windows_only
+def test_effective_cache_reads_the_paired_npm_configuration(tmp_path):
+    """A project npmrc cache wins over a stale platform-default cache shortcut."""
+    from tools.mcp_tool_config import _effective_npx_cache_env
+
+    child_cwd = tmp_path / "child-cwd"
+    child_cwd.mkdir()
+    (child_cwd / ".npmrc").write_text("cache=configured-npm-cache\n", encoding="utf-8")
+    npx, node, npm_cli = _paired_windows_npm_layout(tmp_path)
+    observed = {}
+
+    def _run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="configured-npm-cache\n")
+
+    with patch("tools.mcp_tool_config.subprocess.run", side_effect=_run):
+        env = _effective_npx_cache_env(str(npx), {"PATH": str(npx.parent)}, str(child_cwd))
+
+    assert env is not None
+    assert env["npm_config_cache"] == str(child_cwd / "configured-npm-cache")
+    assert observed["argv"] == [
+        str(node), str(npm_cli), "--silent", "--no-update-notifier", "--offline", "config", "get", "cache",
+    ]
+    assert observed["kwargs"]["cwd"] == str(child_cwd)
+    assert observed["kwargs"]["env"]["PATH"] == str(npx.parent)
+
+
+@pytest.mark.windows_only
+def test_effective_cache_failure_returns_no_configured_cache(tmp_path):
+    """A failed npm config subprocess does not invent a custom cache root."""
+    from tools.mcp_tool_config import _effective_npx_cache_env
+
+    npx, _node, _npm_cli = _paired_windows_npm_layout(tmp_path)
+    with patch(
+        "tools.mcp_tool_config.subprocess.run",
+        side_effect=subprocess.TimeoutExpired("npm config get cache", 2),
+    ):
+        assert _effective_npx_cache_env(str(npx), {"PATH": str(npx.parent)}, str(tmp_path)) is None
+
+
+@pytest.mark.windows_only
+def test_default_cache_guard_rejects_a_project_npmrc_cache_override(tmp_path):
+    """A failed probe must retain npx when a project config picks another cache."""
+    from tools.mcp_tool_config import _can_use_default_npx_cache
+
+    child_cwd = tmp_path / "child-cwd"
+    child_cwd.mkdir()
+    (child_cwd / ".npmrc").write_text("cache=configured-npm-cache\n", encoding="utf-8")
+    env = {
+        "HOME": str(tmp_path / "home"),
+        "USERPROFILE": str(tmp_path / "profile"),
+        "APPDATA": str(tmp_path / "appdata"),
+        "LOCALAPPDATA": str(tmp_path / "localappdata"),
+        "ProgramFiles": str(tmp_path / "program-files"),
+    }
+
+    assert not _can_use_default_npx_cache(env, str(child_cwd), str(tmp_path / "npx.cmd"))
+
+
+@pytest.mark.windows_only
+def test_default_cache_guard_rejects_an_unreadable_custom_config_source(tmp_path):
+    """An explicit custom config source is fail-closed when it cannot be read."""
+    from tools.mcp_tool_config import _can_use_default_npx_cache
+
+    env = {
+        "NPM_CONFIG_USERCONFIG": str(tmp_path / "missing-userconfig"),
+        "HOME": str(tmp_path / "home"),
+        "USERPROFILE": str(tmp_path / "profile"),
+        "APPDATA": str(tmp_path / "appdata"),
+        "LOCALAPPDATA": str(tmp_path / "localappdata"),
+        "ProgramFiles": str(tmp_path / "program-files"),
+    }
+
+    assert not _can_use_default_npx_cache(env, str(tmp_path), str(tmp_path / "npx.cmd"))
+
+
+def test_preflight_uses_default_cache_when_effective_lookup_fails_without_override():
+    """A known default cache remains available when npm's config process is transiently broken."""
+    from tools.mcp_tool import _preflight_stdio_command
+
+    env = {"LOCALAPPDATA": "C:/fixture/AppData/Local"}
+    with patch("tools.osv_check.check_package_for_malware", return_value=None), \
+         patch("tools.mcp_tool._effective_npx_cache_env", return_value=None), \
+         patch("tools.mcp_tool._can_use_default_npx_cache", return_value=True), \
+         patch("tools.mcp_tool._npx_cached_bin", return_value=("cached-server", ["--from-cache"])) as cached:
+        command, args = asyncio.run(_preflight_stdio_command(
+            "server", "npx", ["-y", "mcp-linear"], env=env, cwd="server-cwd"))
+
+    assert (command, args) == ("cached-server", ["--from-cache"])
+    cached.assert_called_once_with(
+        ["-y", "mcp-linear"], env=env, cwd="server-cwd", default_cache_only=True)
+
+
+@pytest.mark.windows_only
+def test_preflight_uses_default_windows_cache_when_paired_npm_fails(tmp_path):
+    """A real failed npm CLI probe still reaches the known Windows cache launcher."""
+    from tools.mcp_tool import _preflight_stdio_command
+    from tools.mcp_tool_config import _resolve_stdio_command
+
+    child_cwd = tmp_path / "child-cwd"
+    child_cwd.mkdir()
+    local_app_data = tmp_path / "appdata" / "local"
+    target = _cache(
+        tmp_path,
+        package="mcp-linear",
+        bin_field={"mcp-linear": "dist/index.js"},
+        cache_dir=local_app_data / "npm-cache",
+    )
+    npx_dir = tmp_path / "npx-bin"
+    npx_dir.mkdir()
+    (npx_dir / "npx.cmd").write_text("@echo off\r\nexit /b 1\r\n", encoding="utf-8")
+    npm_cli = npx_dir / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    npm_cli.parent.mkdir(parents=True)
+    npm_cli.write_text("process.exit(1);\n", encoding="utf-8")
+    env = {
+        "APPDATA": str(tmp_path / "appdata" / "roaming"),
+        "HOME": str(tmp_path / "home"),
+        "LOCALAPPDATA": str(local_app_data),
+        "PATH": str(npx_dir) + os.pathsep + os.environ.get("PATH", ""),
+        "ProgramFiles": str(tmp_path / "program-files"),
+        "USERPROFILE": str(tmp_path / "profile"),
+    }
+    command, safe_env = _resolve_stdio_command("npx", env)
+
+    with patch("tools.osv_check.check_package_for_malware", return_value=None):
+        direct_command, direct_args = asyncio.run(_preflight_stdio_command(
+            "server", command, ["-y", "mcp-linear"], env=safe_env, cwd=str(child_cwd)))
+
+    assert (direct_command, direct_args) == (str(target), [])
+
+
+def test_preflight_keeps_npx_when_default_cache_may_be_overridden():
+    """A failed config lookup does not scan a default cache when a custom one may apply."""
+    from tools.mcp_tool import _preflight_stdio_command
+
+    with patch("tools.osv_check.check_package_for_malware", return_value=None), \
+         patch("tools.mcp_tool._effective_npx_cache_env", return_value=None), \
+         patch("tools.mcp_tool._can_use_default_npx_cache", return_value=False), \
+         patch("tools.mcp_tool._npx_cached_bin") as cached:
+        command, args = asyncio.run(_preflight_stdio_command("server", "npx", ["-y", "mcp-linear"]))
+
+    assert (command, args) == ("npx", ["-y", "mcp-linear"])
+    cached.assert_not_called()
+
+
 def test_corrupt_cache_manifest_is_skipped(tmp_path):
     root = tmp_path / ".npm" / "_npx" / "broken"
     root.mkdir(parents=True)
@@ -170,8 +383,8 @@ def test_preflight_checks_npx_before_using_its_cached_binary():
         events.append(("osv", command, list(args)))
         return None
 
-    def _cached(args, *, env=None, cwd=None):
-        events.append(("cached", list(args), env, cwd))
+    def _cached(args, *, env=None, cwd=None, default_cache_only=False):
+        events.append(("cached", list(args), env, cwd, default_cache_only))
         return "cached-server", ["--from-cache"]
 
     with patch("tools.osv_check.check_package_for_malware", side_effect=_check), \
@@ -185,7 +398,7 @@ def test_preflight_checks_npx_before_using_its_cached_binary():
     assert (command, args) == ("cached-server", ["--from-cache"])
     assert events == [
         ("osv", "npx", ["-y", "mcp-linear"]),
-        ("cached", ["-y", "mcp-linear"], {"npm_config_cache": "configured"}, "server-cwd"),
+        ("cached", ["-y", "mcp-linear"], {"npm_config_cache": "configured"}, "server-cwd", False),
     ]
 
 
