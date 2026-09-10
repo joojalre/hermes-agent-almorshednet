@@ -111,7 +111,6 @@ def test_run_stdio_malware_check_does_not_block_event_loop():
     async def _test():
         with patch("tools.osv_check.check_package_for_malware", side_effect=slow_check), \
              patch("tools.mcp_tool._effective_npx_cache_env", return_value=None), \
-             patch("tools.mcp_tool._can_use_default_npx_cache", return_value=False), \
              patch("tools.mcp_tool.StdioServerParameters"), \
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
@@ -141,7 +140,6 @@ def test_run_stdio_malware_check_times_out_fail_open():
         with patch("tools.osv_check.check_package_for_malware", side_effect=hung_check), \
              patch("tools.mcp_tool._OSV_MALWARE_CHECK_TIMEOUT_S", 0.2), \
              patch("tools.mcp_tool._effective_npx_cache_env", return_value=None), \
-             patch("tools.mcp_tool._can_use_default_npx_cache", return_value=False), \
              patch("tools.mcp_tool.StdioServerParameters"), \
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):

@@ -279,8 +279,7 @@ def _effective_npx_cache_env(
     if result.returncode != 0 or not configured_cache or configured_cache.lower() in {"null", "undefined"}:
         logger.debug("npm cache configuration was unavailable for %s (exit %s)", npx_command, result.returncode)
         return None
-    if not os.path.isabs(configured_cache):
-        configured_cache = os.path.abspath(os.path.join(cwd or os.getcwd(), configured_cache))
+    configured_cache = _resolve_npm_cache_path(configured_cache, cache_env, cwd)
 
     for key in list(cache_env):
         if isinstance(key, str) and key.casefold() == "npm_config_cache":
@@ -289,106 +288,25 @@ def _effective_npx_cache_env(
     return cache_env
 
 
-def _npmrc_declares_cache(path: str) -> bool:
-    """Return whether an npmrc file may override npm's default cache.
+def _resolve_npm_cache_path(configured_cache: str, env: Mapping[str, str], cwd: Optional[str]) -> str:
+    """Resolve npm's cache path with the same child home and working directory.
 
-    The fallback path only needs to distinguish an absent/default cache configuration from one
-    that could select another cache.  A malformed or unreadable present file is intentionally
-    treated as an override so the caller keeps ``npx`` rather than launching from a cache it may
-    not use.
+    npm accepts ``~``-relative cache settings. ``os.path.expanduser`` reads Hermes's own process
+    environment, which can differ from the stdio child's HOME/USERPROFILE, so expand a plain home
+    alias from the exact child environment before handling genuinely relative paths.
     """
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                value = line.lstrip("\ufeff").strip()
-                if not value or value.startswith(("#", ";")):
-                    continue
-                if re.match(r"cache\s*=", value, flags=re.IGNORECASE):
-                    return True
-    except FileNotFoundError:
-        return False
-    except (OSError, UnicodeError):
-        return True
-    return False
-
-
-def _can_use_default_npx_cache(
-    env: Optional[dict] = None, cwd: Optional[str] = None, npx_command: Optional[str] = None,
-) -> bool:
-    """Whether it is safe to use npm's documented default cache after a config-probe failure.
-
-    ``npm config get cache`` is the authoritative path for a custom ``.npmrc``.  If that local
-    probe fails, we preserve the direct-launch optimisation only when read-only inspection finds
-    no explicit cache selection.  Any unknown custom config source, unreadable config, or cache
-    directive keeps the original ``npx`` command instead.
-    """
-    cache_env = dict(os.environ if env is None else env)
-    if _env_value(cache_env, "npm_config_cache", case_insensitive=True):
-        return False
-
-    # On POSIX, npm may read a prefix-owned global npmrc that cannot be safely inferred from
-    # the npx shim alone. If its authoritative config probe failed, retain npx rather than scan
-    # the documented default cache and potentially launch a different package.
-    if os.name != "nt":
-        return False
-
-    candidate_paths: list[str] = []
-    seen_paths: set[str] = set()
-
-    def _add(path: Optional[str]) -> None:
-        if not path:
-            return
-        expanded = os.path.abspath(os.path.expanduser(str(path)))
-        normalized = os.path.normcase(os.path.normpath(expanded))
-        if normalized not in seen_paths:
-            seen_paths.add(normalized)
-            candidate_paths.append(expanded)
-
-    # npm applies a project .npmrc from the current workspace upward.  Walking ancestors is
-    # deliberately conservative: a false positive retains npx, while a missed override could
-    # select the wrong cached package.
-    project_dir = os.path.abspath(cwd or os.getcwd())
-    while True:
-        _add(os.path.join(project_dir, ".npmrc"))
-        parent_dir = os.path.dirname(project_dir)
-        if parent_dir == project_dir:
-            break
-        project_dir = parent_dir
-
-    user_config = _env_value(cache_env, "npm_config_userconfig", case_insensitive=True)
-    global_config = _env_value(cache_env, "npm_config_globalconfig", case_insensitive=True)
-    prefix = _env_value(cache_env, "npm_config_prefix", case_insensitive=True)
-    if prefix:
-        # A custom prefix can point npm at a global config outside the locations below.  Without
-        # successfully asking npm for its effective cache, keep npx instead of guessing.
-        return False
-    for configured_path in (user_config, global_config):
-        if configured_path:
-            expanded_path = os.path.abspath(os.path.expanduser(str(configured_path)))
-            if not os.path.isfile(expanded_path):
-                return False
-    _add(user_config)
-    _add(global_config)
-
-    home = _env_value(cache_env, "HOME") or _env_value(cache_env, "USERPROFILE")
-    if home:
-        _add(os.path.join(home, ".npmrc"))
-
-    if os.name == "nt":
-        app_data = _env_value(cache_env, "APPDATA")
-        if app_data:
-            _add(os.path.join(app_data, "npm", "etc", "npmrc"))
-        program_files = _env_value(cache_env, "ProgramFiles")
-        if program_files:
-            _add(os.path.join(program_files, "nodejs", "etc", "npmrc"))
-
-    # npm's built-in config sits with the paired npx shim.  It is normally read-only and lacks a
-    # cache setting, but a present unreadable/custom file is still a reason to retain npx.
-    if npx_command:
-        npx_dir = os.path.dirname(os.path.abspath(os.path.expanduser(str(npx_command))))
-        _add(os.path.join(npx_dir, "node_modules", "npm", "npmrc"))
-
-    return not any(_npmrc_declares_cache(path) for path in candidate_paths)
+    cache_path = str(configured_cache)
+    if cache_path == "~" or cache_path.startswith(("~/", "~\\")):
+        home = _env_value(env, "HOME") or _env_value(env, "USERPROFILE")
+        if home:
+            cache_path = os.path.join(str(home), cache_path[2:])
+        else:
+            cache_path = os.path.expanduser(cache_path)
+    else:
+        cache_path = os.path.expanduser(cache_path)
+    if not os.path.isabs(cache_path):
+        cache_path = os.path.join(cwd or os.getcwd(), cache_path)
+    return os.path.abspath(cache_path)
 
 
 def _npx_cached_invocation(args: list) -> Optional[tuple[str, list]]:
@@ -421,8 +339,6 @@ def _npx_cached_bin(
     args: list,
     env: Optional[dict] = None,
     cwd: Optional[str] = None,
-    *,
-    default_cache_only: bool = False,
 ) -> Optional[tuple]:
     """Resolve ``npx -y <pkg>`` to the already-installed binary, or None.
 
@@ -434,9 +350,7 @@ def _npx_cached_bin(
     without one obvious bin, or any unreadable cache entry. ``env`` and ``cwd`` are
     the exact stdio-child settings when supplied, so a per-server
     ``npm_config_cache`` selects the same package cache that the original ``npx``
-    command would use, including a relative configured cache path.  ``default_cache_only`` is
-    reserved for a failed ``npm config`` probe: on Windows it prevents the legacy portable
-    ``~/.npm`` compatibility root from being mistaken for npm's documented default cache.
+    command would use, including a relative configured cache path.
     Returns ``(binary_path, remaining_args)``."""
     invocation = _npx_cached_invocation(args)
     if invocation is None:
@@ -446,17 +360,14 @@ def _npx_cached_bin(
     cache_env = os.environ if env is None else env
     configured_cache = _env_value(cache_env, "npm_config_cache", case_insensitive=True)
     if configured_cache:
-        if not os.path.isabs(configured_cache):
-            configured_cache = os.path.abspath(os.path.join(cwd or os.getcwd(), configured_cache))
-        cache_roots = [configured_cache]
+        cache_roots = [_resolve_npm_cache_path(configured_cache, cache_env, cwd)]
     elif os.name == "nt":
         # npm's Windows default is %LOCALAPPDATA%\npm-cache, not ~/.npm.
         # Falling back to ~/.npm keeps old/portable layouts working without
         # overriding an explicit npm_config_cache selected by the user.
         local_app_data = _env_value(cache_env, "LOCALAPPDATA")
         cache_roots = [os.path.join(local_app_data, "npm-cache")] if local_app_data else []
-        if not default_cache_only:
-            cache_roots.append(os.path.join(os.path.expanduser("~"), ".npm"))
+        cache_roots.append(os.path.join(os.path.expanduser("~"), ".npm"))
     else:
         cache_roots = [os.path.join(os.path.expanduser("~"), ".npm")]
 

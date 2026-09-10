@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 from tools.mcp_tool_common import _DEFAULT_TOOL_TIMEOUT, mcp_field
 from tools.mcp_tool_config import (
-    _can_use_default_npx_cache,
     _effective_npx_cache_env,
     _get_mcp_stderr_log,
     _npx_cached_bin,
@@ -70,19 +69,11 @@ async def _preflight_stdio_command(
         # npm can select its cache through a project/user .npmrc.  Establish that effective
         # configuration before looking at _npx; otherwise a stale platform-default cache could
         # launch a binary that the original npx invocation would not have selected.  Both the
-        # small npm config subprocess and directory scan stay off the shared MCP event loop.
+        # small npm config subprocess stays off the shared MCP event loop.
         cache_env = await asyncio.to_thread(_effective_npx_cache_env, command, env, cwd)
-        default_cache_only = False
-        if cache_env is None and await asyncio.to_thread(_can_use_default_npx_cache, env, cwd, command):
-            # The npm config probe failed, but no project/user/global setting selects another
-            # cache.  `_npx_cached_bin` already implements npm's documented platform default.
-            # This preserves the optimisation for a transiently broken npm CLI without guessing
-            # when configuration may change the cache root.
-            cache_env = dict(os.environ if env is None else env)
-            default_cache_only = True
         cached = (
             await asyncio.to_thread(
-                _npx_cached_bin, args, env=cache_env, cwd=cwd, default_cache_only=default_cache_only,
+                _npx_cached_bin, args, env=cache_env, cwd=cwd,
             )
             if cache_env
             else None
