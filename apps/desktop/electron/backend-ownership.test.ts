@@ -179,16 +179,19 @@ test('startup reap preserves failed stops for the next launch', async () => {
   assert.deepEqual(parseBackendOwnership(store.value()), [entry])
 })
 
-test('startup reap stops at the deadline and preserves the unprocessed records', async () => {
+test('startup reap stops at the deadline and preserves the unprocessed records', async ({ onTestFinished }) => {
+  // Advance only when the first probe completes, never with runner scheduling.
+  const now = vi.spyOn(Date, 'now').mockReturnValue(0)
+  onTestFinished(() => now.mockRestore())
   const first = ownershipEntry({ pid: 60 })
   const second = ownershipEntry({ pid: 61 })
   const store = memoryStore(stored([first, second]))
   const stop = vi.fn()
 
   const ownership = createOwnership(store, {
-    // Each probe is slow enough to blow a 1ms budget after the first entry.
+    // Exhaust the budget exactly at the boundary after processing one entry.
     matchesIdentity: async () => {
-      await new Promise(resolve => setTimeout(resolve, 10))
+      now.mockReturnValue(1)
 
       return false
     },
@@ -202,7 +205,9 @@ test('startup reap stops at the deadline and preserves the unprocessed records',
   assert.deepEqual(parseBackendOwnership(store.value()), [second])
 })
 
-test('startup reap preserves would-be-reaped records when the budget runs out', async () => {
+test('startup reap preserves would-be-reaped records when the budget runs out', async ({ onTestFinished }) => {
+  const now = vi.spyOn(Date, 'now').mockReturnValue(0)
+  onTestFinished(() => now.mockRestore())
   const first = ownershipEntry({ pid: 62 })
   const second = ownershipEntry({ pid: 63 })
   const store = memoryStore(stored([first, second]))
@@ -210,7 +215,7 @@ test('startup reap preserves would-be-reaped records when the budget runs out', 
 
   const ownership = createOwnership(store, {
     matchesIdentity: async () => {
-      await new Promise(resolve => setTimeout(resolve, 10))
+      now.mockReturnValue(1)
 
       return true
     },
