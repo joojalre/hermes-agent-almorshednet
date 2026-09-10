@@ -348,6 +348,7 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { isPackagedDesktopRuntime } from './runtime-mode'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
@@ -475,12 +476,7 @@ if (USER_DATA_OVERRIDE) {
 }
 
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
-// Electron 41 can report `app.isPackaged` while Playwright launches the dev
-// entrypoint as `electron <desktop-dir>` on Windows.  E2E fixtures set this
-// explicit, test-only escape hatch so their isolated runtime still resolves
-// the checkout; the packaged fixture removes it before launching a bundle.
-const FORCE_DEV_RUNTIME = process.env.HERMES_DESKTOP_FORCE_DEV === '1'
-const IS_PACKAGED = !FORCE_DEV_RUNTIME && (app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACKAGED))
+const IS_PACKAGED = isPackagedDesktopRuntime(app.isPackaged, process.env)
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
 const IS_WSL = isWslEnvironment()
