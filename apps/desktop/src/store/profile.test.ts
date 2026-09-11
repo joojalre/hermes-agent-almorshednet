@@ -211,12 +211,12 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     let releaseFirst!: () => void
     let releaseSecond!: () => void
 
-    const first = new Promise<void>(resolve => {
-      releaseFirst = resolve
+    const first = new Promise<undefined>(resolve => {
+      releaseFirst = () => resolve(undefined)
     })
 
-    const second = new Promise<void>(resolve => {
-      releaseSecond = resolve
+    const second = new Promise<undefined>(resolve => {
+      releaseSecond = () => resolve(undefined)
     })
 
     openGatewayForProfile.mockImplementationOnce(() => first).mockImplementationOnce(() => second)
