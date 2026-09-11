@@ -529,7 +529,8 @@ def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
 
     try:
         started = _run_prompt_submit(f"__bot_dm__{delivery_id}", sid, session, claimed["message"],
-                                     image_paths=[], terminal_callback=terminal_receipt)
+                                     image_paths=[], terminal_callback=terminal_receipt,
+                                     turn_author=claimed.get("author") or None)
     except Exception as exc:
         _notif_release_turn(session)
         terminal_receipt({"status": "failed", "error": str(exc)})
@@ -556,8 +557,16 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
     handle = lambda events, deferred: _notif_handle_ready(  # noqa: E731
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
     last_kanban_poll = last_loop_poll = 0.0
+    last_wisdom_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
+        if not session.get("running") and now - last_wisdom_poll >= _WISDOM_POLL_SECONDS:
+            last_wisdom_poll = now
+            _sync_wisdom_activity_notice(sid, session)
+        try:
+            _poll_bot_live_delivery_once(sid, session)
+        except Exception:
+            logger.warning("Bot live-owner delivery poll failed", exc_info=True)
         # /loop and /heartbeat wakeup drivers: fire a due tick for THIS session while idle (same claim-under-lock
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:
@@ -569,10 +578,6 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
                     _notif_log_failure(f"{what} poll failed", tick_exc)
         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
             last_kanban_poll = now
-            try:
-                _poll_bot_live_delivery_once(sid, session)
-            except Exception:
-                logger.warning("Bot live-owner delivery poll failed", exc_info=True)
             _notif_poll_kanban(sid, session)
         try:
             evt = queue.get(timeout=0.5)
