@@ -358,8 +358,8 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { loadRendererLoadErrorPage } from './renderer-load-error-page'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
-import { isPackagedDesktopRuntime } from './runtime-mode'
 import { fetchRosterSourceData } from './roster-source-fetch'
+import { isPackagedDesktopRuntime } from './runtime-mode'
 import {
   classifyStoredSecret,
   readSecretStoragePolicy,
