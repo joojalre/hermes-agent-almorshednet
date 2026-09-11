@@ -411,6 +411,19 @@ export const $hydrationSyncProfile = atom<string | null>(null)
 const PREWARM_MIN_INTERVAL_MS = 60_000
 
 const prewarmedAt = new Map<string, number>()
+// `openSecondaryCount()` only rises once Electron has finished opening a
+// backend. A rapid pointer sweep can therefore observe the same free capacity
+// repeatedly and queue every profile before the first spawn settles. Keep
+// tentative reservations in the renderer so speculative hover work never
+// floods the main-process coordinator.
+const prewarmingProfiles = new Set<string>()
+
+function backgroundPrewarmCapacity(maxBackends: number): number {
+  // The coordinator reserves one slot for a real user action whenever the
+  // pool has more than one slot. Hover pre-warm requests are background work,
+  // so they must leave that foreground slot free.
+  return maxBackends >= 2 ? maxBackends - 1 : maxBackends
+}
 
 export function prewarmProfileBackend(name: string): void {
   const key = normalizeProfileKey(name)
@@ -432,12 +445,17 @@ export function prewarmProfileBackend(name: string): void {
   // it exists to prevent. Skip speculative spawns once every pool slot is
   // occupied by an open socket; the real click still spawns on demand, it
   // just doesn't get a head start.
-  if (openSecondaryCount() + 1 > $poolLimits.get().maxBackends) {
+  const capacity = backgroundPrewarmCapacity($poolLimits.get().maxBackends)
+
+  if (openSecondaryCount() + prewarmingProfiles.size + 1 > capacity) {
     return
   }
 
   prewarmedAt.set(key, now)
-  openGatewayForProfile(key).catch(() => undefined)
+  prewarmingProfiles.add(key)
+  void openGatewayForProfile(key)
+    .catch(() => undefined)
+    .finally(() => prewarmingProfiles.delete(key))
 }
 
 let gatewaySwitch: Promise<void> | null = null

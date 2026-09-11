@@ -72,6 +72,7 @@ beforeEach(() => {
   ensureGatewayForProfile.mockClear()
   openGatewayForProfile.mockClear()
   openSecondaryCount.mockReturnValue(0)
+  $poolLimits.set({ idleMs: 600_000, maxBackends: 3 })
   $gateway.set({ id: 'live-socket', connectionState: 'open' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
@@ -204,6 +205,40 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     prewarmProfileBackend('warm-slot-free')
 
     expect(openGatewayForProfile).toHaveBeenCalledWith('warm-slot-free')
+  })
+
+  it('reserves background capacity during a rapid hover sweep', async () => {
+    let releaseFirst!: () => void
+    let releaseSecond!: () => void
+
+    const first = new Promise<void>(resolve => {
+      releaseFirst = resolve
+    })
+
+    const second = new Promise<void>(resolve => {
+      releaseSecond = resolve
+    })
+
+    openGatewayForProfile.mockImplementationOnce(() => first).mockImplementationOnce(() => second)
+
+    prewarmProfileBackend('warm-reserved-a')
+
+    prewarmProfileBackend('warm-reserved-b')
+
+    prewarmProfileBackend('warm-reserved-c')
+
+    // Default pool size is three, but its coordinator reserves one foreground
+    // slot. Two pending background pre-warms are therefore the safe maximum.
+    expect(openGatewayForProfile).toHaveBeenCalledTimes(2)
+
+    releaseFirst()
+    releaseSecond()
+    await Promise.all([first, second])
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    prewarmProfileBackend('warm-reserved-c')
+
+    expect(openGatewayForProfile).toHaveBeenCalledTimes(3)
   })
 
   it('follows the live pool-limit atom, not a hard-coded cap', () => {
