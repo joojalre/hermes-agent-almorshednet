@@ -9,7 +9,7 @@ import type { ProfileInfo } from '@/types/hermes'
 const ensureGatewayForProfile = vi.fn(async () => undefined)
 const ensureGatewayForAgent = vi.fn(async () => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
-const openSecondaryCount = vi.fn(() => 0)
+const openLocalSecondaryCount = vi.fn(() => 0)
 const $gateway = atom<unknown>({ id: 'live-socket', connectionState: 'open' })
 const resetStarmapGraph = vi.fn()
 
@@ -18,7 +18,7 @@ vi.mock('@/store/gateway', () => ({
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForProfile,
-  openSecondaryCount
+  openLocalSecondaryCount
 }))
 // The pool-limits atom is profile.ts's live saturation signal — keep the real
 // one so tests can move the cap via the store, but stub its IPC bridge.
@@ -71,7 +71,7 @@ beforeEach(() => {
   getConnection.mockReset()
   ensureGatewayForProfile.mockClear()
   openGatewayForProfile.mockClear()
-  openSecondaryCount.mockReturnValue(0)
+  openLocalSecondaryCount.mockReturnValue(0)
   $poolLimits.set({ idleMs: 600_000, maxBackends: 3 })
   $gateway.set({ id: 'live-socket', connectionState: 'open' })
   $activeGatewayProfile.set('default')
@@ -192,7 +192,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     // Every pool slot occupied: a speculative spawn would LRU-evict a warm
     // backend — often the one the user is about to click. Default limit 3,
     // 3 open secondaries → the next spawn would exceed the cap.
-    openSecondaryCount.mockReturnValue(3)
+    openLocalSecondaryCount.mockReturnValue(3)
 
     prewarmProfileBackend('warm-saturated')
 
@@ -200,7 +200,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
   })
 
   it('pre-warms while pool slots are free', () => {
-    openSecondaryCount.mockReturnValue(1)
+    openLocalSecondaryCount.mockReturnValue(1)
 
     prewarmProfileBackend('warm-slot-free')
 
@@ -244,7 +244,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
   it('follows the live pool-limit atom, not a hard-coded cap', () => {
     // User raises Warm Bot Backends to 8 in Settings: prewarming must keep
     // working well past the old default of 3.
-    openSecondaryCount.mockReturnValue(5)
+    openLocalSecondaryCount.mockReturnValue(5)
     $poolLimits.set({ idleMs: 600_000, maxBackends: 8 })
 
     prewarmProfileBackend('warm-raised-cap')

@@ -22,7 +22,7 @@ import {
   ensureGatewayForProfile,
   openGatewayForAgent,
   openGatewayForProfile,
-  openSecondaryCount
+  openLocalSecondaryCount
 } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { $poolLimits } from '@/store/pool-limits'
@@ -411,7 +411,7 @@ export const $hydrationSyncProfile = atom<string | null>(null)
 const PREWARM_MIN_INTERVAL_MS = 60_000
 
 const prewarmedAt = new Map<string, number>()
-// `openSecondaryCount()` only rises once Electron has finished opening a
+// `openLocalSecondaryCount()` only rises once Electron has finished opening a
 // backend. A rapid pointer sweep can therefore observe the same free capacity
 // repeatedly and queue every profile before the first spawn settles. Keep
 // tentative reservations in the renderer so speculative hover work never
@@ -447,7 +447,7 @@ export function prewarmProfileBackend(name: string): void {
   // just doesn't get a head start.
   const capacity = backgroundPrewarmCapacity($poolLimits.get().maxBackends)
 
-  if (openSecondaryCount() + prewarmingProfiles.size + 1 > capacity) {
+  if (openLocalSecondaryCount() + prewarmingProfiles.size + 1 > capacity) {
     return
   }
 
