@@ -541,8 +541,13 @@ async function openSecondary(
   if (entry.connectPromise) {
     if (spawnPriority === 'foreground') {
       // Hydration may already own this dial as a background slot wait. Kick a
-      // foreground IPC so main can promote it onto the reserved slot.
-      void (
+      // foreground IPC so main can promote it onto the reserved slot. Keep
+      // its result: the speculative caller can still reject after that
+      // promotion has started the backend, and a user click must then redial
+      // instead of inheriting the stale background rejection.
+      const pending = entry.connectPromise
+
+      const promoted =
         entry.connectionId && desktop.getConnectionFor
           ? desktop.getConnectionFor({
               connectionId: entry.connectionId,
@@ -550,7 +555,30 @@ async function openSecondary(
               priority: 'foreground'
             })
           : desktop.getConnection(entry.profile, { priority: 'foreground' })
-      ).catch(() => undefined)
+
+      try {
+        await pending
+      } catch (error) {
+        try {
+          await promoted
+        } catch {
+          // The original dial carries the useful failure when promotion also
+          // fails; preserve it for the caller's recovery UI.
+          throw error
+        }
+
+        // The old speculative promise is settled, but its outer caller may
+        // not have cleared the slot yet. It is safe to release the settled
+        // reference here; retry through the normal foreground path so this
+        // socket connects to the backend the promotion just started.
+        if (entry.connectPromise === pending) {
+          entry.connectPromise = null
+        }
+
+        await openSecondary(entry, 'foreground')
+      }
+
+      return
     }
 
     await entry.connectPromise
@@ -687,7 +715,12 @@ function scheduleReconnect(entry: Secondary): void {
   entry.reconnectAttempt += 1
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null
-    void reconnectSecondary(entry)
+    // The selected route is no longer speculative when its timer fires: it
+    // owns the user's visible surface and may use the pool's reserved
+    // foreground slot. Other retained sockets remain best-effort so they
+    // cannot queue behind the pool and delay a later click.
+    const active = entry.scope === g.activeKey
+    void reconnectSecondary(entry, active ? { spawnPriority: 'foreground', speculative: false } : undefined)
   }, delay)
 }
 
