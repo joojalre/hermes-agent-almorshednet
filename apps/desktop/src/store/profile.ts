@@ -416,7 +416,7 @@ const prewarmedAt = new Map<string, number>()
 // repeatedly and queue every profile before the first spawn settles. Keep
 // tentative reservations in the renderer so speculative hover work never
 // floods the main-process coordinator.
-const prewarmingProfiles = new Set<string>()
+const prewarmingTargets = new Set<string>()
 
 function backgroundPrewarmCapacity(maxBackends: number): number {
   // The coordinator reserves one slot for a real user action whenever the
@@ -425,13 +425,7 @@ function backgroundPrewarmCapacity(maxBackends: number): number {
   return maxBackends >= 2 ? maxBackends - 1 : maxBackends
 }
 
-export function prewarmProfileBackend(name: string): void {
-  const key = normalizeProfileKey(name)
-
-  if (key === normalizeProfileKey($activeGatewayProfile.get())) {
-    return
-  }
-
+function prewarmTarget(key: string, open: () => Promise<void>): void {
   const now = Date.now()
 
   if (now - (prewarmedAt.get(key) ?? 0) < PREWARM_MIN_INTERVAL_MS) {
@@ -447,15 +441,39 @@ export function prewarmProfileBackend(name: string): void {
   // just doesn't get a head start.
   const capacity = backgroundPrewarmCapacity($poolLimits.get().maxBackends)
 
-  if (openLocalSecondaryCount() + prewarmingProfiles.size + 1 > capacity) {
+  if (openLocalSecondaryCount() + prewarmingTargets.size + 1 > capacity) {
     return
   }
 
   prewarmedAt.set(key, now)
-  prewarmingProfiles.add(key)
-  void openGatewayForProfile(key)
+  prewarmingTargets.add(key)
+  void open()
     .catch(() => undefined)
-    .finally(() => prewarmingProfiles.delete(key))
+    .finally(() => prewarmingTargets.delete(key))
+}
+
+export function prewarmProfileBackend(name: string): void {
+  const profile = normalizeProfileKey(name)
+
+  if (profile === normalizeProfileKey($activeGatewayProfile.get())) {
+    return
+  }
+
+  prewarmTarget(`profile:${profile}`, () => openGatewayForProfile(profile))
+}
+
+/**
+ * The source-qualified counterpart of `prewarmProfileBackend`. Bot roster
+ * rows use this path when their owner is known as `(connectionId, profile)`.
+ * It deliberately shares the same reservation set and foreground headroom as
+ * local profile hovers: a sweep across source-scoped rows must not bypass the
+ * pool cap and queue every local backend before the user actually clicks one.
+ */
+export function prewarmGatewayAgent(connectionId: null | string | undefined, profile: string): void {
+  const source = String(connectionId ?? '').trim() || 'local'
+  const target = normalizeProfileKey(profile)
+
+  prewarmTarget(`agent:${source}:${target}`, () => openGatewayForAgent(connectionId ?? null, target))
 }
 
 let gatewaySwitch: Promise<void> | null = null
