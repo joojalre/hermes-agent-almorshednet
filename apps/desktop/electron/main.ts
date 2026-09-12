@@ -289,7 +289,9 @@ import { ensurePoolBackendRuntime } from './pool-backend-startup'
 import { selectPoolEvictions } from './pool-eviction'
 import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS } from './pool-limits'
 import {
+  isBackgroundCapacitySkip,
   isBackgroundSlotWaitTimeout,
+  LocalBackendBackgroundCapacityError,
   LocalBackendSpawnCoordinator,
   type LocalBackendSpawnPriority,
   type LocalBackendSpawnRequest,
@@ -1529,10 +1531,14 @@ function promotePoolEntry(entry: any): void {
   entry.localBackendSpawnRequest?.promote?.('foreground')
 }
 
-// Land a spawn failure in desktop.log. A background slot-wait timeout is
-// routine under a saturated pool (the next hydration pass retries), so it is
-// logged as such instead of as a backend-start failure.
+// Land a spawn failure in desktop.log. A speculative background hydration that
+// found no immediate slot is routine under a saturated pool, so it stays quiet
+// and retries later; it must not flood logs or occupy the foreground slot.
 function logPoolSpawnFailure(label: string, error: unknown): void {
+  if (isBackgroundCapacitySkip(error)) {
+    return
+  }
+
   if (isBackgroundSlotWaitTimeout(error)) {
     rememberLog(`Profile backend ${label} slot wait timed out (background); will retry on the next hydration`)
   } else {
@@ -12578,10 +12584,27 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   const spawnPriority: LocalBackendSpawnPriority = spawnPriorityFrom(entry.spawnPriority)
 
-  const spawnRequest = localBackendSpawnCoordinator.request(poolKey, {
-    timeoutMs: POOL_SLOT_WAIT_MS,
-    priority: spawnPriority
-  })
+  // Speculative work should never wait behind a saturated pool. In particular,
+  // profile/roster hydration runs repeatedly: queueing each pass kept a growing
+  // set of 30-second waits alive and made a real bot click look slow. Preserve
+  // the normal timed priority queue for foreground navigation, where a click
+  // can also promote an existing dial into the reserved slot.
+  let spawnRequest: LocalBackendSpawnRequest
+
+  if (spawnPriority === 'background') {
+    const immediateRequest = localBackendSpawnCoordinator.tryRequest(poolKey, { priority: 'background' })
+
+    if (!immediateRequest) {
+      throw new LocalBackendBackgroundCapacityError(poolKey)
+    }
+
+    spawnRequest = immediateRequest
+  } else {
+    spawnRequest = localBackendSpawnCoordinator.request(poolKey, {
+      timeoutMs: POOL_SLOT_WAIT_MS,
+      priority: spawnPriority
+    })
+  }
 
   entry.localBackendSlotKey = poolKey
   entry.localBackendSpawnRequest = spawnRequest

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { test } from 'vitest'
 
 import {
+  LocalBackendBackgroundCapacityError,
   LocalBackendSlotWaitTimeoutError,
   LocalBackendSpawnCoordinator,
   releaseLocalBackendSlotAfterExit
@@ -340,6 +341,42 @@ test('cap 3: two background leases leave a reserved slot for foreground', async 
   assert.equal(coordinator.activeCount, 0)
 })
 
+test('a speculative background request skips saturation without joining the queue', async () => {
+  const coordinator = new LocalBackendSpawnCoordinator(3)
+
+  const background = await Promise.all(
+    ['bg-1', 'bg-2'].map(key => coordinator.request(key, { priority: 'background' }).acquired)
+  )
+
+  const skipped = coordinator.tryRequest('roster-hydration', { priority: 'background' })
+
+  assert.equal(skipped, undefined)
+  assert.equal(coordinator.activeCount, 2)
+  assert.equal(coordinator.queuedCount, 0)
+
+  const foreground = coordinator.tryRequest('user-click', { priority: 'foreground' })
+
+  assert.ok(foreground)
+  assert.equal(foreground.queued, false)
+  const releaseForeground = await foreground.acquired
+
+  releaseForeground()
+
+  for (const release of background) {
+    release()
+  }
+
+  assert.equal(coordinator.activeCount, 0)
+})
+
+test('background capacity skips are typed and quiet', () => {
+  const error = new LocalBackendBackgroundCapacityError('roster-hydration')
+
+  assert.equal(error.name, 'LocalBackendBackgroundCapacityError')
+  assert.equal(error.silent, true)
+  assert.match(error.message, /no background slot is currently free/)
+})
+
 test('untagged acquire still fills the cap (foreground default)', async () => {
   const coordinator = new LocalBackendSpawnCoordinator(3)
   const releases = await Promise.all(['a', 'b', 'c'].map(key => coordinator.acquire(key)))
@@ -543,9 +580,11 @@ test('promoting a queued background waiter lets it take the reserved foreground 
     const bootBudget = Number(
       /export const BACKEND_BOOT_WAIT_TIMEOUT_MS = ([\d_]+)/.exec(withTimeoutSource)?.[1]?.replace(/_/g, '')
     )
+
     const portBudget = Number(
       /const DEFAULT_PORT_ANNOUNCE_TIMEOUT_MS = ([\d_]+)/.exec(backendReadySource)?.[1]?.replace(/_/g, '')
     )
+
     const readinessBudget = Number(
       /export const DEFAULT_BACKEND_READY_TIMEOUT_MS = ([\d_]+)/.exec(backendHealthSource)?.[1]?.replace(/_/g, '')
     )
