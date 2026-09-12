@@ -78,11 +78,12 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
     expect(warmProfile).not.toHaveBeenCalled()
 
     vi.useFakeTimers()
+
     try {
       fireEvent.pointerEnter(row)
 
       expect(warmProfile).not.toHaveBeenCalled()
-      vi.advanceTimersByTime(220)
+      vi.runOnlyPendingTimers()
 
       expect(warmProfile.mock.calls).toEqual([['alpha']])
       expect(warmAgent).not.toHaveBeenCalled()
@@ -101,9 +102,11 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
     } as RosterRow)
 
     vi.useFakeTimers()
+
     try {
       fireEvent.pointerEnter(row)
-      vi.advanceTimersByTime(220)
+      expect(warmAgent).not.toHaveBeenCalled()
+      vi.runOnlyPendingTimers()
 
       expect(warmAgent.mock.calls).toEqual([['work', 'research']])
       expect(warmProfile).not.toHaveBeenCalled()
@@ -114,6 +117,7 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
 
   it('keeps only the final hover eligible to warm', () => {
     vi.useFakeTimers()
+
     try {
       const { getAllByRole } = render(
         <>
@@ -133,11 +137,12 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
           />
         </>
       )
+
       const [alpha, beta] = getAllByRole('button')
 
       fireEvent.pointerEnter(alpha)
       fireEvent.pointerEnter(beta)
-      vi.advanceTimersByTime(220)
+      vi.runOnlyPendingTimers()
 
       expect(warmProfile.mock.calls).toEqual([['beta']])
     } finally {

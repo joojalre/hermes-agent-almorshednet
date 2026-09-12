@@ -103,6 +103,21 @@ describe('IncrementalExternalStoreThreadRuntimeCore adapter swap notifications',
     expect(notifications).toBe(0)
   })
 
+  it('accepts a repository after a legacy adapter omitted one', () => {
+    const repo = repositoryOf([message('a', 'one')])
+    const core = new IncrementalExternalStoreRuntimeCore(adapterWith(repo))
+
+    // `ExternalStoreAdapter` supports an older no-repository form. A later
+    // modern adapter must take the normal incremental path rather than trying
+    // to compare the missing legacy repository.
+    core.setAdapter({
+      isRunning: false,
+      messages: repo.messages.map(({ message }) => message)
+    } as ExternalStoreAdapter)
+
+    expect(() => core.setAdapter(adapterWith(repo))).not.toThrow()
+  })
+
   it('still notifies when the message repository actually changes', () => {
     const repo = repositoryOf([message('a', 'one')])
     const core = new IncrementalExternalStoreRuntimeCore(adapterWith(repo))

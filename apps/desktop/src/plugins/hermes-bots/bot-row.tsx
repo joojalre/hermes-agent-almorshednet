@@ -207,6 +207,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
       /* warm is best-effort */
     }
   }, [bot.connectionId, bot.name, bot.sourceScoped])
+
   const { cancelPrewarm, startPrewarm } = usePrewarmIntent(warm)
 
   // Rows and Active Now share the exact-owner open path; only that path may

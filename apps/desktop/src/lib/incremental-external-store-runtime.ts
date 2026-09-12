@@ -222,8 +222,9 @@ class IncrementalExternalStoreThreadRuntimeCore extends ExternalStoreThreadRunti
 
     if (
       oldStore &&
+      oldStore.messageRepository &&
       oldStore.isRunning === store.isRunning &&
-      sameMessageRepository(oldStore.messageRepository!, store.messageRepository)
+      sameMessageRepository(oldStore.messageRepository, store.messageRepository)
     ) {
       // Same observable transcript, same run state: notify only if
       // extras/suggestions/capabilities actually moved. A fresh repository
