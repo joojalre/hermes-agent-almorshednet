@@ -134,7 +134,10 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
 
     let failFirst = true
 
-    const getConnection = vi.fn(async ({ profile }: { profile: string }) => ({
+    const getConnection = vi.fn(async (
+      { profile }: { profile: string },
+      _options?: { priority?: 'foreground'; speculative?: boolean }
+    ) => ({
       authMode: 'token',
       baseUrl: `https://${profile}.invalid`,
       mode: 'local',
@@ -171,7 +174,10 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
 
     let failReconnect = false
 
-    const getConnection = vi.fn(async ({ profile }: { profile: string }) => ({
+    const getConnection = vi.fn(async (
+      { profile }: { profile: string },
+      _options?: { priority?: 'foreground'; speculative?: boolean }
+    ) => ({
       authMode: 'token',
       baseUrl: `https://${profile}.invalid`,
       mode: 'local',
