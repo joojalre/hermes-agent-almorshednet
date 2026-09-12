@@ -446,10 +446,10 @@ function prewarmTarget(key: string, open: () => Promise<void>, reserveLocalPool:
   }
 
   prewarmedAt.set(key, now)
+
   if (reserveLocalPool) {
     prewarmingTargets.add(key)
   }
-
 
   void open()
     .catch(() => undefined)
