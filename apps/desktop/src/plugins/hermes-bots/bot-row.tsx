@@ -26,11 +26,11 @@ import {
   SidebarRowLead,
   Tip,
   useI18n,
+  usePrewarmIntent,
   useValue
 } from '@hermes/plugin-sdk'
 import { useCallback } from 'react'
 
-import { usePrewarmIntent } from '@/app/chat/sidebar/use-profile-prewarm'
 import { avatarColor, botAppearance, BotFace } from './avatar'
 import { isBackfilledFacePng } from './avatar-image'
 import {
