@@ -67,6 +67,7 @@ import {
   newSessionInAgent,
   newSessionInProfile,
   normalizeProfileKey,
+  prewarmProfileBackend,
   refreshProfiles,
   selectProfile,
   setActiveProfile,
@@ -666,12 +667,10 @@ export const host = {
   },
 
   /** Pre-dial a profile's gateway socket in the background — pool-only, no
-   *  activation, no navigation, no scope change (openGatewayForProfile; it
-   *  already no-ops for shared-remote routes and the primary). Roster UIs
-   *  call this after mount so the FIRST click on an agent doesn't pay the
-   *  whole backend spawn + socket dial latency. Fire-and-forget: failures
-   *  are swallowed — the click path re-runs its own ensure and surfaces
-   *  errors properly. */
+   *  activation, no navigation, no scope change. The profile-store seam
+   *  applies the same live pool cap, foreground reservation, and hover
+   *  throttling used by the native profile rail, so a large bot roster cannot
+   *  flood the background spawn queue. */
   warmProfile: (profile: string): void => {
     const name = (profile ?? '').trim()
 
@@ -679,7 +678,7 @@ export const host = {
       return
     }
 
-    void openGatewayForProfile(name).catch(() => undefined)
+    prewarmProfileBackend(name)
   },
 
   /** Delete a profile THROUGH the desktop's teardown-routed REST path — the
