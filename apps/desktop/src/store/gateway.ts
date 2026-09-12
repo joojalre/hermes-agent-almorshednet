@@ -691,7 +691,19 @@ function scheduleReconnect(entry: Secondary): void {
   }, delay)
 }
 
-async function reconnectSecondary(entry: Secondary): Promise<void> {
+/**
+ * Retry a secondary after a transport or lifecycle event.
+ *
+ * Automatic recovery is deliberately speculative: it is useful only while a
+ * local-pool slot is available right now. Queuing every closed background
+ * socket behind a saturated pool made a normal roster of profiles keep 30s
+ * waits alive and delayed the next real bot click. A caller servicing the
+ * active, user-facing route opts into foreground instead.
+ */
+async function reconnectSecondary(
+  entry: Secondary,
+  { spawnPriority = 'background', speculative = true }: { spawnPriority?: SpawnPriority; speculative?: boolean } = {}
+): Promise<void> {
   if (entry.reconnecting || !entry.wantOpen || isOpen(entry.gateway)) {
     return
   }
@@ -699,7 +711,7 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
   entry.reconnecting = true
 
   try {
-    await openSecondary(entry)
+    await openSecondary(entry, spawnPriority, speculative)
     entry.reconnectAttempt = 0
   } catch (error) {
     // The registry no longer knows this connection (removed while we were
@@ -1615,7 +1627,10 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
   }
 
   if (!isOpen(entry.gateway)) {
-    await reconnectSecondary(entry)
+    // This is on the request path for the currently active bot/profile. It is
+    // a real user action, not the automatic reconnect sweep, so it must be
+    // allowed to claim the foreground pool slot immediately.
+    await reconnectSecondary(entry, { spawnPriority: 'foreground', speculative: false })
   }
 
   if (!isOpen(entry.gateway)) {

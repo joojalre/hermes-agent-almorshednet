@@ -160,6 +160,9 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
     failFirst = false
     await vi.runAllTimersAsync()
     expect(gatewayMocks.instances[0].connectionState).toBe('open')
+    // Recovery is automatic background work. It may retry later, but it must
+    // never occupy a queued local-pool slot and delay a person selecting a bot.
+    expect(getConnection.mock.calls.at(-1)?.[1]).toEqual({ speculative: true })
   })
 
   it('activates the secondary when connect succeeds', async () => {
