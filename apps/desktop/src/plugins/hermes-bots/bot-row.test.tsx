@@ -77,10 +77,18 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
 
     expect(warmProfile).not.toHaveBeenCalled()
 
-    fireEvent.pointerEnter(row)
+    vi.useFakeTimers()
+    try {
+      fireEvent.pointerEnter(row)
 
-    expect(warmProfile.mock.calls).toEqual([['alpha']])
-    expect(warmAgent).not.toHaveBeenCalled()
+      expect(warmProfile).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(220)
+
+      expect(warmProfile.mock.calls).toEqual([['alpha']])
+      expect(warmAgent).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('pre-dials a source-scoped row on its own source', async () => {
@@ -92,10 +100,49 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
       sourceScoped: true
     } as RosterRow)
 
-    fireEvent.pointerEnter(row)
+    vi.useFakeTimers()
+    try {
+      fireEvent.pointerEnter(row)
+      vi.advanceTimersByTime(220)
 
-    expect(warmAgent.mock.calls).toEqual([['work', 'research']])
-    expect(warmProfile).not.toHaveBeenCalled()
+      expect(warmAgent.mock.calls).toEqual([['work', 'research']])
+      expect(warmProfile).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps only the final hover eligible to warm', () => {
+    vi.useFakeTimers()
+    try {
+      const { getAllByRole } = render(
+        <>
+          <BotRow
+            bot={{ name: 'alpha' } as RosterRow}
+            onDelete={noop}
+            onEdit={noop}
+            onGroup={noop}
+            onNewSection={noop}
+          />
+          <BotRow
+            bot={{ name: 'beta' } as RosterRow}
+            onDelete={noop}
+            onEdit={noop}
+            onGroup={noop}
+            onNewSection={noop}
+          />
+        </>
+      )
+      const [alpha, beta] = getAllByRole('button')
+
+      fireEvent.pointerEnter(alpha)
+      fireEvent.pointerEnter(beta)
+      vi.advanceTimersByTime(220)
+
+      expect(warmProfile.mock.calls).toEqual([['beta']])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
