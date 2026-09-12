@@ -30,12 +30,12 @@ type SpawnPriority = 'foreground' | 'background'
 function dialOptions(
   spawnPriority: SpawnPriority,
   speculative = false
-): { priority?: 'foreground'; speculative?: true } {
+): { priority?: 'foreground'; speculative?: true } | undefined {
   if (spawnPriority === 'foreground') {
     return { priority: 'foreground' }
   }
 
-  return speculative ? { speculative: true } : {}
+  return speculative ? { speculative: true } : undefined
 }
 
 function dialProfile(
@@ -44,7 +44,9 @@ function dialProfile(
   spawnPriority: SpawnPriority,
   speculative = false
 ): Promise<HermesConnection> {
-  return desktop.getConnection(profile, dialOptions(spawnPriority, speculative))
+  const options = dialOptions(spawnPriority, speculative)
+
+  return options ? desktop.getConnection(profile, options) : desktop.getConnection(profile)
 }
 
 // Read connection state through a call so TS control-flow analysis doesn't
@@ -358,7 +360,7 @@ async function isAttachedSharedRemote(
 
   try {
     const conn = await withTimeout(
-      desktop.getConnectionFor({ connectionId: id, profile: key, ...dialOptions(spawnPriority, speculative) }),
+      desktop.getConnectionFor({ connectionId: id, profile: key, ...(dialOptions(spawnPriority, speculative) ?? {}) }),
       RECONNECT_ATTEMPT_TIMEOUT_MS,
       `Timed out resolving shared-remote route for "${key}"`
     )
@@ -600,7 +602,7 @@ async function openSecondary(
             desktop.getConnectionFor({
               connectionId: entry.connectionId,
               profile: entry.profile,
-              ...dialOptions(spawnPriority, speculative)
+              ...(dialOptions(spawnPriority, speculative) ?? {})
             }),
             RECONNECT_ATTEMPT_TIMEOUT_MS,
             `Timed out connecting to profile "${entry.profile}"`
