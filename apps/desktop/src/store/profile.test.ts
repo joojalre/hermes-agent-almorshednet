@@ -257,6 +257,16 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     expect(openGatewayForAgent).not.toHaveBeenCalledWith('local', 'warm-shared-overflow')
   })
 
+  it('does not apply a local pool limit to a remote bot hint', () => {
+    // A remote/cloud socket is not a child of Electron's local backend pool.
+    // Saturating that pool must not make an unrelated remote Bot Chat cold.
+    openLocalSecondaryCount.mockReturnValue(3)
+
+    prewarmGatewayAgent('remote-hostinger', 'warm-remote-agent')
+
+    expect(openGatewayForAgent).toHaveBeenCalledWith('remote-hostinger', 'warm-remote-agent')
+  })
+
   it('follows the live pool-limit atom, not a hard-coded cap', () => {
     // User raises Warm Bot Backends to 8 in Settings: prewarming must keep
     // working well past the old default of 3.
