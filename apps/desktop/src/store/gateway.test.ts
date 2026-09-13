@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { RECONNECT_ATTEMPT_TIMEOUT_MS } from '@/lib/with-timeout'
+
 // Connection lifecycle for registry-scoped secondary gateways:
 //
 //  1. Removing a connection must dispose its secondaries — remote/cloud
@@ -248,6 +250,113 @@ describe('ensureGatewayForProfile — secondary connect failure surfaces (#81094
       ['work', { priority: 'foreground' }],
       ['work', { priority: 'foreground' }]
     ])
+  })
+
+  it('bounds a foreground promotion after the speculative dial is rejected', async () => {
+    vi.useFakeTimers()
+
+    let rejectSpeculative!: (reason?: unknown) => void
+
+    const speculative = new Promise<never>((_resolve, reject) => {
+      rejectSpeculative = reject
+    })
+
+    const stalledPromotion = new Promise<never>(() => {})
+
+    const connection = {
+      authMode: 'token',
+      baseUrl: 'https://work.invalid',
+      mode: 'local',
+      profile: 'work',
+      token: 'fake-test-token',
+      wsUrl: 'wss://work.invalid/ws'
+    }
+
+    const getConnection = vi
+      .fn()
+      .mockResolvedValueOnce({ ...connection, sharedPrimary: false })
+      .mockImplementationOnce(() => speculative)
+      .mockResolvedValueOnce({ ...connection, sharedPrimary: false })
+      .mockImplementationOnce(() => stalledPromotion)
+
+    installDesktop({ getConnection })
+
+    const warming = openGatewayForProfile('work', { speculative: true })
+
+    const warmingFailure = warming.then(
+      () => undefined,
+      error => error
+    )
+
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(2))
+
+    const selecting = ensureGatewayForProfile('work')
+
+    const selectingFailure = selecting.then(
+      () => undefined,
+      error => error
+    )
+
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(4))
+    rejectSpeculative(new Error('local pool is full'))
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_ATTEMPT_TIMEOUT_MS)
+
+    await expect(warmingFailure).resolves.toMatchObject({ message: 'local pool is full' })
+    await expect(selectingFailure).resolves.toMatchObject({ message: 'local pool is full' })
+  })
+
+  it('handles a rejected foreground promotion before the speculative dial settles', async () => {
+    let rejectSpeculative!: (reason?: unknown) => void
+
+    const speculative = new Promise<never>((_resolve, reject) => {
+      rejectSpeculative = reject
+    })
+
+    const connection = {
+      authMode: 'token',
+      baseUrl: 'https://work.invalid',
+      mode: 'local',
+      profile: 'work',
+      token: 'fake-test-token',
+      wsUrl: 'wss://work.invalid/ws'
+    }
+
+    const getConnection = vi
+      .fn()
+      .mockResolvedValueOnce({ ...connection, sharedPrimary: false })
+      .mockImplementationOnce(() => speculative)
+      .mockResolvedValueOnce({ ...connection, sharedPrimary: false })
+      .mockRejectedValueOnce(new Error('foreground promotion refused'))
+
+    installDesktop({ getConnection })
+
+    const warming = openGatewayForProfile('work', { speculative: true })
+
+    const warmingFailure = warming.then(
+      () => undefined,
+      error => error
+    )
+
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(2))
+
+    const selecting = ensureGatewayForProfile('work')
+
+    const selectingFailure = selecting.then(
+      () => undefined,
+      error => error
+    )
+
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(4))
+
+    // The foreground request rejects before hydration gives up. Its rejection
+    // must already be observed; the later original failure remains the one
+    // surfaced to the user.
+    await new Promise(resolve => setTimeout(resolve, 0))
+    rejectSpeculative(new Error('local pool is full'))
+
+    await expect(warmingFailure).resolves.toMatchObject({ message: 'local pool is full' })
+    await expect(selectingFailure).resolves.toMatchObject({ message: 'local pool is full' })
   })
 
   it('activates the secondary when connect succeeds', async () => {

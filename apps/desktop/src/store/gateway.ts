@@ -547,21 +547,30 @@ async function openSecondary(
       // instead of inheriting the stale background rejection.
       const pending = entry.connectPromise
 
-      const promoted =
+      // Attach both the timeout and rejection handler immediately. The
+      // foreground IPC may settle before the older dial does; leaving its
+      // rejection unobserved until `pending` settles creates an
+      // unhandledrejection, while a wedged IPC would otherwise keep the
+      // user-facing switch latched forever.
+      const promoted = withTimeout(
         entry.connectionId && desktop.getConnectionFor
           ? desktop.getConnectionFor({
               connectionId: entry.connectionId,
               profile: entry.profile,
               priority: 'foreground'
             })
-          : desktop.getConnection(entry.profile, { priority: 'foreground' })
+          : desktop.getConnection(entry.profile, { priority: 'foreground' }),
+        RECONNECT_ATTEMPT_TIMEOUT_MS,
+        `Timed out promoting connection to profile "${entry.profile}"`
+      ).then(
+        () => true,
+        () => false
+      )
 
       try {
         await pending
       } catch (error) {
-        try {
-          await promoted
-        } catch {
+        if (!(await promoted)) {
           // The original dial carries the useful failure when promotion also
           // fails; preserve it for the caller's recovery UI.
           throw error
@@ -1708,7 +1717,8 @@ export function reconnectSecondaryGateways({ forceOpenSockets = false }: { force
 
     entry.reconnectAttempt = 0
     clearTimer(entry)
-    void reconnectSecondary(entry)
+    const active = entry.scope === g.activeKey
+    void reconnectSecondary(entry, active ? { spawnPriority: 'foreground', speculative: false } : undefined)
   }
 }
 
