@@ -16985,6 +16985,7 @@ def test_hosted_prompt_persists_terminal_receipt_before_callback_failure(
             task=identity,
             execution_generation=attempt.execution_generation,
             on_terminal=callback_failure,
+            member_id="ops",
         )
 
         receipt = driver_state.get_terminal_receipt(

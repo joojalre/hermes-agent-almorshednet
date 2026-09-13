@@ -190,7 +190,8 @@ jobs:
     name: Public-surface diff (advisory)
     if: inputs.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Leave scheduling/reporting headroom beyond the 1 + 3 + 1 minute steps.
+    timeout-minutes: 6
     steps:
       - name: Checkout code
         id: checkout
