@@ -41,7 +41,10 @@ jobs:
           command: npm ci
 
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # The UI suite already uses a bounded Vitest pool. Keeping the outer
+        # workspace scheduler at two prevents concurrent builds and test
+        # runners from starving its teardown on standard hosted runners.
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2
 
   windows-native:
     name: Windows native Desktop regressions

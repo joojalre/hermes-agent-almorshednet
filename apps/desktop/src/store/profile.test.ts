@@ -8,7 +8,7 @@ import type { ProfileInfo } from '@/types/hermes'
 // the REST query client must not run for real in a unit test.
 const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const ensureGatewayForAgent = vi.fn(async () => undefined)
-const openGatewayForAgent = vi.fn(async (_connectionId: string, _profile: string) => undefined)
+const openGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const openLocalSecondaryCount = vi.fn(() => 0)
 const $gateway = atom<unknown>({ id: 'live-socket', connectionState: 'open' })
@@ -43,6 +43,7 @@ const {
   $profiles,
   ensureGatewayProfile,
   invalidateProfileListFetches,
+  prewarmGatewayAgent,
   prewarmProfileBackend,
   refreshProfiles
 } = await import('./profile')
@@ -103,7 +104,7 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     await ensureGatewayProfile('vps-remote')
 
     expect(ensureGatewayForProfile).toHaveBeenCalledWith('vps-remote')
-    expect(getConnection).toHaveBeenCalledWith('vps-remote')
+    expect(getConnection).toHaveBeenCalledWith('vps-remote', { priority: 'foreground' })
     expect($connection.get()?.mode).toBe('remote')
     expect($connection.get()?.profile).toBe('vps-remote')
   })
@@ -115,7 +116,7 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
 
     await ensureGatewayProfile('default')
 
-    expect(getConnection).toHaveBeenCalledWith('default')
+    expect(getConnection).toHaveBeenCalledWith('default', { priority: 'foreground' })
     expect($connection.get()?.mode).toBe('local')
   })
 
@@ -164,7 +165,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
   it('opens the gateway (spawn + connect, no activation) for a non-active profile', () => {
     prewarmProfileBackend('warm-basic')
 
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-basic')
+    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-basic', { speculative: true })
     // Pre-warm must never activate — that's the click's job.
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
@@ -172,7 +173,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
   it('pre-warms an agent-scoped backend through its registry connection', () => {
     prewarmProfileBackend('warm-agent', 'registry-connection')
 
-    expect(openGatewayForAgent).toHaveBeenCalledWith('registry-connection', 'warm-agent')
+    expect(openGatewayForAgent).toHaveBeenCalledWith('registry-connection', 'warm-agent', { speculative: true })
     expect(openGatewayForProfile).not.toHaveBeenCalled()
   })
 
@@ -216,7 +217,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
 
     prewarmProfileBackend('warm-slot-free')
 
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-slot-free')
+    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-slot-free', { speculative: true })
   })
 
   it('reserves background capacity during a rapid hover sweep', async () => {
@@ -253,6 +254,28 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     expect(openGatewayForProfile).toHaveBeenCalledTimes(3)
   })
 
+  it('shares the hover reservation across profile and source-qualified bot hints', () => {
+    // Source-scoped Bot Mode rows call warmAgent rather than warmProfile. They
+    // must not bypass the same two-slot background limit used by the rail.
+    prewarmProfileBackend('warm-shared-profile')
+    prewarmGatewayAgent('local', 'warm-shared-agent')
+    prewarmGatewayAgent('local', 'warm-shared-overflow')
+
+    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-shared-profile', { speculative: true })
+    expect(openGatewayForAgent).toHaveBeenCalledWith('local', 'warm-shared-agent', { speculative: true })
+    expect(openGatewayForAgent).not.toHaveBeenCalledWith('local', 'warm-shared-overflow')
+  })
+
+  it('does not apply a local pool limit to a remote bot hint', () => {
+    // A remote/cloud socket is not a child of Electron's local backend pool.
+    // Saturating that pool must not make an unrelated remote Bot Chat cold.
+    openLocalSecondaryCount.mockReturnValue(3)
+
+    prewarmGatewayAgent('remote-hostinger', 'warm-remote-agent')
+
+    expect(openGatewayForAgent).toHaveBeenCalledWith('remote-hostinger', 'warm-remote-agent', { speculative: true })
+  })
+
   it('follows the live pool-limit atom, not a hard-coded cap', () => {
     // User raises Warm Bot Backends to 8 in Settings: prewarming must keep
     // working well past the old default of 3.
@@ -261,7 +284,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
 
     prewarmProfileBackend('warm-raised-cap')
 
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-raised-cap')
+    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-raised-cap', { speculative: true })
 
     // And lowering the cap re-engages the guard at the new boundary.
     $poolLimits.set({ idleMs: 600_000, maxBackends: 2 })

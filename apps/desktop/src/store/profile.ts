@@ -422,7 +422,7 @@ const prewarmedAt = new Map<string, number>()
 // repeatedly and queue every profile before the first spawn settles. Keep
 // tentative reservations in the renderer so speculative hover work never
 // floods the main-process coordinator.
-const prewarmingProfiles = new Set<string>()
+const prewarmingTargets = new Set<string>()
 
 function backgroundPrewarmCapacity(maxBackends: number): number {
   // The coordinator reserves one slot for a real user action whenever the
@@ -431,43 +431,83 @@ function backgroundPrewarmCapacity(maxBackends: number): number {
   return maxBackends >= 2 ? maxBackends - 1 : maxBackends
 }
 
+function prewarmTarget(key: string, open: () => Promise<void>, reserveLocalPool: boolean): void {
+  const now = Date.now()
+
+  if (now - (prewarmedAt.get(key) ?? 0) < PREWARM_MIN_INTERVAL_MS) {
+    return
+  }
+
+  if (reserveLocalPool) {
+    // Prewarm/cap harmony (#91545): the local pool caps spawned backends at
+    // the configured max, and a spawn over the cap LRU-evicts the warmest idle
+    // backend. A hover sweep across the rail therefore evicted backends for
+    // profiles the user was about to click — prewarming caused the exact churn
+    // it exists to prevent. Remote and cloud sockets do not consume this pool.
+    const capacity = backgroundPrewarmCapacity($poolLimits.get().maxBackends)
+
+    if (openLocalSecondaryCount() + prewarmingTargets.size + 1 > capacity) {
+      return
+    }
+  }
+
+  prewarmedAt.set(key, now)
+
+  if (reserveLocalPool) {
+    prewarmingTargets.add(key)
+  }
+
+  void open()
+    .catch(() => undefined)
+    .finally(() => {
+      if (reserveLocalPool) {
+        prewarmingTargets.delete(key)
+      }
+    })
+}
+
 export function prewarmProfileBackend(name: string, connectionId: null | string = null): void {
-  const key = normalizeProfileKey(name)
   const connection = (connectionId ?? '').trim() || null
-  const scope = registryBackendScopeKey(connection, key)
+
+  if (connection) {
+    prewarmGatewayAgent(connection, name)
+    return
+  }
+
+  const profile = normalizeProfileKey(name)
+
+  if (profile === normalizeProfileKey($activeGatewayProfile.get())) {
+    return
+  }
+
+  prewarmTarget(`profile:${profile}`, () => openGatewayForProfile(profile, { speculative: true }), true)
+}
+
+/**
+ * The source-qualified counterpart of `prewarmProfileBackend`. Bot roster
+ * rows use this path when their owner is known as `(connectionId, profile)`.
+ * Local rows share the same reservation set and foreground headroom as local
+ * profile hovers. Remote and cloud rows only share the throttle: their socket
+ * does not consume a local backend slot, so the local pool guard must not
+ * delay their next click.
+ */
+export function prewarmGatewayAgent(connectionId: null | string | undefined, profile: string): void {
+  const source = String(connectionId ?? '').trim() || 'local'
+  const target = normalizeProfileKey(profile)
+  const isLocal = connectionId == null || source === 'local'
 
   if (
-    key === normalizeProfileKey($activeGatewayProfile.get()) &&
-    (!connection || connection === activeGatewayConnectionId())
+    target === normalizeProfileKey($activeGatewayProfile.get()) &&
+    source === (activeGatewayConnectionId() || 'local')
   ) {
     return
   }
 
-  const now = Date.now()
-
-  if (now - (prewarmedAt.get(scope) ?? 0) < PREWARM_MIN_INTERVAL_MS) {
-    return
-  }
-
-  // Prewarm/cap harmony (#91545): the pool caps spawned backends at the
-  // configured max, and a spawn over the cap LRU-evicts the warmest idle
-  // backend. A hover sweep across the rail therefore evicted backends for
-  // profiles the user was about to click — prewarming caused the exact churn
-  // it exists to prevent. Skip speculative spawns once every pool slot is
-  // occupied by an open socket; the real click still spawns on demand, it
-  // just doesn't get a head start.
-  const capacity = backgroundPrewarmCapacity($poolLimits.get().maxBackends)
-
-  if (openLocalSecondaryCount() + prewarmingProfiles.size + 1 > capacity) {
-    return
-  }
-
-  prewarmedAt.set(scope, now)
-  prewarmingProfiles.add(scope)
-  const dial = connection ? openGatewayForAgent(connection, key) : openGatewayForProfile(key)
-  void dial
-    .catch(() => undefined)
-    .finally(() => prewarmingProfiles.delete(scope))
+  prewarmTarget(
+    registryBackendScopeKey(source, target),
+    () => openGatewayForAgent(connectionId ?? null, target, { speculative: true }),
+    isLocal
+  )
 }
 
 let gatewaySwitch: Promise<void> | null = null
@@ -503,7 +543,11 @@ async function resolveConnectionForProfile(profile: string): Promise<HermesConne
 
   try {
     return await withTimeout(
-      getConnection(profile),
+      // Profile activation is a direct user navigation. Give the descriptor
+      // lookup the same foreground priority as the concurrently-started
+      // gateway activation, otherwise it can join a stale background claim
+      // and make the selected bot appear to have no access.
+      getConnection(profile, { priority: 'foreground' }),
       DESCRIPTOR_LOOKUP_TIMEOUT_MS,
       `Timed out resolving the connection descriptor for profile "${profile}"`
     )
@@ -655,7 +699,10 @@ async function resolveConnectionForAgent(connectionId: string, profile: string):
 
   try {
     return await withTimeout(
-      getConnectionFor({ connectionId, profile }),
+      // Same rule for a source-qualified bot: the user selected this exact
+      // route, so descriptor resolution must not be downgraded to a background
+      // spawn while the activation is foreground.
+      getConnectionFor({ connectionId, profile, priority: 'foreground' }),
       DESCRIPTOR_LOOKUP_TIMEOUT_MS,
       `Timed out resolving the connection descriptor for agent "${connectionId}:${profile}"`
     )

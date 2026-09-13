@@ -27,18 +27,26 @@ const normKey = (profile: string | null | undefined): string => (profile ?? '').
 // default, so background dials keep the pre-priority IPC payload shape.
 type SpawnPriority = 'foreground' | 'background'
 
-function dialPriority(spawnPriority: SpawnPriority): { priority: 'foreground' } | Record<never, never> {
-  return spawnPriority === 'foreground' ? { priority: 'foreground' } : {}
+function dialOptions(
+  spawnPriority: SpawnPriority,
+  speculative = false
+): { priority?: 'foreground'; speculative?: true } | undefined {
+  if (spawnPriority === 'foreground') {
+    return { priority: 'foreground' }
+  }
+
+  return speculative ? { speculative: true } : undefined
 }
 
 function dialProfile(
   desktop: NonNullable<typeof window.hermesDesktop>,
   profile: string,
-  spawnPriority: SpawnPriority
+  spawnPriority: SpawnPriority,
+  speculative = false
 ): Promise<HermesConnection> {
-  return spawnPriority === 'foreground'
-    ? desktop.getConnection(profile, { priority: 'foreground' })
-    : desktop.getConnection(profile)
+  const options = dialOptions(spawnPriority, speculative)
+
+  return options ? desktop.getConnection(profile, options) : desktop.getConnection(profile)
 }
 
 // Read connection state through a call so TS control-flow analysis doesn't
@@ -333,7 +341,8 @@ function isPrimaryRegistryRoute(connectionId: null | string, profile: string): b
 async function isAttachedSharedRemote(
   connectionId: null | string,
   profile: string,
-  spawnPriority: SpawnPriority = 'background'
+  spawnPriority: SpawnPriority = 'background',
+  speculative = false
 ): Promise<boolean> {
   const id = String(connectionId ?? '').trim()
   const key = normKey(profile)
@@ -354,7 +363,7 @@ async function isAttachedSharedRemote(
 
   try {
     const conn = await withTimeout(
-      desktop.getConnectionFor({ connectionId: id, profile: key, ...dialPriority(spawnPriority) }),
+      desktop.getConnectionFor({ connectionId: id, profile: key, ...(dialOptions(spawnPriority, speculative) ?? {}) }),
       RECONNECT_ATTEMPT_TIMEOUT_MS,
       `Timed out resolving shared-remote route for "${key}"`
     )
@@ -521,7 +530,11 @@ function clearTimer(entry: Secondary): void {
   }
 }
 
-async function openSecondary(entry: Secondary, spawnPriority: SpawnPriority = 'background'): Promise<void> {
+async function openSecondary(
+  entry: Secondary,
+  spawnPriority: SpawnPriority = 'background',
+  speculative = false
+): Promise<void> {
   const desktop = window.hermesDesktop
 
   if (!desktop) {
@@ -531,16 +544,53 @@ async function openSecondary(entry: Secondary, spawnPriority: SpawnPriority = 'b
   if (entry.connectPromise) {
     if (spawnPriority === 'foreground') {
       // Hydration may already own this dial as a background slot wait. Kick a
-      // foreground IPC so main can promote it onto the reserved slot.
-      void (
+      // foreground IPC so main can promote it onto the reserved slot. Keep
+      // its result: the speculative caller can still reject after that
+      // promotion has started the backend, and a user click must then redial
+      // instead of inheriting the stale background rejection.
+      const pending = entry.connectPromise
+
+      // Attach both the timeout and rejection handler immediately. The
+      // foreground IPC may settle before the older dial does; leaving its
+      // rejection unobserved until `pending` settles creates an
+      // unhandledrejection, while a wedged IPC would otherwise keep the
+      // user-facing switch latched forever.
+      const promoted = withTimeout(
         entry.connectionId && desktop.getConnectionFor
           ? desktop.getConnectionFor({
               connectionId: entry.connectionId,
               profile: entry.profile,
               priority: 'foreground'
             })
-          : desktop.getConnection(entry.profile, { priority: 'foreground' })
-      ).catch(() => undefined)
+          : desktop.getConnection(entry.profile, { priority: 'foreground' }),
+        RECONNECT_ATTEMPT_TIMEOUT_MS,
+        `Timed out promoting connection to profile "${entry.profile}"`
+      ).then(
+        () => true,
+        () => false
+      )
+
+      try {
+        await pending
+      } catch (error) {
+        if (!(await promoted)) {
+          // The original dial carries the useful failure when promotion also
+          // fails; preserve it for the caller's recovery UI.
+          throw error
+        }
+
+        // The old speculative promise is settled, but its outer caller may
+        // not have cleared the slot yet. It is safe to release the settled
+        // reference here; retry through the normal foreground path so this
+        // socket connects to the backend the promotion just started.
+        if (entry.connectPromise === pending) {
+          entry.connectPromise = null
+        }
+
+        await openSecondary(entry, 'foreground')
+      }
+
+      return
     }
 
     await entry.connectPromise
@@ -592,13 +642,13 @@ async function openSecondary(entry: Secondary, spawnPriority: SpawnPriority = 'b
             desktop.getConnectionFor({
               connectionId: entry.connectionId,
               profile: entry.profile,
-              ...dialPriority(spawnPriority)
+              ...(dialOptions(spawnPriority, speculative) ?? {})
             }),
             RECONNECT_ATTEMPT_TIMEOUT_MS,
             `Timed out connecting to profile "${entry.profile}"`
           )
         : await withTimeout(
-            dialProfile(desktop, entry.profile, spawnPriority),
+            dialProfile(desktop, entry.profile, spawnPriority, speculative),
             RECONNECT_ATTEMPT_TIMEOUT_MS,
             `Timed out connecting to profile "${entry.profile}"`
           )
@@ -704,11 +754,28 @@ function scheduleReconnect(entry: Secondary): void {
   entry.reconnectAttempt += 1
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null
-    void reconnectSecondary(entry)
+    // The selected route is no longer speculative when its timer fires: it
+    // owns the user's visible surface and may use the pool's reserved
+    // foreground slot. Other retained sockets remain best-effort so they
+    // cannot queue behind the pool and delay a later click.
+    const active = entry.scope === g.activeKey
+    void reconnectSecondary(entry, active ? { spawnPriority: 'foreground', speculative: false } : undefined)
   }, delay)
 }
 
-async function reconnectSecondary(entry: Secondary): Promise<void> {
+/**
+ * Retry a secondary after a transport or lifecycle event.
+ *
+ * Automatic recovery is deliberately speculative: it is useful only while a
+ * local-pool slot is available right now. Queuing every closed background
+ * socket behind a saturated pool made a normal roster of profiles keep 30s
+ * waits alive and delayed the next real bot click. A caller servicing the
+ * active, user-facing route opts into foreground instead.
+ */
+async function reconnectSecondary(
+  entry: Secondary,
+  { spawnPriority = 'background', speculative = true }: { spawnPriority?: SpawnPriority; speculative?: boolean } = {}
+): Promise<void> {
   if (entry.reconnecting || !entry.wantOpen || isOpen(entry.gateway)) {
     return
   }
@@ -716,7 +783,7 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
   entry.reconnecting = true
 
   try {
-    await openSecondary(entry)
+    await openSecondary(entry, spawnPriority, speculative)
     entry.reconnectAttempt = 0
   } catch (error) {
     // The registry no longer knows this connection (removed while we were
@@ -850,7 +917,11 @@ function createSecondary(profile: string, connectionId: null | string = null): S
 // the second dial fails (tunnel/token are per-backend) and the closed socket
 // poisons the active gateway with "not connected" even though the primary is
 // open right next to it.
-async function sharedPrimaryRoute(profile: string, spawnPriority: SpawnPriority = 'background'): Promise<boolean> {
+async function sharedPrimaryRoute(
+  profile: string,
+  spawnPriority: SpawnPriority = 'background',
+  speculative = false
+): Promise<boolean> {
   const desktop = window.hermesDesktop
 
   if (!desktop) {
@@ -866,7 +937,7 @@ async function sharedPrimaryRoute(profile: string, spawnPriority: SpawnPriority 
     // carry the foreground priority — otherwise the spawn it starts queues as
     // background and the click waits out this probe before being promoted.
     const conn = await withTimeout(
-      dialProfile(desktop, profile, spawnPriority),
+      dialProfile(desktop, profile, spawnPriority, speculative),
       RECONNECT_ATTEMPT_TIMEOUT_MS,
       `Timed out resolving the shared-primary route for profile "${profile}"`
     )
@@ -883,7 +954,8 @@ async function sharedPrimaryRoute(profile: string, spawnPriority: SpawnPriority 
 async function gatewayForProfile(
   profile: string,
   leaseRequest = false,
-  spawnPriority: SpawnPriority = 'background'
+  spawnPriority: SpawnPriority = 'background',
+  speculative = false
 ): Promise<{ gateway: HermesGateway | null; key: string; release: () => void; scopeProfile: boolean }> {
   const key = normKey(profile)
   const noRelease = () => undefined
@@ -892,7 +964,7 @@ async function gatewayForProfile(
     return { gateway: g.primaryGateway, key, release: noRelease, scopeProfile: false }
   }
 
-  if (await sharedPrimaryRoute(key, spawnPriority)) {
+  if (await sharedPrimaryRoute(key, spawnPriority, speculative)) {
     return { gateway: g.primaryGateway, key, release: noRelease, scopeProfile: true }
   }
 
@@ -942,7 +1014,7 @@ async function gatewayForProfile(
 
   try {
     if (!isOpen(entry.gateway)) {
-      await openSecondary(entry, spawnPriority)
+      await openSecondary(entry, spawnPriority, speculative)
     }
   } catch (error) {
     release()
@@ -1404,9 +1476,9 @@ function releaseTerminalTurnLease(scope: string, event: GatewayEvent): void {
 // and error UX. An already-open (or primary) profile is a no-op.
 export async function openGatewayForProfile(
   profile: string,
-  { spawnPriority = 'background' }: { spawnPriority?: SpawnPriority } = {}
+  { spawnPriority = 'background', speculative = false }: { spawnPriority?: SpawnPriority; speculative?: boolean } = {}
 ): Promise<void> {
-  await gatewayForProfile(profile, false, spawnPriority)
+  await gatewayForProfile(profile, false, spawnPriority, speculative)
 }
 
 // ── Connection-scoped agents (multi-source roster) ─────────────────────────
@@ -1428,16 +1500,17 @@ export async function openGatewayForAgent(
   profile: string,
   {
     activationLease = false,
-    spawnPriority = 'background'
-  }: { activationLease?: boolean; spawnPriority?: SpawnPriority } = {}
+    spawnPriority = 'background',
+    speculative = false
+  }: { activationLease?: boolean; spawnPriority?: SpawnPriority; speculative?: boolean } = {}
 ): Promise<void> {
   const scope = registryBackendScopeKey(connectionId, profile)
 
   if (scope === normKey(profile) || isPrimaryRegistryRoute(connectionId, profile)) {
-    return openGatewayForProfile(profile, { spawnPriority })
+    return openGatewayForProfile(profile, { spawnPriority, speculative })
   }
 
-  if (await isAttachedSharedRemote(connectionId, profile, spawnPriority)) {
+  if (await isAttachedSharedRemote(connectionId, profile, spawnPriority, speculative)) {
     if (!isOpen(g.primaryGateway)) {
       throw new Error('Hermes gateway unavailable')
     }
@@ -1464,7 +1537,7 @@ export async function openGatewayForAgent(
   }
 
   try {
-    await openSecondary(entry, spawnPriority)
+    await openSecondary(entry, spawnPriority, speculative)
   } catch (error) {
     if (activationLease) {
       entry.activationLeaseUntil = 0
@@ -1646,7 +1719,10 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
     // The viewed scope is an explicit recovery target (Reconnect action,
     // request retry): a parked entry must dial again here, not stay parked.
     rearmSecondary(entry)
-    await reconnectSecondary(entry)
+    // This is on the request path for the currently active bot/profile. It is
+    // a real user action, not the automatic reconnect sweep, so it must be
+    // allowed to claim the foreground pool slot immediately.
+    await reconnectSecondary(entry, { spawnPriority: 'foreground', speculative: false })
   }
 
   if (!isOpen(entry.gateway)) {
@@ -1692,7 +1768,8 @@ export function reconnectSecondaryGateways({ forceOpenSockets = false }: { force
 
     entry.reconnectAttempt = 0
     clearTimer(entry)
-    void reconnectSecondary(entry)
+    const active = entry.scope === g.activeKey
+    void reconnectSecondary(entry, active ? { spawnPriority: 'foreground', speculative: false } : undefined)
   }
 }
 
