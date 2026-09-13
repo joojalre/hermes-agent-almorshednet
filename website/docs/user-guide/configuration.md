@@ -69,6 +69,25 @@ cannot override, via a system-level managed directory. See
 [Managed Scope](/user-guide/managed-scope).
 :::
 
+## Nous Free-Tier Provisioning
+
+`nous.guest` controls free-tier identity provisioning for the active profile across
+the CLI, gateway, and Desktop backend. Use a YAML boolean to make the choice
+independent of how Hermes was launched:
+
+```yaml
+nous:
+  guest: false # true opts into free-tier provisioning; false disables it
+```
+
+An explicit `true` does not require a launcher environment flag. An explicit
+`false` cannot be overridden by one. The default `null` (or an omitted setting)
+retains the older launcher's onboarding hint for compatibility, and stays off
+when that hint is absent. New configurations should use the boolean setting,
+not add an environment variable. Invalid strings and numbers do not opt in.
+This setting does not complete sign-in to an existing account or authorize
+external connectors on the user's behalf.
+
 ## Runtime Limits
 
 Long-running Hermes server surfaces (including the gateway and
