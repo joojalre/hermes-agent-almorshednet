@@ -625,6 +625,7 @@ def unregister_live_transport(transport: Transport | None) -> None:
     """Stop tracking a transport (call on disconnect). Idempotent."""
     with _live_transports_lock:
         _live_transports.discard(transport)
+    _release_vault_transport_owner(transport)
 
 
 def _broadcast_global_event(event: str, payload: dict | None = None) -> None:

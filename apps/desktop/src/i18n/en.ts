@@ -608,8 +608,9 @@ export const en: Translations = {
         notInstalled: name =>
           `Not detected. Install the ${name} command-line tool and sign in to it; Hermes picks it up automatically.`,
         disabledDesc: 'Detected but turned off for Hermes.',
-        lockedDesc: 'Detected. The agent will ask you to unlock it when it needs a login, or unlock now.',
-        unlockedDesc: 'Unlocked for this session. Locks automatically after 30 minutes idle or when Hermes closes.',
+        lockedDesc: 'Locked for this Settings connection. Unlock here to view saved logins; each chat asks separately.',
+        unlockedDesc:
+          'Unlocked for this Settings connection only. Locks after 30 minutes idle or when this connection disconnects. Chats unlock separately.',
         statusLocked: 'Locked',
         statusNotDetected: 'Not detected',
         statusOff: 'Off',
@@ -617,10 +618,10 @@ export const en: Translations = {
         unlock: 'Unlock',
         unlocking: 'Unlocking…',
         lock: 'Lock',
-        unlocked: name => `${name} unlocked for this session.`,
+        unlocked: name => `${name} unlocked for this Settings connection only.`,
         unlockTitle: name => `Unlock ${name}`,
         unlockDescription:
-          'Enter your master password. It is handed to the password manager on this machine and discarded — it is never stored, logged, or shown to the agent.',
+          'This unlock applies only to this Settings connection. Each chat asks separately. Your master password is handed to the password manager and discarded locally; it is never stored, logged, or shown to the agent.',
         masterPasswordPlaceholder: 'Master password'
       }
     },

@@ -328,15 +328,37 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
     socket and never enters the conversation."""
     from agent.redact import register_vault_redaction_value
-    from agent.vault_backends import backend_for_handle
+    from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
-    _focus_bound_origin(effective_task_id, "", "otp")
+    backend = backend_for_handle(handle) if handle else None
+    bound_origin = ""
+    if handle:
+        if backend is not None and backend.needs_unlock and not backend.is_unlocked():
+            unlocked = json.loads(browser_vault_unlock(backend.name))
+            if not unlocked.get("success"):
+                return json.dumps(unlocked)
+        try:
+            meta = backend.get_meta(handle) if backend is not None else None
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": "The password manager locked again; call browser_vault_unlock."})
+        if meta is None or meta.kind != "login":
+            return json.dumps({"success": False, "error_type": "invalid_handle",
+                               "error": "No saved login with this handle. Use browser_vault_list."})
+        if not meta.origin:
+            return json.dumps({"success": False, "error_type": "no_origin",
+                               "error": "This login has no bound origin; no code was resolved or entered."})
+        bound_origin = meta.origin
+    _focus_bound_origin(effective_task_id, bound_origin, "otp")
     origin = _current_page_origin(effective_task_id)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
+    if bound_origin and origin != bound_origin:
+        return json.dumps({"success": False, "error_type": "origin_mismatch",
+                           "error": "The page does not match the login's exact bound origin; no code was resolved or entered."})
     site = origin.split("://", 1)[-1]
 
     nonce = secrets.token_hex(8)
@@ -352,7 +374,6 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     code: Optional[str] = None
     source = "user"
-    backend = backend_for_handle(handle) if handle else None
     if backend is not None:
         try:
             code = backend.resolve_otp(handle)
@@ -373,7 +394,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     register_vault_redaction_value(code)
     fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=bound_origin or origin, nonce=nonce))
     del code
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})

@@ -518,8 +518,8 @@ export const zh = defineLocale({
         toggleFailed: '无法更新密码管理器',
         notInstalled: name => `未检测到。安装 ${name} 命令行工具并登录后，Hermes 会自动识别。`,
         disabledDesc: '已检测到，但已为 Hermes 关闭。',
-        lockedDesc: '已检测到。智能体需要登录信息时会请你解锁，也可立即解锁。',
-        unlockedDesc: '本会话已解锁。闲置 30 分钟或关闭 Hermes 后会自动锁定。',
+        lockedDesc: '当前设置连接尚未解锁。在此解锁可查看已保存的登录信息；每个聊天会单独请求解锁。',
+        unlockedDesc: '仅当前设置连接已解锁。闲置 30 分钟或此连接断开后会自动锁定。聊天需要单独解锁。',
         statusLocked: '已锁定',
         statusNotDetected: '未检测到',
         statusOff: '已关闭',
@@ -527,9 +527,10 @@ export const zh = defineLocale({
         unlock: '解锁',
         unlocking: '解锁中…',
         lock: '锁定',
-        unlocked: name => `${name} 已在本会话中解锁。`,
+        unlocked: name => `${name} 仅在当前设置连接中解锁。`,
         unlockTitle: name => `解锁 ${name}`,
-        unlockDescription: '输入主密码。它会交给本机的密码管理器后立即丢弃，不会被存储、记录或展示给智能体。',
+        unlockDescription:
+          '此次解锁仅适用于当前设置连接。每个聊天会单独请求解锁。主密码会交给密码管理器，随后在本地丢弃，不会被存储、记录或展示给智能体。',
         masterPasswordPlaceholder: '主密码'
       }
     },

@@ -48,6 +48,8 @@ export function useVaultData(owner: string, scopeProfile: string) {
 
   const { data: sourcesData } = useQuery({
     enabled: gatewayState === 'open',
+    // Reconnecting revokes Settings unlocks even when the connection/profile owner is unchanged.
+    staleTime: 0,
     queryKey: VAULT_SOURCES_QUERY_KEY,
     queryFn: async () => {
       const result = await requestGateway<{ sources: VaultSource[] }>('vault.sources', {})
@@ -65,6 +67,7 @@ export function useVaultData(owner: string, scopeProfile: string) {
 
   const { data, error, isPending } = useQuery({
     enabled: gatewayState === 'open',
+    staleTime: 0,
     queryKey: VAULT_QUERY_KEY,
     queryFn: async () => {
       const result = await requestGateway<{ items: VaultItem[] }>('vault.list', {})

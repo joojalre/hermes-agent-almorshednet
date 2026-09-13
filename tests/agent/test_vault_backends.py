@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import os
-import stat
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -51,19 +51,34 @@ sys.exit(2)
 '''
 
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="fake bw is a shebang script; the backend under test is host-agnostic")
-
-
 @pytest.fixture
 def fake_bw(tmp_path, monkeypatch):
-    exe = tmp_path / "bw"
+    from agent.vault_backends import bitwarden
+
+    exe = tmp_path / "bw.py"
     exe.write_text(_FAKE_BW, encoding="utf-8")
-    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    # Only translate the fake executable to this interpreter. Production helpers
+    # still own the real child process, allowlisted env, stdin and secret channel
+    # on every host; Windows does not need shebang support or a shell wrapper.
+    run_cli = bitwarden.run_cli
+    run_with_secret_env = bitwarden.run_with_secret_env
+
+    def native_argv(argv):
+        assert argv[0] == str(exe)
+        return [sys.executable, str(exe), *argv[1:]]
+
+    monkeypatch.setattr(bitwarden, "run_cli", lambda argv, **kw: run_cli(native_argv(argv), **kw))
+    monkeypatch.setattr(bitwarden, "run_with_secret_env",
+                        lambda argv, **kw: run_with_secret_env(native_argv(argv), **kw))
     log = tmp_path / "bw.log"  # the backend runs bw with an allowlisted env, so the fake logs beside itself
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    unlock_mod.set_current_session_id("fixture-vault-session")
     unlock_mod.lock()
-    yield exe, log
-    unlock_mod.lock()
+    try:
+        yield exe, log
+    finally:
+        unlock_mod.lock()
+        unlock_mod.set_current_session_id(None)
 
 
 def _enabled(exe):

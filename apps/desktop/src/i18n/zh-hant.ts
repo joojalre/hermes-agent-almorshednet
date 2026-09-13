@@ -379,8 +379,8 @@ export const zhHant = defineLocale({
         toggleFailed: '無法更新密碼管理器',
         notInstalled: name => `未偵測到。安裝 ${name} 命令列工具並登入後，Hermes 會自動偵測。`,
         disabledDesc: '已偵測到，但已為 Hermes 關閉。',
-        lockedDesc: '已偵測到。代理需要登入資訊時會請你解鎖，也可立即解鎖。',
-        unlockedDesc: '本工作階段已解鎖。閒置 30 分鐘或關閉 Hermes 後會自動鎖定。',
+        lockedDesc: '目前的設定連線尚未解鎖。在此解鎖可檢視已儲存的登入資訊；每個聊天會單獨請求解鎖。',
+        unlockedDesc: '僅目前的設定連線已解鎖。閒置 30 分鐘或此連線中斷後會自動鎖定。聊天需要單獨解鎖。',
         statusLocked: '已鎖定',
         statusNotDetected: '未偵測到',
         statusOff: '已關閉',
@@ -388,9 +388,10 @@ export const zhHant = defineLocale({
         unlock: '解鎖',
         unlocking: '解鎖中…',
         lock: '鎖定',
-        unlocked: name => `${name} 已在本工作階段解鎖。`,
+        unlocked: name => `${name} 僅在目前的設定連線中解鎖。`,
         unlockTitle: name => `解鎖 ${name}`,
-        unlockDescription: '輸入主密碼。它會交給本機的密碼管理器後立即捨棄，不會被儲存、記錄或顯示給代理。',
+        unlockDescription:
+          '此次解鎖僅適用於目前的設定連線。每個聊天會單獨請求解鎖。主密碼會交給密碼管理器，隨後在本機捨棄，不會被儲存、記錄或顯示給代理。',
         masterPasswordPlaceholder: '主密碼'
       }
     },
