@@ -168,6 +168,10 @@ declare global {
         onCursor: (callback: (point: { x: number; y: number } | null) => void) => () => void
         onGameOverlay: (callback: (state: { active: boolean; app: string }) => void) => () => void
       }
+      loginStartup?: {
+        getSettings: () => Promise<{ supported: boolean; openAtLogin: boolean }>
+        setSettings: (enabled: boolean) => Promise<{ supported: boolean; openAtLogin: boolean }>
+      }
       // Quick Entry: a global-hotkey mini composer window. Main owns the OS
       // shortcut registration + the persisted preference (it must restore the
       // shortcut on a cold launch without the renderer visiting Settings), so
@@ -699,6 +703,8 @@ export interface DesktopUpdateCommit {
 
 export interface DesktopUpdateStatus {
   supported: boolean
+  /** Sanitized GitHub owner/repository for the configured origin, never a credential-bearing URL. */
+  repository?: string
   updateAvailable?: boolean
   branch?: string
   currentBranch?: string

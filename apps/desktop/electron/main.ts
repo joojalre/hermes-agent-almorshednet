@@ -167,6 +167,14 @@ import { adoptServedDashboardToken } from './dashboard-token'
 import { registerDeepLinkProtocolOutsideTests } from './deep-link-protocol-registration'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
+import {
+  configureDesktopLoginStartup,
+  DESKTOP_LOGIN_ITEM_NAME,
+  isDesktopLoginStartupSupported,
+  readDesktopLoginStartup,
+  shouldFocusSecondInstance,
+  shouldStartMinimizedFirstLaunch
+} from './desktop-login-startup'
 import { resolveDesktopRemoteRoute, v1SshTerminalPoolKey } from './desktop-remote-route'
 import {
   buildPosixCleanupScript,
@@ -1342,7 +1350,7 @@ app.setName(APP_NAME)
 // need this, so gate it on Windows. (Fixes: desktop approval/turn notifications
 // never firing on Windows.)
 if (IS_WINDOWS) {
-  app.setAppUserModelId('com.nousresearch.hermes')
+  app.setAppUserModelId(DESKTOP_LOGIN_ITEM_NAME)
 }
 
 // Seed the native About panel with the live Hermes version. This is refreshed
@@ -3057,6 +3065,8 @@ function writeDesktopUpdateConfig(config) {
 
 // ─── Main-window geometry persistence (window-state.json) ──────────────────
 
+const deferredMaximizedWindows = new WeakSet<BrowserWindow>()
+
 function readWindowState() {
   try {
     return sanitizeWindowState(JSON.parse(fs.readFileSync(DESKTOP_WINDOW_STATE_PATH, 'utf8')))
@@ -3069,7 +3079,7 @@ function readWindowState() {
 // getNormalBounds() keeps the pre-maximize size, so un-maximizing next session
 // lands back where the user actually sized the window.
 function persistWindowState() {
-  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized() || deferredMaximizedWindows.has(mainWindow)) {
     return
   }
 
@@ -3238,15 +3248,19 @@ async function checkUpdates({ force = false }: { force?: boolean } = {}) {
     getOriginUrl(updateRoot)
   ])
 
+  const slug = githubRepoSlug(originUrl)
   const cached = readUpdateCheckCache()
   const now = Date.now()
 
-  if (!force && cacheIsFresh(cached, { branch, currentSha, now })) {
-    return { ...cached.status, dirty: dirtyStr.length > 0, currentBranch }
+  if (!force && cacheIsFresh(cached, { branch, currentSha, now, repository: slug })) {
+    return {
+      ...cached.status,
+      dirty: dirtyStr.length > 0,
+      currentBranch
+    }
   }
 
   branch = await resolveHealedBranch(updateRoot, branch)
-  const slug = githubRepoSlug(originUrl)
 
   const status = slug
     ? await checkUpdatesViaApi({ slug, branch, currentSha })
@@ -3259,6 +3273,7 @@ async function checkUpdates({ force = false }: { force?: boolean } = {}) {
     currentSha,
     dirty: dirtyStr.length > 0,
     hermesRoot: updateRoot,
+    repository: slug || undefined,
     fetchedAt: now,
     ...status
   }
@@ -11443,6 +11458,7 @@ async function ensureBackend(
   }
 
   assertNotPassiveSpawn(passive, key)
+
   // A hover/roster pre-warm must never evict a warm backend and then race its
   // asynchronous child shutdown for the just-freed slot. It is safe to skip;
   // a real request below retains the normal LRU + bounded-queue behavior.
@@ -11630,6 +11646,7 @@ async function ensureRegistryBackend(
     }
 
     assertNotPassiveSpawn(passive, localRoute.poolKey)
+
     if (!speculative) {
       await evictLruPoolBackends(poolMaxBackends() - 1)
     }
@@ -13466,6 +13483,11 @@ function focusWindow(win) {
     win.restore()
   }
 
+  // A manual launch can precede the first reveal, with no restore event.
+  if (deferredMaximizedWindows.delete(win)) {
+    win.maximize()
+  }
+
   if (!win.isVisible()) {
     win.show()
   }
@@ -14648,7 +14670,7 @@ function closeQuickEntryWindow() {
   quickEntryWindow = null
 }
 
-function createWindow() {
+function createWindow({ startMinimized = false }: { startMinimized?: boolean } = {}) {
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
   mainWindow = new BrowserWindow({
@@ -14704,10 +14726,31 @@ function createWindow() {
   }
 
   if (savedWindowState?.isMaximized) {
-    mainWindow.maximize()
+    if (startMinimized) {
+      // Preserve the saved foreground geometry without revealing the window
+      // during login. Taskbar/manual activation restores the original state.
+      deferredMaximizedWindows.add(createdMainWindow)
+      createdMainWindow.once('restore', () => {
+        if (deferredMaximizedWindows.delete(createdMainWindow)) {
+          createdMainWindow.maximize()
+        }
+      })
+    } else {
+      mainWindow.maximize()
+    }
   }
 
   const revealController = wireWindowReveal(createdMainWindow, {
+    show: () => {
+      if (startMinimized) {
+        // show() would steal focus before minimizing. Also skip the eager
+        // maximize above, which can reveal a saved maximized window early.
+        createdMainWindow.showInactive()
+        createdMainWindow.minimize()
+      } else {
+        createdMainWindow.show()
+      }
+    },
     onRevealed: () => {
       // Persist geometry as soon as the window is visible so a crash before the
       // first clean resize/move/close still captures the restored bounds (#56726).
@@ -14940,6 +14983,7 @@ ipcMain.handle('hermes:connection', async (_event, profile, extra) => {
 ipcMain.handle('hermes:connection:for', async (_event, payload) => {
   const { connectionId, profile, priority, speculative } =
     payload && typeof payload === 'object' ? (payload as any) : ({} as any)
+
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
   const spawnPriority = spawnPriorityFrom(priority)
@@ -17305,6 +17349,49 @@ ipcMain.on('hermes:keep-awake', (_event, on) => {
   }
 })
 
+function desktopLoginStartupStatus() {
+  if (
+    !isDesktopLoginStartupSupported({
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+      isTest: process.env.TEST_WORKER_INDEX !== undefined
+    })
+  ) {
+    return { supported: false, openAtLogin: false }
+  }
+
+  return readDesktopLoginStartup({
+    app,
+    executablePath: app.getPath('exe'),
+    platform: process.platform
+  })
+}
+
+ipcMain.handle('hermes:login-startup:get', async () => desktopLoginStartupStatus())
+
+ipcMain.handle('hermes:login-startup:set', async (_event, openAtLogin) => {
+  if (typeof openAtLogin !== 'boolean') {
+    throw new Error('Login startup requires an explicit boolean choice')
+  }
+
+  if (
+    !isDesktopLoginStartupSupported({
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+      isTest: process.env.TEST_WORKER_INDEX !== undefined
+    })
+  ) {
+    return { supported: false, openAtLogin: false }
+  }
+
+  return configureDesktopLoginStartup({
+    app,
+    executablePath: app.getPath('exe'),
+    platform: process.platform,
+    openAtLogin
+  })
+})
+
 // Quick Entry: the renderer reads the live registration state on settings mount
 // and writes the preference back. Main is authoritative — it owns the OS
 // accelerator — so both handlers return the state that ACTUALLY resulted,
@@ -18124,10 +18211,21 @@ if (!isPrimaryInstance) {
 
     ensureMainWindow(mainWindow, {
       isReady: app.isReady(),
-      createWindow,
+      createWindow: () =>
+        createWindow({
+          startMinimized: shouldStartMinimizedFirstLaunch({
+            platform: process.platform,
+            argv,
+            hasColdDeepLink: Boolean(url)
+          })
+        }),
       focusWindow,
       // deep-link delivery focuses a live window after its renderer is ready.
-      focusExisting: !url
+      focusExisting: shouldFocusSecondInstance({
+        platform: process.platform,
+        argv,
+        hasDeepLink: Boolean(url)
+      })
     })
   })
 }
@@ -18213,11 +18311,17 @@ app.whenReady().then(() => {
   // serves were drained. The owner-only recovery journal survives that crash;
   // its worker waits for the install marker to clear, then reopens every scope
   // captured by the original transaction before removing the journal entry.
-  void resumeManagedSshRecoveries()
-  createWindow()
-
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
+
+  void resumeManagedSshRecoveries()
+  createWindow({
+    startMinimized: shouldStartMinimizedFirstLaunch({
+      platform: process.platform,
+      argv: process.argv,
+      hasColdDeepLink: Boolean(_coldStartLink)
+    })
+  })
 
   if (_coldStartLink) {
     handleDeepLink(_coldStartLink)

@@ -620,6 +620,10 @@ export const ru = defineLocale({
       resumeLastSessionTitle: 'Открывать последний чат при запуске',
       resumeLastSessionDesc:
         'Продолжайте с того места, где остановились. Выключите, чтобы всегда начинать с нового чата.',
+      loginStartupTitle: 'Запускать Hermes вместе с Windows',
+      loginStartupDesc:
+        'Открывать приложение свёрнутым при входе в систему. Используется сохранённый основной профиль.',
+      loginStartupFailed: 'Windows не включила автозапуск. Проверьте приложения автозагрузки в настройках Windows.',
       product: 'Продукт',
       productDesc: 'Дружелюбная активность инструментов с краткими сводками.',
       technical: 'Технический',
@@ -940,8 +944,9 @@ export const ru = defineLocale({
       checking: 'Проверка…',
       seeWhatsNew: 'Смотреть, что нового',
       updateNow: 'Обновить сейчас',
+      updateSource: 'Источник обновлений',
       releaseNotes: 'Заметки о выпуске',
-      onLatest: 'У вас последняя версия.',
+      onLatest: 'Настроенный источник обновлений актуален.',
       installing: 'Сейчас устанавливается обновление.',
       cantUpdate: 'Эта сборка не может обновляться изнутри приложения.',
       cantReach: 'Не удалось связаться с сервером обновлений.',
@@ -954,7 +959,8 @@ export const ru = defineLocale({
       automaticUpdates: 'Автоматические обновления',
       automaticUpdatesDesc: 'Hermes автоматически проверяет обновления в фоне и сообщает, когда они готовы.',
       updateParked: 'Обновление ожидает безопасного состояния рабочей копии.',
-      updateParkedDesc: 'Локальные исправления сохранены. Проверьте или перенесите их перед установкой обновления из upstream.',
+      updateParkedDesc:
+        'Локальные исправления сохранены. Проверьте или перенесите их перед установкой обновления из upstream.',
       branchCommit: (branch, commit) => `Ветка ${branch} · Коммит ${commit}`,
       never: 'никогда',
       justNow: 'только что',
@@ -1517,6 +1523,7 @@ export const ru = defineLocale({
   skills: {
     tabSkills: 'Навыки',
     tabToolsets: 'Инструменты',
+    tabHub: 'Открыть хаб',
     configuringProfile: 'Настраивается:',
     tabMcp: 'MCP',
     all: 'Все',

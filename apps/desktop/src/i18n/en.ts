@@ -774,6 +774,9 @@ export const en: Translations = {
       resumeLastSessionTitle: 'Reopen Last Chat on Launch',
       resumeLastSessionDesc:
         'When enabled, the app reopens your most recent chat on cold start. Turn off to always start with a fresh new chat.',
+      loginStartupTitle: 'Start Hermes with Windows',
+      loginStartupDesc: 'Open the desktop app minimized when you sign in. Uses the saved primary profile.',
+      loginStartupFailed: 'Windows did not enable startup. Check Startup apps in Windows Settings.',
       product: 'Product',
       productDesc: 'Human-friendly tool activity with concise summaries.',
       technical: 'Technical',
@@ -850,8 +853,9 @@ export const en: Translations = {
       checking: 'Checking…',
       seeWhatsNew: "See what's new",
       updateNow: 'Update now',
+      updateSource: 'Update source',
       releaseNotes: 'Release notes',
-      onLatest: "You're on the latest version.",
+      onLatest: 'Your configured update source is up to date.',
       installing: 'An update is currently installing.',
       cantUpdate: "This build can't update itself from inside the app.",
       cantReach: "We couldn't reach the update server.",
@@ -861,8 +865,7 @@ export const en: Translations = {
       lastChecked: age => `Last checked ${age}`,
       justNowSuffix: ' · just now',
       automaticUpdates: 'Automatic update checks',
-      automaticUpdatesDesc:
-        'Check for updates and notify me in the background. Installing remains a manual action.',
+      automaticUpdatesDesc: 'Check for updates and notify me in the background. Installing remains a manual action.',
       updateParked: 'Update is waiting for a safe checkout.',
       updateParkedDesc:
         'Your local repair changes are preserved. Review or move them before installing the upstream update.',
@@ -1581,6 +1584,7 @@ export const en: Translations = {
   skills: {
     tabSkills: 'Skills',
     tabToolsets: 'Tools',
+    tabHub: 'Browse Hub',
     configuringProfile: 'Configuring:',
     tabMcp: 'MCP',
     all: 'All',

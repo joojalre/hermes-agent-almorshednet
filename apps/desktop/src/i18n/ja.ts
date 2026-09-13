@@ -560,6 +560,11 @@ export const ja = defineLocale({
       resumeLastSessionTitle: '起動時に前回のチャットを再開',
       resumeLastSessionDesc:
         'オンの場合、コールドスタート時に直近のチャットを再び開きます。オフにすると常に新しいチャットから始まります。',
+      loginStartupTitle: 'Windows と同時に Hermes を起動',
+      loginStartupDesc:
+        'サインイン時にデスクトップアプリを最小化して開きます。保存されたプライマリプロファイルを使用します。',
+      loginStartupFailed:
+        'Windows でスタートアップを有効にできませんでした。Windows の設定でスタートアップ アプリを確認してください。',
       product: 'プロダクト',
       productDesc: '読みやすいツール活動と簡潔な要約を表示します。',
       technical: 'テクニカル',
@@ -859,8 +864,9 @@ export const ja = defineLocale({
       checking: '確認中…',
       seeWhatsNew: '新機能を見る',
       updateNow: '今すぐ更新',
+      updateSource: '更新ソース',
       releaseNotes: 'リリースノート',
-      onLatest: '最新バージョンです。',
+      onLatest: '設定した更新ソースは最新です。',
       installing: '更新をインストール中です。',
       cantUpdate: 'このビルドはアプリ内から更新できません。',
       cantReach: '更新サーバーに接続できませんでした。',
@@ -1418,6 +1424,7 @@ export const ja = defineLocale({
   skills: {
     tabSkills: 'スキル',
     tabToolsets: 'ツールセット',
+    tabHub: 'スキルハブ',
     tabMcp: 'MCP',
     all: 'すべて',
     searchSkills: 'スキルを検索...',

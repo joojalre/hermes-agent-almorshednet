@@ -650,6 +650,9 @@ export interface Translations {
       embedsReset: (count: number) => string
       resumeLastSessionTitle: string
       resumeLastSessionDesc: string
+      loginStartupTitle: string
+      loginStartupDesc: string
+      loginStartupFailed: string
       product: string
       productDesc: string
       technical: string
@@ -721,6 +724,7 @@ export interface Translations {
       checking: string
       seeWhatsNew: string
       updateNow: string
+      updateSource: string
       releaseNotes: string
       onLatest: string
       installing: string
@@ -1390,6 +1394,7 @@ export interface Translations {
   skills: {
     tabSkills: string
     tabToolsets: string
+    tabHub: string
     configuringProfile: string
     tabMcp: string
     all: string
