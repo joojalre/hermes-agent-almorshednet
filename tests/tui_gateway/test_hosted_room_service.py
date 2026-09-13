@@ -72,6 +72,7 @@ class _FakeRPC:
         task,
         execution_generation,
         on_terminal,
+        member_id="",
     ):
         on_terminal({"status": "settled", "text": f"reply from {profile}"})
         return {"accepted": True}
@@ -83,7 +84,7 @@ class _FakeRPC:
         return {"active": False, "task_id": None}
 
     def interrupt(self, *, profile, session_id, source, expected_task_id,
-                  expected_task=None, expected_execution_generation=None):
+                  expected_task=None, expected_execution_generation=None, expected_member_id=None):
         return {"interrupted": True}
 
     def approve(self, **kwargs):
@@ -284,6 +285,7 @@ class _PromptRecordingRPC(_FakeRPC):
         task,
         execution_generation,
         on_terminal,
+        member_id="",
     ):
         self.prompts.append((profile, prompt))
         on_terminal({"status": "settled", "text": f"reply from {profile}"})
@@ -324,7 +326,8 @@ class _InterruptibleRPC(_FakeRPC):
 
     def submit(self, **kwargs):
         self.active_task_id = kwargs["task"].task_id
-        self.active_proof = {**asdict(kwargs["task"]), "execution_generation": kwargs["execution_generation"]}
+        self.active_proof = {**asdict(kwargs["task"]), "execution_generation": kwargs["execution_generation"],
+                             "member_id": kwargs["member_id"]}
         self.started.set()
         return {"accepted": True}
 
@@ -336,8 +339,11 @@ class _InterruptibleRPC(_FakeRPC):
         }
 
     def interrupt(self, *, profile, session_id, source, expected_task_id,
-                  expected_task=None, expected_execution_generation=None):
-        if self.active_task_id != expected_task_id:
+                  expected_task=None, expected_execution_generation=None, expected_member_id=None):
+        if self.active_task_id != expected_task_id or (
+                expected_task is not None and self.active_proof != {
+                    **asdict(expected_task), "execution_generation": expected_execution_generation,
+                    "member_id": expected_member_id}):
             return {"interrupted": False}
         if not self.acknowledge_interrupt:
             return {"interrupted": False}
@@ -1409,7 +1415,7 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
             return {"active": True, "task_id": self.active_task_id, "hosted_task": self.active_proof}
 
         def interrupt(self, *, profile, session_id, source, expected_task_id,
-                      expected_task=None, expected_execution_generation=None):
+                      expected_task=None, expected_execution_generation=None, expected_member_id=None):
             return None
 
     db = tmp_path / "state.db"
@@ -1451,7 +1457,8 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
     )
     rpc.sessions[("ops", "Group: room-1")] = {"session_id": "ops-session"}
     rpc.active_task_id = task["identity"].task_id
-    rpc.active_proof = {**asdict(task["identity"]), "execution_generation": 1}
+    rpc.active_proof = {**asdict(task["identity"]), "execution_generation": 1,
+                        "member_id": task["payload"]["target_member_id"]}
 
     with pytest.raises(RuntimeError, match="still stopping"):
         service.stop_room(
@@ -1482,7 +1489,7 @@ def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
             return {"active": True, "task_id": self.active_task_id, "hosted_task": self.active_proof}
 
         def interrupt(self, *, profile, session_id, source, expected_task_id,
-                      expected_task=None, expected_execution_generation=None):
+                      expected_task=None, expected_execution_generation=None, expected_member_id=None):
             self.expected_task_ids.append(expected_task_id)
             if not self.acknowledge:
                 return None
@@ -1529,7 +1536,8 @@ def test_demote_waits_for_exact_turn_stop_ack_before_authority_transfer(
     )
     rpc.sessions[("ops", "Group: room-1")] = {"session_id": "ops-session"}
     rpc.active_task_id = task["identity"].task_id
-    rpc.active_proof = {**asdict(task["identity"]), "execution_generation": 1}
+    rpc.active_proof = {**asdict(task["identity"]), "execution_generation": 1,
+                        "member_id": task["payload"]["target_member_id"]}
     observed_gateway = "install:" + "b" * 32
     remote_db = tmp_path / "remote-state.db"
     replicas.ingest_page(

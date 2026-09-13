@@ -535,6 +535,13 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
         scopes.secret = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
         from tools.terminal_scope import install_profile_terminal_scope
         scopes.terminal = install_profile_terminal_scope(Path(profile_home))
+    elif _served_profile_homes:
+        # Multiplex residual of #68559 / #107422: the launch profile used to run
+        # unscoped and fall back to ambient os.environ. Once any secondary home
+        # has been served, bind the launch home's own terminal policy so a
+        # poisoned ambient bridge can never become the launch turn's authority.
+        from tools.terminal_scope import install_profile_terminal_scope
+        scopes.terminal = install_profile_terminal_scope(Path(_hermes_home))
     # The sudo password callback is thread-local: without re-wiring here, sudo prompts
     # fall through to /dev/tty and hang the headless gateway (re-run is a no-op).
     _wire_callbacks(sid)
@@ -876,15 +883,6 @@ def _run_prompt_submit(
             proof = hosted_task if hosted_task is not None else session.get("_hosted_room_task")
             hosted_task = dict(proof) if isinstance(proof, dict) else None
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation, hosted_task)
-    if display_kind is None and not str(rid).startswith("__"):
-        session["_wisdom_user_activity"] = time.time()
-        if session.get("_wisdom_activity_tracking"):
-            try:
-                from tui_gateway.wisdom_mediation import note_activity
-
-                note_activity(session, profile_scope=_session_profile_runtime_scope)
-            except Exception:
-                logger.debug("Wisdom user activity unavailable", exc_info=True)
     if admitted is None:
         if hosted_task is not None:
             _finish_cancelled_hosted_start(session, hosted_task, terminal_callback)

@@ -1018,6 +1018,7 @@ function ingestProgress(payload: DesktopUpdateProgress): void {
 }
 
 let pollerStarted = false
+let lastFocusAt = 0
 let backgroundTimer: ReturnType<typeof setInterval> | null = null
 let connectionUnsub: (() => void) | null = null
 let lastConnectionMode: string | undefined
@@ -1053,9 +1054,7 @@ function configuredAutomaticUpdateChecks(config: Record<string, unknown>): boole
 
   // Accept a flat value from older config writers while always writing the
   // setting under `desktop`, which is the canonical config.yaml section.
-  return typeof config[AUTO_UPDATE_CHECKS_CONFIG_KEY] === 'boolean'
-    ? config[AUTO_UPDATE_CHECKS_CONFIG_KEY]
-    : undefined
+  return typeof config[AUTO_UPDATE_CHECKS_CONFIG_KEY] === 'boolean' ? config[AUTO_UPDATE_CHECKS_CONFIG_KEY] : undefined
 }
 
 function hydrateAutomaticUpdateChecks(restartRetries = false): void {
