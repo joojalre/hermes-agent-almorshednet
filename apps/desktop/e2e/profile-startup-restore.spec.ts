@@ -116,6 +116,21 @@ test('restores named and Default selections on the same local gateway after rest
     await testInfo.attach('after-default-restart', { body: await third.page.screenshot(), contentType: 'image/png' })
   } finally {
     try {
+      if (app && !closed) {
+        await testInfo.attach('owned-window-state', {
+          body: JSON.stringify(await app.evaluate(({ BrowserWindow }) => ({
+            startMinimizedArgument: process.argv.includes('--start-minimized'),
+            windows: BrowserWindow.getAllWindows().map(window => ({
+              id: window.id,
+              visible: window.isVisible(),
+              minimized: window.isMinimized(),
+              maximized: window.isMaximized(),
+              bounds: window.getBounds()
+            }))
+          }))), contentType: 'application/json'
+        })
+      }
+
       if (page && !page.isClosed()) {
         await testInfo.attach('final-alerts', {
           body: JSON.stringify(await collectErrorBanners(page)), contentType: 'application/json'
