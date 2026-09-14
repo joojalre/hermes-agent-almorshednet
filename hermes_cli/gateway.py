@@ -1634,6 +1634,15 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     # treating only Running as supervised still kills the detached gateway on every desktop serve start
     # (#86098, #87001).
     if is_windows():
+        # Fresh desktop profiles have no gateway to reap. Avoid blocking their
+        # readiness on a PowerShell task query when the canonical scan is empty.
+        # A nonempty/failed scan keeps the existing supervisor guard and the
+        # fresh scan below: never kill from a snapshot taken before that query.
+        try:
+            if not find_gateway_pids(exclude_pids=_reaper_exclusion_pids(extra_exclude)):
+                return False
+        except Exception:
+            pass
         try:
             from hermes_cli.gateway_windows import get_task_name  # profile-aware task name
             _task_name = get_task_name()

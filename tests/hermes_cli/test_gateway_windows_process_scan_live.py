@@ -138,3 +138,69 @@ def test_native_snapshot_preserves_argument_boundaries_and_fails_over_cleanly(mo
 
     monkeypatch.setattr(psutil, "process_iter", _failed_snapshot)
     assert gateway_windows._snapshot_process_command_lines() is None
+
+
+def test_empty_orphan_scan_does_not_wait_for_task_scheduler(tmp_path, monkeypatch):
+    """A fresh profile with no gateway has no process for the supervisor to protect."""
+    profile_home = tmp_path / "hermes-home" / "profiles" / f"empty-{os.getpid()}"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    def _unexpected_probe(_name):
+        raise AssertionError("empty orphan sweep must not wait for Task Scheduler")
+
+    def _unexpected_kill(_pid, _signal):
+        raise AssertionError("an empty profile must not target any process")
+
+    monkeypatch.setattr(gateway, "_windows_scheduled_task_supervises", _unexpected_probe)
+    monkeypatch.setattr(gateway.os, "kill", _unexpected_kill)
+    assert gateway._reap_unsupervised_gateway_orphans() is False
+
+
+@pytest.mark.spawns_gateway_lookalike
+@pytest.mark.parametrize("state", ["Running", "Ready", "Queued", "Disabled", "MISSING", None])
+def test_nonempty_orphan_sweep_keeps_supervision_and_rescans_after_probe(
+    tmp_path, monkeypatch, state
+):
+    """A task probe cannot authorize killing a stale scan or a supervised child."""
+    profile = f"reap-{os.getpid()}"
+    profile_home = tmp_path / "hermes-home" / "profiles" / profile
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    supervised = state in {"Running", "Ready", "Queued"}
+    real_kill = os.kill
+    killed = []
+    probes = []
+
+    with ExitStack() as owned_children:
+        original = _spawn_gateway_shaped_sleeper(profile)
+        owned_children.callback(_stop_owned, original)
+        replacement = None
+
+        def _task_state(name):
+            nonlocal replacement
+            probes.append(name)
+            if not supervised:
+                # The process table can change during a slow scheduler query.
+                _stop_owned(original)
+                replacement = _spawn_gateway_shaped_sleeper(profile)
+                owned_children.callback(_stop_owned, replacement)
+            return state
+
+        def _kill_owned_only(pid, sig):
+            assert replacement is not None and pid == replacement.pid
+            killed.append(pid)
+            return real_kill(pid, sig)
+
+        monkeypatch.setattr(gateway, "_windows_scheduled_task_state", _task_state)
+        monkeypatch.setattr(gateway.os, "kill", _kill_owned_only)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is (not supervised)
+        assert probes == [gateway_windows.get_task_name()]
+        if supervised:
+            assert original.poll() is None
+            assert killed == []
+        else:
+            assert replacement is not None
+            assert killed == [replacement.pid]
+            assert replacement.wait(timeout=10) is not None
