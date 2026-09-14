@@ -142,6 +142,15 @@ describe('selectProfile startup preference (#79886)', () => {
     expect(ensureGatewayForProfile).toHaveBeenCalledWith('tilly')
   })
 
+  it('remembers a named local-source pick even when the registry labels local as active', async () => {
+    activeGatewayConnectionId.mockReturnValue('local')
+
+    selectProfile('tilly')
+
+    await vi.waitFor(() => expect(rememberProfile).toHaveBeenCalledWith('tilly'))
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('tilly')
+  })
+
   it('waits for gateway activation before replacing the startup preference', async () => {
     let resolveGateway!: () => void
 

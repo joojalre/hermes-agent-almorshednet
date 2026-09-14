@@ -929,7 +929,8 @@ export function selectProfile(name: string): void {
   // is made on the source the user is looking at (activateOnCurrentSource
   // dials exactly that pair), so the draft's exact owner is that pair — or the
   // legacy profile-only path when that is the door the pick takes.
-  captureNewChatSource(profilePickConnectionId(target))
+  const pickedConnectionId = profilePickConnectionId(target)
+  captureNewChatSource(pickedConnectionId)
 
   if (switching) {
     requestFreshSession()
@@ -948,7 +949,12 @@ export function selectProfile(name: string): void {
   // IPC instead (#79886). Registry-source picks name ANOTHER source's
   // profiles, so only a primary-backend activation updates the startup
   // preference.
-  const onPrimary = activeGatewayConnectionId() == null
+  // A named pick on the explicit local source intentionally uses the legacy
+  // profile door so Electron can honor a per-profile remote override before
+  // falling back to the local backend. Treat that null registry route as the
+  // primary launch preference only after isLocalDesktopProfile confirms the
+  // target is genuinely local.
+  const onPrimary = pickedConnectionId === null
 
   const shouldRememberStartupProfile = onPrimary ? isLocalDesktopProfile(target) : Promise.resolve(false)
 
