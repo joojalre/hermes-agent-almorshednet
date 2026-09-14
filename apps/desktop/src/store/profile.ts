@@ -951,16 +951,26 @@ export function selectProfile(name: string): void {
   // preference.
   // A named pick on the explicit local source intentionally uses the legacy
   // profile door so Electron can honor a per-profile remote override before
-  // falling back to the local backend. Treat that null registry route as the
-  // primary launch preference only after isLocalDesktopProfile confirms the
-  // target is genuinely local.
-  const onPrimary = pickedConnectionId === null
+  // falling back to a local backend. Default on that source stays on the
+  // reserved local registry route and is explicitly local; only the legacy
+  // door needs isLocalDesktopProfile to exclude a per-profile remote override.
+  const onPrimary = pickedConnectionId === null || pickedConnectionId === LOCAL_CONNECTION_ID
 
-  const shouldRememberStartupProfile = onPrimary ? isLocalDesktopProfile(target) : Promise.resolve(false)
+  const shouldRememberStartupProfile =
+    pickedConnectionId === LOCAL_CONNECTION_ID
+      ? Promise.resolve(true)
+      : onPrimary
+        ? isLocalDesktopProfile(target)
+        : Promise.resolve(false)
 
   void Promise.all([activateOnCurrentSource(target), shouldRememberStartupProfile])
     .then(([, shouldRemember]) => {
-      if (shouldRemember) {
+      const localDefaultActivationLanded =
+        pickedConnectionId !== LOCAL_CONNECTION_ID ||
+        (activeGatewayConnectionId() === LOCAL_CONNECTION_ID &&
+          normalizeProfileKey($activeGatewayProfile.get()) === target)
+
+      if (shouldRemember && localDefaultActivationLanded) {
         return window.hermesDesktop?.profile?.remember(target)
       }
 

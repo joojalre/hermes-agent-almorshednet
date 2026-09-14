@@ -16,8 +16,9 @@ import { collectErrorBanners, type ElectronApplication, expect, type Page, test 
 // Real Electron/backend restart, with synthetic profiles and no external
 // provider. A named profile selected on the local registry source uses the
 // legacy profile door and must survive without a forced profile launch flag.
+// Returning to explicit local Default must also replace that saved selection.
 // eslint-disable-next-line no-empty-pattern
-test('restores the selected profile on the same local gateway after restart', async ({}, testInfo) => {
+test('restores named and Default selections on the same local gateway after restart', async ({}, testInfo) => {
   test.setTimeout(360_000)
   const sandbox = createSandbox('profile-startup')
   const mock = await startMockServer()
@@ -81,6 +82,38 @@ test('restores the selected profile on the same local gateway after restart', as
     expect(await collectErrorBanners(second.page)).toEqual([])
     expect(second.app.windows()).toHaveLength(1)
     await testInfo.attach('after-restart', { body: await second.page.screenshot(), contentType: 'image/png' })
+
+    // The inverse choice takes the explicit local registry door rather than
+    // the named profile's legacy door. It must not leave Full saved for boot.
+    const secondRail = second.page.locator('[data-slot="profile-rail"]')
+
+    await secondRail.getByRole('button', { name: 'Switch to default', exact: true }).click()
+    await expect(secondRail.getByRole('button', { name: 'Show all profiles', exact: true }))
+      .toHaveAttribute('aria-pressed', 'true', { timeout: 90_000 })
+    await expect.poll(() => JSON.parse(fs.readFileSync(
+      path.join(sandbox.userDataDir, 'active-profile.json'), 'utf8'
+    )).profile, { timeout: 10_000 }).toBe('default')
+    await testInfo.attach('saved-default-before-restart', {
+      body: JSON.stringify({ profile: JSON.parse(fs.readFileSync(
+        path.join(sandbox.userDataDir, 'active-profile.json'), 'utf8'
+      )).profile }), contentType: 'application/json'
+    })
+    expect(await collectErrorBanners(second.page)).toEqual([])
+    await second.app.close()
+    closed = true
+
+    const third = await launch()
+    page = third.page
+    await waitForAppReady(third, 120_000)
+    const thirdRail = third.page.locator('[data-slot="profile-rail"]')
+
+    await expect(thirdRail.getByRole('button', { name: 'Show all profiles', exact: true }))
+      .toHaveAttribute('aria-pressed', 'true', { timeout: 60_000 })
+    await expect(thirdRail.getByRole('button', { name: 'full', exact: true }))
+      .toHaveAttribute('aria-pressed', 'false')
+    expect(await collectErrorBanners(third.page)).toEqual([])
+    expect(third.app.windows()).toHaveLength(1)
+    await testInfo.attach('after-default-restart', { body: await third.page.screenshot(), contentType: 'image/png' })
   } finally {
     try {
       if (page && !page.isClosed()) {
