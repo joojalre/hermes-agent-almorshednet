@@ -609,10 +609,13 @@ def _scan_gateway_pids(
 
     try:
         if is_windows():
-            listing = _windows_process_listing()
-            if listing is None:
-                return []
-            for pid, command in _iter_windows_list_processes(listing):
+            processes = _gw_windows()._snapshot_process_command_lines()
+            if processes is None:
+                listing = _windows_process_listing()
+                if listing is None:
+                    return []
+                processes = _iter_windows_list_processes(listing)
+            for pid, command in processes:
                 _consider(pid, command)
         else:
             # /proc first (Docker without procps), then `ps -Aww`.
