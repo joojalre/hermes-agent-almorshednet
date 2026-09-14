@@ -9,6 +9,7 @@ import contextlib
 import functools
 import logging
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -201,9 +202,9 @@ def _mountinfo_fstype(directory: str, mountinfo_path: str = "/proc/self/mountinf
         parts = fields.split()
         if len(parts) < 5 or not tail:
             continue
-        mount_point = parts[4]
-        if "\\" in mount_point:  # octal escapes (\040 = space)
-            mount_point = mount_point.encode("latin-1", "ignore").decode("unicode_escape")
+        # proc(5) escapes whitespace and backslashes as octal. Decode only those escape
+        # sequences: a latin-1 roundtrip drops non-Latin characters in the same field.
+        mount_point = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), parts[4])
         if directory == mount_point or directory.startswith(mount_point.rstrip("/") + "/"):
             if len(mount_point) > best_len:
                 best_len, best_fstype = len(mount_point), tail.split()[0]

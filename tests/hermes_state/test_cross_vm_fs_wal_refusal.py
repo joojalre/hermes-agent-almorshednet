@@ -10,7 +10,12 @@ import sqlite3
 import pytest
 
 import hermes_state_wal
-from hermes_state_wal import WalUnsupportedError, _detect_cross_vm_fs, apply_wal_with_fallback
+from hermes_state_wal import (
+    WalUnsupportedError,
+    _detect_cross_vm_fs,
+    _mountinfo_fstype,
+    apply_wal_with_fallback,
+)
 
 
 def _mountinfo(tmp_path, lines):
@@ -25,21 +30,34 @@ BIND_VIRTIOFS = "612 25 0:53 / /data rw,relatime shared:300 - fuse.virtiofs moun
 BIND_9P = "613 25 0:54 / /mnt/host rw,relatime - 9p host0 rw,trans=virtio"
 NESTED_EXT4 = "614 612 8:2 / /data/native rw,relatime - ext4 /dev/sdb1 rw"
 SPACE_VIRTIOFS = "615 25 0:55 / /mnt/my\\040share rw,relatime - virtiofs share rw"
+UNICODE_SPACE_VIRTIOFS = "616 25 0:56 / /mnt/共有\\040share rw,relatime - virtiofs share rw"
 
 
 class TestDetectCrossVmFs:
-    @pytest.mark.parametrize("path,expected", [
-        ("/data/agent", True),          # fuse.virtiofs bind mount
-        ("/mnt/host/db", True),         # 9p bind mount
-        ("/mnt/my share/db", True),     # octal-escaped mount point
-        ("/home/user/.hermes", False),  # ext4 root
-        ("/data/native/db", False),     # ext4 mounted over the virtiofs tree — longest prefix wins
-        ("/datastore", False),          # sibling path sharing a prefix string, not a mount prefix
+    @pytest.mark.parametrize("path,expected_fstype", [
+        ("/data/agent", "fuse.virtiofs"),  # cross-VM bind mount
+        ("/mnt/host/db", "9p"),            # other cross-VM bind mount
+        ("/mnt/my share/db", "virtiofs"),  # octal-escaped mount point
+        ("/home/user/.hermes", "ext4"),    # ordinary root
+        ("/data/native/db", "ext4"),       # nested mount wins over the virtiofs parent
+        ("/datastore", "ext4"),            # sibling path does not match the /data mount
     ])
-    def test_only_virtiofs_and_9p_mounts_are_flagged(self, tmp_path, path, expected):
+    def test_mountinfo_parser_resolves_the_longest_mount(self, tmp_path, path, expected_fstype):
         mi = _mountinfo(tmp_path, [ROOT_EXT4, BIND_VIRTIOFS, BIND_9P, NESTED_EXT4, SPACE_VIRTIOFS])
-        assert _detect_cross_vm_fs(path, mountinfo_path=mi) is expected
+        assert _mountinfo_fstype(path, mountinfo_path=mi) == expected_fstype
 
+    def test_mountinfo_octal_decoding_preserves_unicode_mount_points(self, tmp_path):
+        mi = _mountinfo(tmp_path, [ROOT_EXT4, UNICODE_SPACE_VIRTIOFS])
+
+        assert _mountinfo_fstype("/mnt/共有 share/db", mountinfo_path=mi) == "virtiofs"
+
+    @pytest.mark.linux_only
+    @pytest.mark.parametrize("path", ["/data/agent", "/mnt/host/db", "/mnt/my share/db"])
+    def test_linux_guard_flags_cross_vm_mounts(self, tmp_path, path):
+        mi = _mountinfo(tmp_path, [ROOT_EXT4, BIND_VIRTIOFS, BIND_9P, SPACE_VIRTIOFS])
+        assert _detect_cross_vm_fs(path, mountinfo_path=mi) is True
+
+    @pytest.mark.linux_only
     @pytest.mark.parametrize("fstype", [
         "ext4", "xfs", "btrfs", "zfs", "tmpfs", "overlay", "nfs", "nfs4", "cifs", "fuse.sshfs", "apfs", "f2fs",
     ])
@@ -48,6 +66,7 @@ class TestDetectCrossVmFs:
         mi = _mountinfo(tmp_path, [f"25 1 8:1 / / rw,relatime shared:1 - {fstype} /dev/sda1 rw"])
         assert _detect_cross_vm_fs("/home/user/.hermes", mountinfo_path=mi) is False
 
+    @pytest.mark.linux_only
     def test_missing_mountinfo_conservative_false(self, tmp_path):
         assert _detect_cross_vm_fs("/data", mountinfo_path=str(tmp_path / "nope")) is False
 

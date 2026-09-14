@@ -395,6 +395,26 @@ def test_automatic_migration_canonical_and_legacy_false_each_veto(fleet, capsys,
     assert not (fleet.root / gm.MANIFEST_NAME).exists()
 
 
+@pytest.mark.parametrize("source", ["expanded-user", "managed-overlay"])
+def test_automatic_migration_opt_out_uses_effective_bool_config(fleet, monkeypatch, source):
+    """The presence-sensitive update guard sees the same expanded/managed config and bool strings
+    as gateway runtime, while retaining the legacy-key false veto."""
+    managed = fleet.root / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    if source == "expanded-user":
+        monkeypatch.setenv("AUTO_MIGRATION_ENABLED", "false")
+        (fleet.root / "config.yaml").write_text(
+            "gateway:\n  auto_migrate: ${AUTO_MIGRATION_ENABLED}\n", encoding="utf-8")
+    else:
+        (managed / "config.yaml").write_text(
+            'gateway:\n  auto_multiplex_migration: "false"\n', encoding="utf-8")
+
+    from hermes_cli.gateway_migrate_guards import auto_migration_opted_out
+
+    assert auto_migration_opted_out(fleet.root) is True
+
+
 def test_automatic_migration_config_key_is_canonical_schema_key():
     from hermes_cli.config import _validate_config_key
 

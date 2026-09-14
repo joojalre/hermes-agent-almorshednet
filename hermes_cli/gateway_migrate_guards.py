@@ -135,15 +135,13 @@ def auto_migration_opted_out(default_home: Path) -> bool:
     opted in (the ``DEFAULT_CONFIG`` value); only nested keys count. ``gateway.auto_migrate`` was
     briefly shipped as the documented default name, so either explicit false is a safe veto."""
     cfg_path = default_home / "config.yaml"
-    if not cfg_path.exists():
-        return False
-    from hermes_cli.config import read_user_config_raw
-    cfg = read_user_config_raw(cfg_path) or {}
+    from hermes_cli.config_effective import load_user_config_effective
+    from utils import is_truthy_value
+    cfg = load_user_config_effective(cfg_path)
     gateway_section = cfg.get("gateway")
     if not isinstance(gateway_section, dict):
         return False
-    values = (
-        gateway_section.get("auto_multiplex_migration"),
-        gateway_section.get("auto_migrate"),
+    return any(
+        key in gateway_section and not is_truthy_value(gateway_section[key], default=True)
+        for key in ("auto_multiplex_migration", "auto_migrate")
     )
-    return any(value is not None and not bool(value) for value in values)
