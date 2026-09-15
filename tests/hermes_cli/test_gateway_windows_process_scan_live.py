@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from contextlib import ExitStack
 from types import SimpleNamespace
 
@@ -45,6 +46,16 @@ def _stop_owned(child: subprocess.Popen) -> None:
     if child.poll() is None:
         child.kill()
     child.wait(timeout=10)
+
+
+def _wait_for_gateway_pid(pid: int, timeout: float = 10.0) -> None:
+    """Wait for a newly spawned lookalike to become visible to the native process scan."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid in gateway.find_gateway_pids():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"replacement gateway process {pid} did not become visible")
 
 
 @pytest.mark.spawns_gateway_lookalike
@@ -185,6 +196,7 @@ def test_nonempty_orphan_sweep_keeps_supervision_and_rescans_after_probe(
                 _stop_owned(original)
                 replacement = _spawn_gateway_shaped_sleeper(profile)
                 owned_children.callback(_stop_owned, replacement)
+                _wait_for_gateway_pid(replacement.pid)
             return state
 
         def _kill_owned_only(pid, sig):
