@@ -182,6 +182,10 @@ def test_nonempty_orphan_sweep_keeps_supervision_and_rescans_after_probe(
     real_kill = os.kill
     killed = []
     probes = []
+    # Hosted Windows runners may themselves descend from services.exe. Keep this
+    # test focused on Task Scheduler state; the parent-chain backstop is covered
+    # independently and must not classify the test sleeper as service-owned.
+    monkeypatch.setattr(gateway, "_reaper_candidate_is_supervisor_owned", lambda _pid: False)
 
     with ExitStack() as owned_children:
         original = _spawn_gateway_shaped_sleeper(profile)
