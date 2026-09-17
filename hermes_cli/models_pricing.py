@@ -72,8 +72,8 @@ def _pricing_auth_fingerprint(api_key: str | None) -> str:
     entry. It is a stable keyed fingerprint, not a password verifier."""
     if not api_key:
         return ""
-    from agent.secure_fingerprint import keyed_fingerprint
-    return _PRICING_AUTH_KEY_PREFIX + keyed_fingerprint(api_key)
+    from agent.secure_fingerprint import stable_fingerprint
+    return _PRICING_AUTH_KEY_PREFIX + stable_fingerprint(api_key)
 
 
 def peek_cached_pricing(base_url: str) -> dict[str, dict[str, Any]]:

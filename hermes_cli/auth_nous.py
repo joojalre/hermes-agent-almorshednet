@@ -46,8 +46,8 @@ def _unusable_invoke_jwt_error(reason: str, *, no_refresh_token: bool = False) -
 def _token_fingerprint(token: Any) -> Optional[str]:
     """Return a short hash fingerprint for telemetry without leaking token bytes."""
     cleaned = token.strip() if isinstance(token, str) else ""
-    from agent.secure_fingerprint import keyed_fingerprint
-    return keyed_fingerprint(cleaned, length=12) if cleaned else None
+    from agent.secure_fingerprint import stable_fingerprint
+    return stable_fingerprint(cleaned, length=12) if cleaned else None
 
 
 def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any) -> None:

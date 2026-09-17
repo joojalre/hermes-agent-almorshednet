@@ -1578,7 +1578,7 @@ def _credential_fingerprint(provider: str) -> str:
     """Short hash of the credentials ``provider_model_ids(provider)`` would see right now: api-key /
     base-url env vars from ``PROVIDER_REGISTRY`` plus the mtimes of ``auth.json`` and external
     credential files (OAuth re-auth busts the cache without parsing every file shape)."""
-    from agent.secure_fingerprint import keyed_fingerprint
+    from agent.secure_fingerprint import stable_fingerprint
 
     # Keyless providers serve the catalog anonymously: nothing the user rotates should invalidate
     # the entry, so a stable fingerprint keeps the SWR cache alive and busts only on TTL expiry.
@@ -1647,7 +1647,7 @@ def _credential_fingerprint(provider: str) -> str:
     blob = "|".join(parts)
     # This is a cache identity, not a password verifier. Keep it stable across
     # processes while preventing raw credential material from becoming a cache key.
-    return keyed_fingerprint(blob)
+    return stable_fingerprint(blob)
 
 
 def _load_provider_models_cache() -> dict:
@@ -2569,10 +2569,10 @@ def _custom_endpoint_fingerprint(
     :func:`fetch_api_models`: a rotated ``api_key``, changed ``api_mode`` or edited ``extra_headers``
     each bust the cache entry. It is a stable keyed fingerprint, not a password verifier."""
     from agent.command_token_source import CommandTokenSource
-    from agent.secure_fingerprint import keyed_fingerprint
+    from agent.secure_fingerprint import stable_fingerprint
     identity = api_key.cache_identity if isinstance(api_key, CommandTokenSource) else api_key
     blob = "|".join((identity or "", api_mode or "", json.dumps(headers or {}, sort_keys=True)))
-    return keyed_fingerprint(blob)
+    return stable_fingerprint(blob)
 
 
 def _cache_entry_valid(

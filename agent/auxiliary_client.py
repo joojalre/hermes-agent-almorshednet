@@ -5315,8 +5315,8 @@ def _runtime_cache_discriminator(field: str, value: Any) -> Any:
     if field == "api_key" and callable(value):
         return _CallableCacheDiscriminator(value)
     if field == "api_key" and isinstance(value, str) and value:
-        from agent.secure_fingerprint import keyed_fingerprint
-        return ("api-key-digest", keyed_fingerprint(value, length=32))
+        from agent.secure_fingerprint import stable_fingerprint
+        return ("api-key-digest", stable_fingerprint(value, length=32))
     return value
 
 

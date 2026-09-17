@@ -9,7 +9,7 @@ import hmac
 import re
 from typing import Any, Dict, Mapping
 
-from agent.secure_fingerprint import keyed_fingerprint
+from agent.secure_fingerprint import stable_fingerprint
 
 
 # Sources Hermes owns and may persist with secrets.  Any other non-empty,
@@ -72,7 +72,7 @@ def _is_secret_payload_key(key: Any) -> bool:
 
 
 def fingerprint_secret_value(value: Any) -> str | None:
-    """Non-reversible ``hmac-sha256:<16 hex>`` fingerprint of one secret value.
+    """Non-reversible ``sha3-256:<16 hex>`` fingerprint of one secret value.
 
     Callers comparing a live secret against the ``secret_fingerprint`` left on
     a sanitized (borrowed) pool row need exactly the digest this module writes.
@@ -82,7 +82,7 @@ def fingerprint_secret_value(value: Any) -> str | None:
     text = "" if value is None else str(value)
     if not text:
         return None
-    return f"hmac-sha256:{keyed_fingerprint(text)}"
+    return f"sha3-256:{stable_fingerprint(text)}"
 
 
 def matches_secret_fingerprint(value: Any, expected: Any) -> bool:
@@ -108,7 +108,7 @@ def _credential_secret_fingerprint(payload: Mapping[str, Any]) -> str | None:
         if fingerprint:
             return fingerprint
     existing = payload.get("secret_fingerprint")
-    if isinstance(existing, str) and existing.startswith(("sha256:", "hmac-sha256:")):
+    if isinstance(existing, str) and existing.startswith(("sha256:", "hmac-sha256:", "sha3-256:")):
         return existing
     return None
 

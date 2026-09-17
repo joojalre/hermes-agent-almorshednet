@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import secrets
 import threading
 import time
 from contextlib import nullcontext, suppress
@@ -29,11 +28,6 @@ logger = logging.getLogger("gateway.run")
 _OVERRIDE_APPLY_KEYS = (
     "provider", "requested_provider", "api_key", "base_url", "api_mode", "credential_pool", "capabilities", "max_tokens",
 )
-
-# The agent cache is process-local, so a fresh namespace per process is sufficient and avoids
-# making the credential fingerprint an offline dictionary target.
-_CACHE_FINGERPRINT_KEY = secrets.token_bytes(32)
-
 
 def _first_agent(entry: Any) -> Any:
     """Unwrap a cache entry (``(agent, sig, ...)`` tuple or bare agent) to its agent."""
@@ -114,17 +108,17 @@ class GatewayAgentCacheMixin:
         broke #27371's per-user-peer contract in multi-user gateways. Per-user agent rebuilds in shared
         threads trade prompt-cache warmth for correct memory attribution.
         """
-        import hashlib, hmac, json as _j
+        import hashlib, json as _j
+        from agent.secure_fingerprint import stable_fingerprint
         # Fingerprint the FULL credential, not a short prefix: OAuth/JWT-style tokens often share a
         # common prefix (e.g. "eyJhbGci"), so a prefix would give false cache hits across auth switches.
         _api_key = str(runtime.get("api_key", "") or "")
         blob = _j.dumps(
             [
                 model,
-                # This is a cache fingerprint, not a password verifier. A process-local keyed
-                # digest preserves full-key separation without exposing a dictionary target.
-                hmac.new(_CACHE_FINGERPRINT_KEY, _api_key.encode(), hashlib.sha256).hexdigest()
-                if _api_key else "",
+                # This is a cache fingerprint, not a password verifier. SHA3 preserves
+                # full-key separation without exposing raw credential material.
+                stable_fingerprint(_api_key, length=64) if _api_key else "",
                 runtime.get("base_url", ""), runtime.get("provider", ""),
                 runtime.get("requested_provider", ""), runtime.get("api_mode", ""),
                 sorted((runtime.get("capabilities") or {}).items()),

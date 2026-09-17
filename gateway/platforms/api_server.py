@@ -2475,8 +2475,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Non-reversible principal digest bound to the profile's expected API key, so a client
         cannot impersonate another controller by echoing an id."""
         key = self._expected_api_key() or self._api_key or ""
-        from agent.secure_fingerprint import keyed_fingerprint
-        digest = keyed_fingerprint(f"{profile}\x00{key}", length=32)
+        from agent.secure_fingerprint import stable_fingerprint
+        digest = stable_fingerprint(f"{profile}\x00{key}", length=32)
         return f"principal:{profile}:{digest}"
 
     def _browser_control_transport_family(self, request: "web.Request") -> str:

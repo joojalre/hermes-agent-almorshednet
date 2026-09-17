@@ -2647,8 +2647,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             # Non-string/multimodal-envelope shapes can't be hashed by text.
             if msg.get("role") != "tool" or not isinstance(content, str) or len(content) < _PRUNE_MIN_CHARS:
                 continue
-            from agent.secure_fingerprint import keyed_fingerprint
-            h = keyed_fingerprint(content, length=12)
+            from agent.secure_fingerprint import stable_fingerprint
+            h = stable_fingerprint(content, length=12)
             if h in content_hashes:
                 result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
                 pruned += 1
