@@ -5,9 +5,11 @@ share one policy without import cycles."""
 
 from __future__ import annotations
 
-import hashlib
+import hmac
 import re
 from typing import Any, Dict, Mapping
+
+from agent.secure_fingerprint import keyed_fingerprint
 
 
 # Sources Hermes owns and may persist with secrets.  Any other non-empty,
@@ -70,16 +72,31 @@ def _is_secret_payload_key(key: Any) -> bool:
 
 
 def fingerprint_secret_value(value: Any) -> str | None:
-    """Non-reversible ``sha256:<16 hex>`` fingerprint of one secret value.
+    """Non-reversible ``hmac-sha256:<16 hex>`` fingerprint of one secret value.
 
     Callers comparing a live secret against the ``secret_fingerprint`` left on
     a sanitized (borrowed) pool row need exactly the digest this module writes.
+    Legacy ``sha256:`` rows are treated as needing one-time rehydration; the
+    runtime never recomputes that weak digest.
     """
     text = "" if value is None else str(value)
     if not text:
         return None
-    digest = hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
-    return f"sha256:{digest[:16]}"
+    return f"hmac-sha256:{keyed_fingerprint(text)}"
+
+
+def matches_secret_fingerprint(value: Any, expected: Any) -> bool:
+    """Compare a live secret with a current persisted fingerprint.
+
+    A legacy ``sha256:`` row deliberately returns ``False`` so the caller
+    refreshes its sanitized row instead of recreating a weak digest.
+    """
+    if not isinstance(expected, str) or not expected:
+        return False
+    current = fingerprint_secret_value(value)
+    if current and hmac.compare_digest(current, expected):
+        return True
+    return False
 
 
 def _credential_secret_fingerprint(payload: Mapping[str, Any]) -> str | None:
@@ -91,7 +108,7 @@ def _credential_secret_fingerprint(payload: Mapping[str, Any]) -> str | None:
         if fingerprint:
             return fingerprint
     existing = payload.get("secret_fingerprint")
-    if isinstance(existing, str) and existing.startswith("sha256:"):
+    if isinstance(existing, str) and existing.startswith(("sha256:", "hmac-sha256:")):
         return existing
     return None
 
