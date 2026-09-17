@@ -5,6 +5,7 @@ share one policy without import cycles."""
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import re
 from typing import Any, Dict, Mapping
@@ -76,8 +77,8 @@ def fingerprint_secret_value(value: Any) -> str | None:
 
     Callers comparing a live secret against the ``secret_fingerprint`` left on
     a sanitized (borrowed) pool row need exactly the digest this module writes.
-    Legacy ``sha256:`` rows are treated as needing one-time rehydration; the
-    runtime never recomputes that weak digest.
+    Legacy rows remain readable through ``matches_secret_fingerprint`` so a
+    format upgrade is not mistaken for credential rotation.
     """
     text = "" if value is None else str(value)
     if not text:
@@ -86,17 +87,31 @@ def fingerprint_secret_value(value: Any) -> str | None:
 
 
 def matches_secret_fingerprint(value: Any, expected: Any) -> bool:
-    """Compare a live secret with a current persisted fingerprint.
+    """Match current or legacy identity metadata, never an authentication verifier.
 
-    A legacy ``sha256:`` row deliberately returns ``False`` so the caller
-    refreshes its sanitized row instead of recreating a weak digest.
+    Only new PBKDF2 fingerprints are written. Legacy digests are computed solely
+    to preserve exhaustion/quarantine decisions while reading existing records.
     """
     if not isinstance(expected, str) or not expected:
         return False
-    current = fingerprint_secret_value(value)
-    if current and hmac.compare_digest(current, expected):
-        return True
-    return False
+    prefix, separator, digest = expected.partition(":")
+    if not separator or re.fullmatch(r"[0-9a-f]{16}", digest) is None:
+        return False
+    text = "" if value is None else str(value)
+    if not text:
+        return False
+    data = text.encode("utf-8", errors="surrogatepass")
+    legacy_readers = {
+        "sha256": lambda: hashlib.sha256(data, usedforsecurity=False).hexdigest(),
+        "hmac-sha256": lambda: hmac.new(
+            b"hermes-non-verifier-fingerprint-v2", data, hashlib.sha256
+        ).hexdigest(),
+        "sha3-256": lambda: hashlib.sha3_256(data, usedforsecurity=False).hexdigest(),
+    }
+    if prefix == "pbkdf2-sha256":
+        return hmac.compare_digest(stable_fingerprint(text), digest)
+    reader = legacy_readers.get(prefix)
+    return reader is not None and hmac.compare_digest(reader()[:16], digest)
 
 
 def _credential_secret_fingerprint(payload: Mapping[str, Any]) -> str | None:

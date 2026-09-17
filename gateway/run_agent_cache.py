@@ -116,7 +116,7 @@ class GatewayAgentCacheMixin:
         blob = _j.dumps(
             [
                 model,
-                # This is a cache fingerprint, not a password verifier. SHA3 preserves
+                # This is a cache fingerprint, not a password verifier. The digest preserves
                 # full-key separation without exposing raw credential material.
                 stable_fingerprint(_api_key, length=64) if _api_key else "",
                 runtime.get("base_url", ""), runtime.get("provider", ""),

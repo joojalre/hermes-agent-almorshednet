@@ -69,7 +69,7 @@ _PRICING_AUTH_KEY_PREFIX = "\x00auth:"
 def _pricing_auth_fingerprint(api_key: str | None) -> str:
     """Cache-key suffix identifying the credential a catalog was read with: a governed endpoint
     answers each token with the catalog its org may reach, so two credentials cannot share an
-    entry. It is a stable keyed fingerprint, not a password verifier."""
+    entry. It is a stable fingerprint, not a password verifier."""
     if not api_key:
         return ""
     from agent.secure_fingerprint import stable_fingerprint

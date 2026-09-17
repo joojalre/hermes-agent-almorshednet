@@ -2567,7 +2567,7 @@ def _custom_endpoint_fingerprint(
     api_key: Any, api_mode: Optional[str], headers: Optional[dict[str, str]]) -> str:
     """Custom endpoints have no ``PROVIDER_REGISTRY`` slug, so hash exactly what callers pass to
     :func:`fetch_api_models`: a rotated ``api_key``, changed ``api_mode`` or edited ``extra_headers``
-    each bust the cache entry. It is a stable keyed fingerprint, not a password verifier."""
+    each bust the cache entry. It is a stable fingerprint, not a password verifier."""
     from agent.command_token_source import CommandTokenSource
     from agent.secure_fingerprint import stable_fingerprint
     identity = api_key.cache_identity if isinstance(api_key, CommandTokenSource) else api_key
