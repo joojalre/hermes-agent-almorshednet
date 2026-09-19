@@ -46,11 +46,18 @@ vi.mock('@/store/session', () => ({
   setGatewayState: vi.fn()
 }))
 vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() }))
+// Reconnect lazily loads this store. Keep the session boundary isolated here
+// too: the real store imports the UI graph and depends on unmocked session atoms.
+vi.mock('@/store/session-states', () => ({
+  reconcileBusyStatesOnReconnect: vi.fn(),
+  resetTileRuntimeBindings: vi.fn()
+}))
 
 const {
   activeGateway,
   closeSecondaryGateways,
   configureGatewayRegistry,
+  dispatchPrimaryServerRequest,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
   openGatewayForProfile,
@@ -408,20 +415,21 @@ describe('connection-scoped dial failure identity (#95421)', () => {
       await expect(openGatewayForAgent('work', 'default')).rejects.toBe(dialError)
       await expect(openGatewayForAgent('homelab', 'default')).rejects.toBe(dialError)
 
-      const messages = errorSpy.mock.calls.map(([message]) => String(message))
+      const calls = errorSpy.mock.calls
+      const messages = calls.map(([message]) => String(message))
+      const contexts = calls.map(([, context]) => context as { scope?: string; profile?: string })
 
       expect(messages).toHaveLength(2)
-      expect(messages).toEqual(
+      expect(messages.every(message => message === '[gateway] dial failed')).toBe(true)
+      expect(contexts).toEqual(
         expect.arrayContaining([
-          expect.stringContaining('scope="conn:work::default"'),
-          expect.stringContaining('scope="conn:homelab::default"')
+          expect.objectContaining({ scope: 'conn:work::default', profile: 'default' }),
+          expect.objectContaining({ scope: 'conn:homelab::default', profile: 'default' })
         ])
       )
-      expect(messages.every(message => message.includes('profile="default"'))).toBe(true)
-      expect(new Set(messages).size).toBe(2)
-      expect(messages.join(' ')).not.toContain('wss://')
+      expect(new Set(contexts.map(context => context.scope)).size).toBe(2)
 
-      for (const [, error] of errorSpy.mock.calls) {
+      for (const [, , error] of calls) {
         expect(error).toBe(dialError)
       }
     } finally {
@@ -967,5 +975,27 @@ describe('secondary connection timeout (#93454)', () => {
 
     pruneSecondaryGateways(new Set())
     expect(gatewayMocks.instances[0].close).not.toHaveBeenCalled()
+  })
+})
+
+describe('server→client request routing without a registry handler (#112791)', () => {
+  it('answers -32601 when the registry has no onServerRequest, and forwards with the profile when it does', () => {
+    const request = { fail: vi.fn(), id: 'srq-1', method: 'clarify', params: { session_id: 's1' }, respond: vi.fn() }
+
+    // beforeEach configured a registry with onEvent only: nobody can answer,
+    // so the handler declines (false) and the channel answers -32601 now
+    // instead of the backend waiting out its deadline.
+    expect(dispatchPrimaryServerRequest(request as never, 'default')).toBe(false)
+    expect(request.fail).not.toHaveBeenCalled()
+
+    const onServerRequest = vi.fn()
+
+    configureGatewayRegistry({ onEvent: vi.fn(), onServerRequest } as never)
+    expect(dispatchPrimaryServerRequest(request as never, 'work')).toBe(true)
+    expect(request.fail).not.toHaveBeenCalled()
+    expect(onServerRequest).toHaveBeenCalledTimes(1)
+    expect(onServerRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'srq-1', method: 'clarify', profile: 'work' })
+    )
   })
 })

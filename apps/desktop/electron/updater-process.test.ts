@@ -6,6 +6,7 @@ import { test } from 'vitest'
 
 import {
   collectRelaunchArgs,
+  describeUpdaterHandoffFailure,
   MARKER_SELF_ADOPT_EPOCH_MS,
   observeUpdaterHandoff,
   resolvePosixScriptHandoff,
@@ -101,7 +102,7 @@ test('spawnUpdaterProcess hides the updater console and detaches the child on Wi
     {
       args: ['--update', '--branch', 'main'],
       command: 'hermes-setup.exe',
-      options: { cwd: 'C:\\Hermes', detached: true, stdio: 'ignore', windowsHide: true }
+      options: { cwd: 'C:\\Hermes', detached: true, stdio: 'ignore', windowsHide: true, shell: false }
     }
   ])
 })
@@ -123,7 +124,7 @@ test('spawnUpdaterProcess preserves updater options off Windows', () => {
     }
   )
 
-  assert.deepEqual(capturedOptions, { detached: true, stdio: 'ignore' })
+  assert.deepEqual(capturedOptions, { detached: true, stdio: 'ignore', shell: false })
 })
 
 test('resolveStagedUpdaterBinary hands Windows the staged installer it finds', () => {
@@ -218,7 +219,7 @@ test('resolveUpdateScriptHandoff is Windows-only (POSIX updates in place)', () =
   assert.equal(handoff, null)
 })
 
-test('wrapHandoffForDetachedConsole routes through cmd start with own console', () => {
+test('wrapHandoffForDetachedConsole keeps data out of cmd syntax and rejects unsupported parameters', () => {
   const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
   const expected = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
 
@@ -231,8 +232,9 @@ test('wrapHandoffForDetachedConsole routes through cmd start with own console', 
   const wrapped = wrapHandoffForDetachedConsole(handoff, ['-InstallRoot', root, '-Branch', 'main'])
 
   assert.equal(wrapped.command, 'cmd.exe')
-  assert.deepEqual(wrapped.args, [
+  assert.deepEqual(wrapped.args.slice(0, -1), [
     '/d',
+    '/v:off',
     '/s',
     '/c',
     'start',
@@ -242,13 +244,11 @@ test('wrapHandoffForDetachedConsole routes through cmd start with own console', 
     '-NoProfile',
     '-ExecutionPolicy',
     'Bypass',
-    '-File',
-    expected,
-    '-InstallRoot',
-    root,
-    '-Branch',
-    'main'
+    '-EncodedCommand'
   ])
+  assert.match(wrapped.args.at(-1)!, /^[A-Za-z0-9+/]+=*$/)
+  assert.throws(() => wrapHandoffForDetachedConsole(handoff, ['-Command', 'unexpected']))
+  assert.throws(() => wrapHandoffForDetachedConsole(handoff, ['-Branch']))
 })
 
 test('resolvePosixScriptHandoff returns the bash recipe when the script exists', () => {
@@ -391,6 +391,20 @@ test('observeUpdaterHandoff reports a non-zero early exit', async () => {
   assert.equal(outcome.ok, false)
   assert.equal(outcome.reason, 'early-exit')
   assert.equal(outcome.code, 127)
+})
+
+test('describeUpdaterHandoffFailure leads with plain copy and confines the raw outcome to Details', () => {
+  for (const raw of ['updater exited 127 before the settle window elapsed', 'updater spawn failed: ENOENT']) {
+    const text = describeUpdaterHandoffFailure({ message: raw })
+    const [lead, details] = text.split('\n\nDetails: ')
+
+    assert.match(lead, /Hermes keeps running/)
+    assert.match(lead, /Try again/)
+    assert.doesNotMatch(lead, /exited|spawn|ENOENT|settle window|hermes update|\d/)
+    assert.equal(details, raw)
+  }
+
+  assert.doesNotMatch(describeUpdaterHandoffFailure({}), /Details:/)
 })
 
 test('observeUpdaterHandoff reports a signal death inside the window', async () => {
