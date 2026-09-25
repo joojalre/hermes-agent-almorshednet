@@ -64,6 +64,22 @@ def test_fork_python_suite_uses_public_runners_with_shared_assignment(tmp_path):
     assert len(observed) == len(set(observed))
 
 
+def test_fork_main_push_has_successful_skip_sentinel():
+    """Intentional fork-main validation skips must not become zero-job failures."""
+    workflow = _ci_workflow()
+    job = workflow["jobs"]["fork-main-push-skipped"]
+
+    assert job["if"] == (
+        "github.event_name == 'push' && "
+        "github.repository != 'NousResearch/hermes-agent'"
+    )
+    assert job["runs-on"] == "ubuntu-latest"
+    assert any(
+        "intentionally skipped" in step.get("run", "")
+        for step in job["steps"]
+    )
+
+
 @pytest.mark.parametrize(
     ("workflow_name", "job_name", "must_run_after_failed_needs"),
     [

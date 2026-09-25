@@ -234,6 +234,20 @@ jobs:
       security-events: write
     uses: ./.github/workflows/osv-scanner.yml
 
+  # A push to this fork's main branch has already passed its pull-request
+  # validation. Keep the intentional no-duplicate-validation policy, but leave
+  # one successful job so GitHub does not record a zero-job push as a failure.
+  fork-main-push-skipped:
+    name: Fork main CI skipped
+    if: github.event_name == 'push' && github.repository != 'NousResearch/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Record intentional skip
+        run: |
+          echo "Fork main push validation is intentionally skipped."
+          echo "The pull request run is the authoritative validation gate."
+
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
   # status even when some deps were skipped. Only actual ``failure``
