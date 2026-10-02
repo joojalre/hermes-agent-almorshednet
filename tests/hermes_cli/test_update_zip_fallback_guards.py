@@ -79,16 +79,15 @@ def test_unknown_command_gets_generic_stage():
 
 
 
-def test_no_zip_fallback_flag_survives_post_swap_handoff():
+def test_no_zip_fallback_flag_is_opt_in():
     from hermes_cli.subcommands.update import build_update_parser
 
     parser = argparse.ArgumentParser()
     build_update_parser(parser.add_subparsers(), cmd_update=lambda _args: None)
     assert parser.parse_args(["update"]).no_zip_fallback is False
     args = parser.parse_args(["update", "--no-zip-fallback", "--branch", "main"])
-    child = parser.parse_args(["update", *update_cmd._post_swap_argv_tail(args)])
-    assert child.no_zip_fallback is True
-    assert child.branch == "main"
+    assert args.no_zip_fallback is True
+    assert args.branch == "main"
 
 
 def test_git_error_with_no_zip_fallback_exits_without_archive(monkeypatch):
@@ -110,7 +109,7 @@ def test_git_error_with_no_zip_fallback_exits_without_archive(monkeypatch):
 def test_direct_zip_entry_refuses_before_configuration_or_download(monkeypatch, capsys):
     from hermes_cli import update_cmd_zip
 
-    with patch.object(update_cmd, "_resolve_update_options") as resolve, patch.object(
+    with patch.object(update_cmd, "_m") as resolve, patch.object(
         update_cmd_zip, "_download_and_swap_zip"
     ) as download, patch.object(update_cmd, "_finalize_receipt") as finalize:
         with pytest.raises(SystemExit) as failure:
@@ -355,8 +354,6 @@ def test_preserved_filter_does_not_split_non_rename_lines():
     assert update_cmd._is_zip_preserved_entry_status_line(
         "R  venv/a -> node_modules/b"
     )
-
-
 
 
 def test_zip_overlay_allows_ignored_preserved_entries(tmp_path, monkeypatch):

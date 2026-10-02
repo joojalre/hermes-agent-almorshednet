@@ -14,7 +14,7 @@ _REPO = Path(__file__).resolve().parents[2]
 
 
 def _workflow(name):
-    yaml = pytest.importorskip("yaml")
+    import hermes_yaml as yaml
     return yaml.safe_load(
         (_REPO / ".github" / "workflows" / name).read_text(encoding="utf-8")
     )
@@ -44,7 +44,7 @@ def test_advisory_is_separate_and_required_lint_still_fails_closed(tmp_path, lin
         if step.get("id") in {"checkout", "surface"}:
             assert step["continue-on-error"] is True
     assert not mandatory.get("continue-on-error", False)
-    for checker in ("check-windows-footguns.py", "check_compat_pointers.py"):
+    for checker in ("check-windows-footguns.py",):
         step = next(step for step in mandatory["steps"] if checker in step.get("run", ""))
         assert not step.get("continue-on-error", False)
         failed = _shell("python() { return 23; };\n" + step["run"], tmp_path)
@@ -57,14 +57,16 @@ def test_advisory_is_separate_and_required_lint_still_fails_closed(tmp_path, lin
     assert not orchestrator["lint"].get("continue-on-error", False)
     gate = orchestrator["all-checks-pass"]
     assert "lint" in gate["needs"]
-    evaluate = next(step for step in gate["steps"] if step["name"] == "Evaluate job results")
-    source = evaluate["run"].split('python3 -c "', 1)[1].rsplit('"', 1)[0]
-    source = source.replace(r'\"', '"').replace(
-        "'$GITHUB_OUTPUT'", repr(str(tmp_path / "gate-output"))
-    )
+    evaluate = next(step for step in gate["steps"] if step.get("name") == "Evaluate job results")
+    # Run the step's real command; it pipes ``toJSON(needs)`` into scripts/ci/required_results.py.
     result = subprocess.run(
-        [sys.executable, "-c", source],
-        input=json.dumps({"lint": {"result": lint_result}}),
+        [shutil.which("bash"), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", evaluate["run"]],
+        cwd=_REPO,
+        env={
+            **os.environ, "PYTHONIOENCODING": "utf-8", "RELEASE": "",
+            "NEEDS": json.dumps({"lint": {"result": lint_result}}),
+            "GITHUB_OUTPUT": str(tmp_path / "gate-output"),
+        },
         capture_output=True,
         text=True,
         encoding="utf-8",

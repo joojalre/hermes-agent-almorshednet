@@ -19,7 +19,7 @@ import pytest
 from hermes_cli import gateway, gateway_windows
 
 
-pytestmark = pytest.mark.windows_only
+pytestmark = pytest.mark.platforms("windows")
 
 
 def _spawn_gateway_shaped_sleeper(profile: str) -> subprocess.Popen:

@@ -8,14 +8,15 @@ import type { ProfileInfo } from '@/types/hermes'
 // the REST query client must not run for real in a unit test.
 const ensureGatewayForProfile = vi.fn(async (_profile: string) => undefined)
 const ensureGatewayForAgent = vi.fn(async () => undefined)
-const openGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
-const openLocalSecondaryCount = vi.fn(() => 0)
+const openGatewayForAgent = vi.fn(async (_connectionId: null | string, _profile: string) => undefined)
+const openSecondaryCount = vi.fn(() => 0)
 const $gateway = atom<unknown>({ id: 'live-socket', connectionState: 'open' })
 const resetStarmapGraph = vi.fn()
 
 vi.mock('@/store/gateway', () => ({
   $gateway,
+  activeGateway: () => null,
   activeGatewayConnectionId: () => null,
   // Activation now verifies the socket's route before publishing the profile.
   activeGatewayProfileKey: () => ensureGatewayForProfile.mock.lastCall?.[0] ?? $activeGatewayProfile.get(),
@@ -23,7 +24,7 @@ vi.mock('@/store/gateway', () => ({
   ensureGatewayForProfile,
   openGatewayForAgent,
   openGatewayForProfile,
-  openLocalSecondaryCount
+  openSecondaryCount
 }))
 // The pool-limits atom is profile.ts's live saturation signal — keep the real
 // one so tests can move the cap via the store, but stub its IPC bridge.
@@ -44,11 +45,14 @@ const {
   $profiles,
   ensureGatewayProfile,
   invalidateProfileListFetches,
-  openGatewayAgent,
-  prewarmGatewayAgent,
+  newSessionInProfile,
   prewarmProfileBackend,
-  refreshProfiles
+  refreshProfiles,
+  selectProfile
 } = await import('./profile')
+
+const { $projectScope, ALL_PROJECTS } = await import('./project-scope')
+const { $projectTree, resolveNewSessionCwd } = await import('./projects')
 
 const { $poolLimits } = await import('@/store/pool-limits')
 const { $connectionsRegistry } = await import('@/store/connection-registry-state')
@@ -78,10 +82,8 @@ const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnectio
 beforeEach(() => {
   getConnection.mockReset()
   ensureGatewayForProfile.mockClear()
-  openGatewayForAgent.mockClear()
   openGatewayForProfile.mockClear()
-  openLocalSecondaryCount.mockReturnValue(0)
-  $poolLimits.set({ idleMs: 600_000, maxBackends: 3 })
+  openSecondaryCount.mockReturnValue(0)
   $gateway.set({ id: 'live-socket', connectionState: 'open' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
@@ -107,6 +109,7 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     await ensureGatewayProfile('vps-remote')
 
     expect(ensureGatewayForProfile).toHaveBeenCalledWith('vps-remote')
+    // Profile activation is a user navigation: the descriptor lookup runs at foreground priority.
     expect(getConnection).toHaveBeenCalledWith('vps-remote', { priority: 'foreground' })
     expect($connection.get()?.mode).toBe('remote')
     expect($connection.get()?.profile).toBe('vps-remote')
@@ -164,37 +167,13 @@ describe('profile-scoped cache invalidation', () => {
   })
 })
 
-describe('source preparation correlation', () => {
-  it('forwards the source transaction signal without activating the route', async () => {
-    const controller = new AbortController()
-    const previousConnection = $connection.get()
-
-    await openGatewayAgent('local', 'full', { signal: controller.signal })
-
-    expect(openGatewayForAgent).toHaveBeenCalledWith('local', 'full', {
-      activationLease: true,
-      signal: controller.signal,
-      spawnPriority: 'foreground'
-    })
-    expect($activeGatewayProfile.get()).toBe('default')
-    expect($connection.get()).toBe(previousConnection)
-  })
-})
-
 describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
   it('opens the gateway (spawn + connect, no activation) for a non-active profile', () => {
     prewarmProfileBackend('warm-basic')
 
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-basic', { speculative: true })
+    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-basic')
     // Pre-warm must never activate — that's the click's job.
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
-  })
-
-  it('pre-warms an agent-scoped backend through its registry connection', () => {
-    prewarmProfileBackend('warm-agent', 'registry-connection')
-
-    expect(openGatewayForAgent).toHaveBeenCalledWith('registry-connection', 'warm-agent', { speculative: true })
-    expect(openGatewayForProfile).not.toHaveBeenCalled()
   })
 
   it('skips the profile the gateway is already on', () => {
@@ -222,7 +201,7 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     prewarmProfileBackend('dax', 'shell')
     prewarmProfileBackend('dax', 'gateway')
 
-    expect(openGatewayForAgent.mock.calls).toEqual([['gateway', 'dax', { speculative: true }]])
+    expect(openGatewayForAgent.mock.calls).toEqual([['gateway', 'dax']])
     expect(openGatewayForProfile).not.toHaveBeenCalled()
   })
 
@@ -246,86 +225,22 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     // Every pool slot occupied: a speculative spawn would LRU-evict a warm
     // backend — often the one the user is about to click. Default limit 3,
     // 3 open secondaries → the next spawn would exceed the cap.
-    openLocalSecondaryCount.mockReturnValue(3)
+    openSecondaryCount.mockReturnValue(3)
 
     prewarmProfileBackend('warm-saturated')
 
     expect(openGatewayForProfile).not.toHaveBeenCalled()
   })
 
-  it('pre-warms while pool slots are free', () => {
-    openLocalSecondaryCount.mockReturnValue(1)
-
-    prewarmProfileBackend('warm-slot-free')
-
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-slot-free', { speculative: true })
-  })
-
-  it('reserves background capacity during a rapid hover sweep', async () => {
-    let releaseFirst!: () => void
-    let releaseSecond!: () => void
-
-    const first = new Promise<undefined>(resolve => {
-      releaseFirst = () => resolve(undefined)
-    })
-
-    const second = new Promise<undefined>(resolve => {
-      releaseSecond = () => resolve(undefined)
-    })
-
-    openGatewayForProfile.mockImplementationOnce(() => first).mockImplementationOnce(() => second)
-
-    prewarmProfileBackend('warm-reserved-a')
-
-    prewarmProfileBackend('warm-reserved-b')
-
-    prewarmProfileBackend('warm-reserved-c')
-
-    // Default pool size is three, but its coordinator reserves one foreground
-    // slot. Two pending background pre-warms are therefore the safe maximum.
-    expect(openGatewayForProfile).toHaveBeenCalledTimes(2)
-
-    releaseFirst()
-    releaseSecond()
-    await Promise.all([first, second])
-    await new Promise(resolve => setTimeout(resolve, 0))
-
-    prewarmProfileBackend('warm-reserved-c')
-
-    expect(openGatewayForProfile).toHaveBeenCalledTimes(3)
-  })
-
-  it('shares the hover reservation across profile and source-qualified bot hints', () => {
-    // Source-scoped Bot Mode rows call warmAgent rather than warmProfile. They
-    // must not bypass the same two-slot background limit used by the rail.
-    prewarmProfileBackend('warm-shared-profile')
-    prewarmGatewayAgent('local', 'warm-shared-agent')
-    prewarmGatewayAgent('local', 'warm-shared-overflow')
-
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-shared-profile', { speculative: true })
-    expect(openGatewayForAgent).toHaveBeenCalledWith('local', 'warm-shared-agent', { speculative: true })
-    expect(openGatewayForAgent).not.toHaveBeenCalledWith('local', 'warm-shared-overflow')
-  })
-
-  it('does not apply a local pool limit to a remote bot hint', () => {
-    // A remote/cloud socket is not a child of Electron's local backend pool.
-    // Saturating that pool must not make an unrelated remote Bot Chat cold.
-    openLocalSecondaryCount.mockReturnValue(3)
-
-    prewarmGatewayAgent('remote-hostinger', 'warm-remote-agent')
-
-    expect(openGatewayForAgent).toHaveBeenCalledWith('remote-hostinger', 'warm-remote-agent', { speculative: true })
-  })
-
   it('follows the live pool-limit atom, not a hard-coded cap', () => {
     // User raises Warm Bot Backends to 8 in Settings: prewarming must keep
     // working well past the old default of 3.
-    openLocalSecondaryCount.mockReturnValue(5)
+    openSecondaryCount.mockReturnValue(5)
     $poolLimits.set({ idleMs: 600_000, maxBackends: 8 })
 
     prewarmProfileBackend('warm-raised-cap')
 
-    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-raised-cap', { speculative: true })
+    expect(openGatewayForProfile).toHaveBeenCalledWith('warm-raised-cap')
 
     // And lowering the cap re-engages the guard at the new boundary.
     $poolLimits.set({ idleMs: 600_000, maxBackends: 2 })
@@ -465,5 +380,40 @@ describe('stale profile-list fetches across a backend switch (#85731)', () => {
     await oldFetch
 
     expect($profiles.get().map(profile => profile.name)).toEqual(['default', 'coder'])
+  })
+})
+
+describe("profile switch leaves the previous profile's project (#54990)", () => {
+  const enterDefaultProfileProject = () => {
+    $projectTree.set([{ id: 'p_app1', label: 'app1', path: '/work/app1', repos: [] } as never])
+    $projectScope.set('p_app1')
+  }
+
+  afterEach(() => {
+    $projectScope.set(ALL_PROJECTS)
+    $projectTree.set([])
+  })
+
+  it.each([
+    ['selectProfile', selectProfile],
+    ['newSessionInProfile', newSessionInProfile]
+  ])('%s to another profile does not root the fresh draft in the old project', (_name, open) => {
+    enterDefaultProfileProject()
+    expect(resolveNewSessionCwd()).toBe('/work/app1')
+
+    // The gateway swap is async: the old profile's project tree is still loaded
+    // when the fresh draft resolves its cwd.
+    open('sinan')
+
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+    expect(resolveNewSessionCwd()).not.toBe('/work/app1')
+  })
+
+  it('keeps the entered project when the draft stays on the active profile', () => {
+    enterDefaultProfileProject()
+
+    newSessionInProfile('default')
+
+    expect(resolveNewSessionCwd()).toBe('/work/app1')
   })
 })

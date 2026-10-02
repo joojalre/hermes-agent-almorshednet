@@ -39,7 +39,7 @@ and finally paths can write the result, remove the marker, and relaunch Desktop.
 So the contract is: bounded when a descendant holds the pipe open, never slower
 than the step can write, and bounded when the step itself remains alive without
 observable progress. All arms live in the script's own
-``-SelfTestPipeDrain`` fixture, which is ``windows_only`` because Linux CI
+``-SelfTestPipeDrain`` fixture, which is ``platforms("windows")`` because Linux CI
 cannot execute the PowerShell hand-off.
 """
 
@@ -56,9 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 WINDOWS_PS1 = REPO_ROOT / "scripts" / "desktop-update" / "windows.ps1"
 
 
-
-
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
     tmp_path: Path,
 ) -> None:
@@ -85,10 +83,10 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
     output, and report quiescence only after both processes are gone. This is the
     invariant that permits retry.
 
-    *logstall* -- a step that is silent on its pipes but appends to a
-    profile-scoped ``profiles/fixture/logs/update.log`` every second, exiting
-    3. This is the shape of a Desktop update: output streams to the active
-    profile's update log, not stdout, for 40+ minutes. The idle watchdog must
+    *logstall* -- a step that is silent on its pipes but appends to the
+    progress log (pointed at the fixture's own file) every second, exiting 3.
+    This is the shape of every real ``hermes update`` build: output streams to
+    ``logs/update.log``, not stdout, for 40+ minutes. The idle watchdog must
     count that growth as progress and let the step run to its natural exit
     instead of killing it at the ceiling with 124.
 
@@ -112,16 +110,10 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         # how long the leaking grandchild lives. hold >> grace is what makes a
         # regression measurable rather than lucky.
         "HERMES_UPDATE_PIPE_DRAIN_SECONDS": "3",
-        # Windows can take several seconds to schedule a newly-created
-        # console child under load.  Keep the fixture's watchdog below the
-        # 45-second hold while leaving enough launch headroom for its first
-        # profile-scoped log write to become observable.
+        # Cold PowerShell children can take more than three seconds to emit.
         "HERMES_UPDATE_STEP_IDLE_SECONDS": "15",
         "HERMES_SELFTEST_HOLD_SECONDS": "45",
     }
-    # The fixture must prove profile discovery rather than an explicit single
-    # progress-log override inherited from a caller.
-    env.pop("HERMES_UPDATE_PROGRESS_LOG", None)
 
     result = subprocess.run(
         [
@@ -143,14 +135,9 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         cwd=str(REPO_ROOT),
     )
 
-    assert "PIPE-DRAIN SELF-TEST: PASS" in result.stdout, (
-        "The Windows update hand-off's step drain regressed: it either waited "
-        "on a descendant holding the pipe open (the Desktop parks on 'Updating "
-        "Hermes' forever) or metered a chatty step (backpressure on the running "
-        f"update). Fixture diagnosis follows.\n--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
-    assert result.returncode == 0, (
-        f"-SelfTestPipeDrain exited {result.returncode}.\n"
-        f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
-    )
+    # Keep the real flood output on disk instead of flooding the CI log on failure.
+    (tmp_path / "pipe-drain.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (tmp_path / "pipe-drain.stderr.log").write_text(result.stderr, encoding="utf-8")
+    diagnosis = result.stdout[-6000:] + result.stderr[-6000:]
+    if "PIPE-DRAIN SELF-TEST: PASS" not in result.stdout or result.returncode != 0:
+        pytest.fail(diagnosis, pytrace=False)

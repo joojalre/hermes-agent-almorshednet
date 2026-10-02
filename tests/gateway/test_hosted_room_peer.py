@@ -53,21 +53,11 @@ def test_gateway_room_grant_secret_is_persistent_and_not_an_api_key(
     assert first != derive_room_grant_secret("gateway-api-key-1234567890")
 
 
-@pytest.mark.parametrize(
-    "_platform",
-    [
-        pytest.param("linux", marks=pytest.mark.linux_only),
-        pytest.param("macos", marks=pytest.mark.macos_only),
-    ],
-)
-def test_gateway_room_grant_secret_has_private_posix_mode(
-    tmp_path, monkeypatch, _platform
-):
-    # Common persistence/derivation contracts above still execute on Windows.
-    home = tmp_path / ".hermes"
-    monkeypatch.setenv("HERMES_HOME", str(home))
+@pytest.mark.platforms("posix")
+def test_gateway_room_grant_secret_has_owner_only_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     gateway_room_grant_secret()
-    assert stat.S_IMODE((home / ".room-link-grant-secret").stat().st_mode) == 0o600
+    assert stat.S_IMODE((tmp_path / ".room-link-grant-secret").stat().st_mode) == 0o600
 
 
 def test_gateway_room_grant_secret_is_atomic_across_concurrent_workers(

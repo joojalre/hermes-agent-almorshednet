@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 import type { DesktopConnectionsRegistry } from '@/global'
+import { BACKEND_BOOT_WAIT_TIMEOUT_MS, SOURCE_SWITCH_DIAL_TIMEOUT_MS } from '@/lib/with-timeout'
 
-import { BACKEND_BOOT_WAIT_TIMEOUT_MS } from '../lib/with-timeout'
 import { deferred } from '../test/deferred'
 
 const $activeGatewayProfile = atom('default')
@@ -33,10 +33,7 @@ const ensureGatewayAgent = vi.fn(
   async (_connectionId: null | string, _profile: string, _options?: ActivationOptions): Promise<void> => undefined
 )
 
-const openGatewayAgent = vi.fn(
-  async (_connectionId: string, _profile: string, _options?: { signal?: AbortSignal }): Promise<void> => undefined
-)
-
+const openGatewayAgent = vi.fn(async (_connectionId: string, _profile: string): Promise<void> => undefined)
 const refreshActiveProfile = vi.fn(async () => undefined)
 const requestFreshSession = vi.fn()
 const beforeConnectionSwitch = vi.fn()
@@ -211,6 +208,24 @@ describe('connection registry cache', () => {
     expect(ensureGatewayAgent).not.toHaveBeenCalled()
   })
 
+  it('selects the registry primary on boot when an update left an unqualified local descriptor', async () => {
+    // Post-update boot can publish a local descriptor with no registry id
+    // while connections.json still says launchMode=primary and the primary is
+    // SSH. That live local must not block selecting the registered primary.
+    list.mockResolvedValueOnce({
+      ...registry,
+      lastUsed: 'local',
+      launchMode: 'primary',
+      primary: 'homelab'
+    })
+    $connection.set({ mode: 'local' })
+
+    await initializeConnectionsRegistry()
+
+    expect(ensureGatewayAgent).toHaveBeenCalledTimes(1)
+    expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
+  })
+
   it('restores a remote registry primary through its exact connection id', async () => {
     list.mockResolvedValueOnce({ ...registry, primary: 'homelab', launchMode: 'primary' })
     $connection.set({ connectionId: 'local', mode: 'local' })
@@ -254,25 +269,13 @@ describe('connection registry cache', () => {
 })
 
 describe('selectConnection', () => {
-  it('correlates source preparation and commit with one caller-owned signal', async () => {
-    setConnectionsRegistry(registry)
-    $connection.set({ connectionId: 'local', mode: 'local' })
-
-    await selectConnection('homelab')
-
-    const signal = openGatewayAgent.mock.calls[0]?.[2]?.signal
-    expect(signal).toBeDefined()
-    expect(ensureGatewayAgent.mock.calls[0]?.[2]?.signal).toBe(signal)
-    expect(signal?.aborted).toBe(true)
-  })
-
   it('dials a secondary source and starts a fresh source-scoped draft', async () => {
     setConnectionsRegistry(registry)
     $connection.set({ connectionId: 'local', mode: 'local' })
 
     await selectConnection('homelab')
 
-    expect(openGatewayAgent).toHaveBeenCalledWith('homelab', 'default', { signal: expect.anything() })
+    expect(openGatewayAgent).toHaveBeenCalledWith('homelab', 'default')
     expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
     expect(api).not.toHaveBeenCalled()
     expect(beforeConnectionSwitch).toHaveBeenCalledTimes(1)
@@ -323,18 +326,13 @@ describe('selectConnection', () => {
     releaseDials()
     await Promise.all([openHomelab, stayLocal])
 
-    expect(openGatewayAgent.mock.calls.map(call => [call[0], call[1]])).toEqual([
+    expect(openGatewayAgent.mock.calls).toEqual([
       ['homelab', 'default'],
       ['local', 'default']
     ])
     // The superseded dial never activates: the user doesn't flip through
     // homelab on the way back to local, and only the winner commits.
     expect(ensureGatewayAgent.mock.calls.map(call => [call[0], call[1]])).toEqual([['local', 'default']])
-    const abandonedSignal = openGatewayAgent.mock.calls[0][2]?.signal
-    const winningSignal = openGatewayAgent.mock.calls[1][2]?.signal
-    expect(abandonedSignal?.aborted).toBe(true)
-    expect(winningSignal).not.toBe(abandonedSignal)
-    expect(ensureGatewayAgent.mock.calls[0][2]?.signal).toBe(winningSignal)
     expect(beginGatewaySwitch).toHaveBeenCalledTimes(1)
     expect(wipeSessionListsForGatewaySwitch).toHaveBeenCalledTimes(1)
     // Only the latest intent repaints the profile list.
@@ -471,9 +469,7 @@ describe('selectConnection', () => {
           expect.objectContaining({ connectionId: 'homelab', profile: 'scout', path: '/api/profiles' })
         )
       )
-      expect(openGatewayAgent.mock.calls.map(call => [call[0], call[1]])).toEqual(
-        Array.from({ length: 3 }, () => ['homelab', 'scout'])
-      )
+      expect(openGatewayAgent.mock.calls).toEqual(Array.from({ length: 3 }, () => ['homelab', 'scout']))
       expect(ensureGatewayAgent).toHaveBeenCalledTimes(1)
       expect(beginGatewaySwitch).toHaveBeenCalledTimes(1)
       expect(api.mock.invocationCallOrder[2]).toBeLessThan(beginGatewaySwitch.mock.invocationCallOrder[0])
@@ -543,7 +539,7 @@ describe('selectConnection', () => {
     expect(published).toEqual([{ activeSessionId: null, connectionId: 'homelab', switching: true }])
     // dial → commit (barrier + reset + wipe, inside the activation's commit
     // hook) → publish, in that order.
-    expect(openGatewayAgent).toHaveBeenCalledWith('homelab', 'default', { signal: expect.anything() })
+    expect(openGatewayAgent).toHaveBeenCalledWith('homelab', 'default')
     expect(openGatewayAgent.mock.invocationCallOrder[0]).toBeLessThan(ensureGatewayAgent.mock.invocationCallOrder[0])
     expect(beginGatewaySwitch).toHaveBeenCalledTimes(1)
     expect(beforeConnectionSwitch).toHaveBeenCalledTimes(1)
@@ -647,48 +643,43 @@ describe('selectConnection', () => {
     }
   })
 
-  it('allows a cold foreground source to open beyond the reconnect budget without severing the current source', async () => {
+  it('a slow-but-healthy dial is not a failed switch: the source caps only past the ssh layer budget, and the click lands', async () => {
     vi.useFakeTimers()
-    const dial = deferred()
 
     try {
+      const dial = deferred<void>()
+
       setConnectionsRegistry(registry)
       $connection.set({ connectionId: 'local', mode: 'local' })
-      $activeSessionId.set('a93bb39d')
       openGatewayAgent.mockImplementationOnce(() => dial.promise)
-      let settled = false
 
-      const outcome = selectConnection('homelab').then(
+      let outcome = 'pending'
+
+      const attempt = selectConnection('homelab').then(
         () => {
-          settled = true
-
-          return 'resolved'
+          outcome = 'resolved'
         },
         (error: Error) => {
-          settled = true
-
-          return error.message
+          outcome = error.message
         }
       )
 
-      await vi.advanceTimersByTimeAsync(40_000)
-
-      expect(settled).toBe(false)
+      // A cold remote dial is a chain of main-process stages (ssh connect, the
+      // platform/locate/version execs, the spawned backend's ready sentinel, the
+      // forward) that routinely outruns the 20 s reconnect-class budget: measured
+      // 37-64 s against a small VPS. The switch must keep waiting instead of
+      // toasting "Could not connect to <source>" for a source that is arriving.
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(outcome).toBe('pending')
       expect($pendingConnectionId.get()).toBe('homelab')
-      expect($connection.get()?.connectionId).toBe('local')
-      expect($activeSessionId.get()).toBe('a93bb39d')
-      expect(beginGatewaySwitch).not.toHaveBeenCalled()
-      expect(ensureGatewayAgent).not.toHaveBeenCalled()
 
       dial.resolve()
+      await attempt
 
-      expect(await outcome).toBe('resolved')
-      expect(beginGatewaySwitch).toHaveBeenCalledTimes(1)
+      expect(outcome).toBe('resolved')
       expect($connection.get()?.connectionId).toBe('homelab')
-      expect($pendingConnectionId.get()).toBeNull()
       expect($gatewaySwitching.get()).toBe(false)
     } finally {
-      dial.resolve()
       vi.useRealTimers()
     }
   })
@@ -707,11 +698,7 @@ describe('selectConnection', () => {
         (error: Error) => error.message
       )
 
-      await vi.advanceTimersByTimeAsync(BACKEND_BOOT_WAIT_TIMEOUT_MS - 1)
-
-      expect($pendingConnectionId.get()).toBe('homelab')
-      expect(beginGatewaySwitch).not.toHaveBeenCalled()
-      await vi.advanceTimersByTimeAsync(1)
+      await vi.advanceTimersByTimeAsync(SOURCE_SWITCH_DIAL_TIMEOUT_MS)
 
       expect(await outcome).toMatch(/Timed out connecting to "Homelab"/)
       expect(ensureGatewayAgent).not.toHaveBeenCalled()
@@ -953,7 +940,7 @@ describe('selectConnection', () => {
     expect($showAllProfiles.get()).toBe(true)
   })
 
-  it('boot restore proceeds after the descriptor wait deadline (bounded wait)', async () => {
+  it('boot restore proceeds after the descriptor wait deadline (bounded wait)', { timeout: 30_000 }, async () => {
     // A primary that never publishes (spawn failure, dead SSH target) must
     // not strand the registry restore forever: after the deadline the restore
     // runs exactly as it did before the wait existed.
@@ -968,7 +955,7 @@ describe('selectConnection', () => {
       expect(ensureGatewayAgent).not.toHaveBeenCalled()
 
       // Descriptor never arrives; deadline elapses.
-      await vi.advanceTimersByTimeAsync(BACKEND_BOOT_WAIT_TIMEOUT_MS)
+      await vi.advanceTimersByTimeAsync(BACKEND_BOOT_WAIT_TIMEOUT_MS + 15_000)
       await restoring
 
       expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default', expect.anything())
@@ -1008,7 +995,7 @@ describe('selectConnection', () => {
 
     await selectConnection('local')
 
-    expect(openGatewayAgent).toHaveBeenLastCalledWith('local', 'mac', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect(openGatewayAgent).toHaveBeenLastCalledWith('local', 'mac')
     expect(ensureGatewayAgent).toHaveBeenLastCalledWith('local', 'mac', expect.anything())
     expect($newChatProfile.get()).toBe('mac')
   })

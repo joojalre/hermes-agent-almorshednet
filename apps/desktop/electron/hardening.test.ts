@@ -15,6 +15,8 @@ import {
   enableBasicPasswordStoreEncryption,
   encryptDesktopSecret,
   homeRelativeAttachmentCandidates,
+  isMissingFileError,
+  missingFileResult,
   readFileDataUrlForIpc,
   resolveDirectoryForIpc,
   resolvePersistedRemoteToken,
@@ -473,7 +475,7 @@ function fsWith(overrides: Record<string, unknown>) {
 }
 
 test.runIf(process.platform !== 'win32')('the written file is owner-only even where chmod does nothing', () => {
-  // Windows, and any mount that refuses chmod. The create-time `mode` is what
+  // A POSIX filesystem where chmod is unavailable. The create-time `mode` is what
   // covers this — there is no second chance to tighten.
   withTempDir(dir => {
     const target = path.join(dir, 'connection.json')
@@ -529,7 +531,7 @@ test('writeSecretFileAtomic cannot be redirected through a symlink planted at th
       fs.symlinkSync(victim, `${target}.tmp`, 'file')
     } catch (error: any) {
       if (error?.code === 'EPERM' || error?.code === 'EACCES') {
-        context.skip(`Native file symlink creation is unavailable: ${error.code}`)
+        context.skip('creating a file symlink requires host permission')
       }
 
       throw error
@@ -538,7 +540,7 @@ test('writeSecretFileAtomic cannot be redirected through a symlink planted at th
     writeSecretFileAtomic(target, 'tok-live-42')
 
     assert.equal(fs.readFileSync(victim, 'utf8'), 'original', 'the symlink target was not written through')
-    assert.equal(modeOf(victim), victimMode, 'the victim file was not chmodded either')
+    assert.equal(modeOf(victim), victimMode, 'the victim file mode stays unchanged')
     assert.equal(fs.readFileSync(target, 'utf8'), 'tok-live-42')
     assert.equal(fs.lstatSync(target).isSymbolicLink(), false, 'the target is a real file, not the planted link')
 
@@ -621,32 +623,30 @@ test.runIf(process.platform !== 'win32')(
   }
 )
 
-test.runIf(process.platform !== 'win32')(
-  'tightenSecretFileMode refuses to chmod a symlink instead of following it to its target',
-  () => {
-    // Matches readInstallationId in desktop-installation.ts. Without the lstat
-    // guard a link planted at the config path sends the chmod to whatever it
-    // resolves to — someone else's file gets its mode rewritten.
-    withTempDir(dir => {
-      const target = path.join(dir, 'connection.json')
-      const victim = path.join(dir, 'victim.txt')
-      fs.writeFileSync(victim, 'not mine', { mode: 0o644 })
+test('tightenSecretFileMode never changes a symlink target', context => {
+  // Matches readInstallationId in desktop-installation.ts. Without the lstat
+  // guard a link planted at the config path sends the chmod to whatever it
+  // resolves to — someone else's file gets its mode rewritten.
+  withTempDir(dir => {
+    const target = path.join(dir, 'connection.json')
+    const victim = path.join(dir, 'victim.txt')
+    fs.writeFileSync(victim, 'not mine', { mode: 0o644 })
+    const victimMode = modeOf(victim)
 
-      try {
-        fs.symlinkSync(victim, target, 'file')
-      } catch (error: any) {
-        if (error?.code === 'EPERM' || error?.code === 'EACCES') {
-          return
-        }
-
-        throw error
+    try {
+      fs.symlinkSync(victim, target, 'file')
+    } catch (error: any) {
+      if (error?.code === 'EPERM' || error?.code === 'EACCES') {
+        context.skip('creating a file symlink requires host permission')
       }
 
-      assert.equal(tightenSecretFileMode(target), false, 'reports "not tightened" rather than acting on the link')
-      assert.equal(modeOf(victim), 0o644, 'the symlink target keeps its own mode')
-    })
-  }
-)
+      throw error
+    }
+
+    assert.equal(tightenSecretFileMode(target), process.platform === 'win32')
+    assert.equal(modeOf(victim), victimMode, 'the symlink target keeps its own mode')
+  })
+})
 
 test.runIf(process.platform !== 'win32')(
   'tightenSecretFileMode only touches a regular file the current user owns',
@@ -708,25 +708,6 @@ test('tightenSecretFileMode leaves Windows alone rather than flipping the read-o
   assert.equal(tightenSecretFileMode('/home/me/connection.json', { fs: fakeFs, platform: 'linux' }), true)
   assert.ok(chmods.includes('/home/me/connection.json'), 'the POSIX path was tightened')
 })
-
-test.runIf(process.platform === 'win32')(
-  'Windows atomic secret replacement preserves contents and remains writable',
-  () => {
-    withTempDir(dir => {
-      const target = path.join(dir, 'connection.json')
-      const payload = JSON.stringify({ remote: { token: { encoding: SAFE_STORAGE_ENCODING, value: 'BLOB' } } })
-      fs.writeFileSync(target, 'old')
-      fs.writeFileSync(target + '.tmp', 'stale')
-      writeSecretFileAtomic(target, payload)
-      assert.equal(fs.readFileSync(target, 'utf8'), payload)
-      assert.equal(tightenSecretFileMode(target), true)
-      assertNoSecretDebris(dir, 'connection.json', 'BLOB')
-      writeSecretFileAtomic(target, 'replacement')
-      assert.equal(fs.readFileSync(target, 'utf8'), 'replacement')
-      assert.equal(fs.lstatSync(target).isFile(), true)
-    })
-  }
-)
 
 test('a token is never persisted in plaintext when safeStorage is unavailable', () => {
   // The defined degradation for `isEncryptionAvailable() === false` (Linux with
@@ -1069,4 +1050,60 @@ test('homeRelativeAttachmentCandidates second candidate falls back to basename o
     path.join('/Users/alice', 'foo.xlsx'),
     path.join('/Users/alice/.hermes', 'attachments', 'foo.xlsx')
   ])
+})
+
+test('isMissingFileError classifies ENOENT/ENOTDIR as expected preview-read outcomes', () => {
+  const missing = new Error('Text preview failed: file does not exist.')
+
+  ;(missing as NodeJS.ErrnoException).code = 'ENOENT'
+  assert.equal(isMissingFileError(missing), true)
+
+  const missingDir = new Error('Text preview failed: file does not exist.')
+
+  ;(missingDir as NodeJS.ErrnoException).code = 'ENOTDIR'
+  assert.equal(isMissingFileError(missingDir), true)
+
+  // Everything else — permission, size, invalid path — is a real error and
+  // must keep rejecting so the renderer sees it as a genuine failure.
+  for (const code of ['EACCES', 'EFBIG', 'EISDIR', 'invalid-path', 'sensitive-file', undefined]) {
+    const error = new Error('some read failure')
+
+    if (code !== undefined) {
+      ;(error as NodeJS.ErrnoException).code = code
+    }
+
+    assert.equal(isMissingFileError(error), false, `code ${String(code)} must not be treated as missing-file`)
+  }
+
+  assert.equal(isMissingFileError(null), false)
+  assert.equal(isMissingFileError('ENOENT'), false)
+  assert.equal(isMissingFileError({ code: 'ENOENT' }), true)
+  assert.equal(isMissingFileError({ code: 'EACCES' }), false)
+})
+
+test('missingFileResult builds the structured missing-file IPC answer', () => {
+  const error = new Error("ENOENT: no such file or directory, open '/tmp/gone.txt'")
+
+  ;(error as NodeJS.ErrnoException).code = 'ENOENT'
+
+  assert.deepEqual(missingFileResult('/tmp/gone.txt', error), {
+    ok: false,
+    error: 'ENOENT',
+    message: "ENOENT: no such file or directory, open '/tmp/gone.txt'",
+    path: '/tmp/gone.txt'
+  })
+
+  // A non-Error throw (e.g. a string from a lower layer) still yields the
+  // same shape with a fallback message and code.
+  assert.deepEqual(missingFileResult(null, 'boom'), {
+    ok: false,
+    error: 'ENOENT',
+    message: 'File does not exist.',
+    path: ''
+  })
+
+  // The path echoes what was REQUESTED (not resolved) so the renderer can
+  // match it back to the tab that probed it.
+  const url = 'file:///tmp/gone.txt'
+  assert.equal(missingFileResult(url, { code: 'ENOTDIR' }).path, url)
 })

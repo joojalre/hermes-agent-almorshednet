@@ -78,25 +78,16 @@ def _path_from_file_uri(uri: str) -> Path | None:
     if not raw:
         return None
 
-    # Parse native drive paths before ``urlparse`` mistakes ``C:`` for a URI scheme.
-    # ``C:relative.md`` is drive-relative on Windows, not a local absolute path;
-    # never turn it into an attachable resource.
-    decoded_raw = unquote(raw)
-    is_windows_drive_path = (
-        len(raw) >= 3
-        and raw[0].isalpha()
-        and raw[1] == ":"
-        and raw[2] in "/\\"
-    )
-    if is_windows_drive_path:
-        path_text = decoded_raw
-    else:
-        parsed = urlparse(raw)
-        if parsed.scheme and parsed.scheme != "file":
-            return None
-        if parsed.scheme == "file" and parsed.netloc and parsed.netloc not in {"", "localhost"}:
-            return None
-        path_text = unquote(parsed.path or "") if parsed.scheme == "file" else unquote(raw)
+    # urlparse treats a bare Windows drive as a URI scheme.
+    if len(raw) >= 3 and raw[0].isalpha() and raw[1] == ":" and raw[2] in "/\\":
+        raw = "file:///" + raw.replace("\\", "/")
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.scheme != "file":
+        return None
+
+    if parsed.scheme == "file" and parsed.netloc and parsed.netloc not in {"", "localhost"}:
+        return None
+    path_text = unquote(parsed.path or "") if parsed.scheme == "file" else unquote(raw)
 
     # file:///C:/Users/... or C:\Users\...
     if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():

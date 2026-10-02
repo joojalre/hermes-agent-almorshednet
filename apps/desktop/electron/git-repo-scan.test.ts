@@ -50,6 +50,13 @@ describe('scanGitRepos', () => {
     expect(read).not.toHaveBeenCalled()
   })
 
+  it('does not fall back to scanning the home directory when roots are empty (#53328)', async () => {
+    const read = vi.spyOn(fs.promises, 'readdir')
+
+    await expect(scanGitRepos([], { enabled: true })).resolves.toEqual([])
+    expect(read).not.toHaveBeenCalled()
+  })
+
   it('scans only configured roots and excludes complete subtrees', async () => {
     const root = tempDir()
     const included = path.join(root, 'included')
@@ -74,8 +81,8 @@ describe('scanGitRepos', () => {
   })
 })
 
-describe('macOS TCC-protected media exclusions (issue #57611 salvage)', () => {
-  it.runIf(process.platform === 'darwin')('finds a normal repo but skips root-level media folders on darwin', async () => {
+describe.runIf(process.platform !== 'win32')('macOS TCC-protected media exclusions (issue #57611 salvage)', () => {
+  it('finds a normal repo but skips root-level media folders on darwin', async () => {
     const root = tempDir()
     const dev = makeRepoAt(root, 'dev', 'proj')
     makeRepoAt(root, 'Pictures', 'wallpapers')
@@ -86,14 +93,14 @@ describe('macOS TCC-protected media exclusions (issue #57611 salvage)', () => {
     expect(foundRoots(await scanGitRepos([root], { enabled: true, platform: 'darwin' }))).toEqual([dev])
   })
 
-  it.runIf(process.platform === 'darwin')('still scans a media-named directory below the search root on darwin', async () => {
+  it('still scans a media-named directory below the search root on darwin', async () => {
     const root = tempDir()
     const nested = makeRepoAt(root, 'dev', 'Music', 'app')
 
     expect(foundRoots(await scanGitRepos([root], { enabled: true, platform: 'darwin' }))).toEqual([nested])
   })
 
-  it.runIf(process.platform === 'darwin')('skips Apple media-library packages at any depth on darwin', async () => {
+  it('skips Apple media-library packages at any depth on darwin', async () => {
     const root = tempDir()
     const keeper = makeRepoAt(root, 'code', 'site')
     makeRepoAt(root, 'code', 'Photos Library.photoslibrary', 'inner')
@@ -104,7 +111,7 @@ describe('macOS TCC-protected media exclusions (issue #57611 salvage)', () => {
     expect(foundRoots(await scanGitRepos([root], { enabled: true, platform: 'darwin' }))).toEqual([keeper])
   })
 
-  it.runIf(process.platform === 'darwin')('walks an explicitly passed media root on darwin', async () => {
+  it('walks an explicitly passed media root on darwin', async () => {
     const root = tempDir()
     const musicRoot = path.join(root, 'Music')
     const repo = makeRepoAt(musicRoot, 'samples')
@@ -112,12 +119,12 @@ describe('macOS TCC-protected media exclusions (issue #57611 salvage)', () => {
     expect(foundRoots(await scanGitRepos([musicRoot], { enabled: true, platform: 'darwin' }))).toEqual([repo])
   })
 
-  it.runIf(process.platform !== 'darwin')('does not exclude media-named folders on the native non-macOS host', async () => {
+  it('does not exclude media-named folders on linux', async () => {
     const root = tempDir()
     const dev = makeRepoAt(root, 'dev', 'proj')
     const music = makeRepoAt(root, 'Music', 'samples')
 
-    expect(foundRoots(await scanGitRepos([root], { enabled: true }))).toEqual([dev, music].sort())
+    expect(foundRoots(await scanGitRepos([root], { enabled: true, platform: 'linux' }))).toEqual([dev, music].sort())
   })
 })
 

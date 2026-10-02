@@ -60,7 +60,8 @@ def test_standard_python_runner_has_bounded_workers() -> None:
 def test_standard_nix_runner_has_bounded_parallelism() -> None:
     workflow = _read(".github/workflows/nix.yml")
     assert "runs-on: ubuntu-latest" in workflow
-    assert "nix flake check --print-build-logs --max-jobs 2" in workflow
+    flake_check = next(line for line in workflow.splitlines() if "run: nix flake check" in line)
+    assert flake_check.rstrip().endswith("--print-build-logs --max-jobs 2")
     assert "timeout-minutes: 90" in workflow
 
 
@@ -69,15 +70,16 @@ def test_standard_nix_runner_has_bounded_parallelism() -> None:
     ".github/workflows/nix.yml",
 ])
 def test_validation_workflows_accept_manual_runs(relative) -> None:
-    yaml = pytest.importorskip("yaml")
-    # BaseLoader keeps the YAML key `on` as text instead of YAML 1.1's boolean.
-    workflow = yaml.load(_read(relative), Loader=yaml.BaseLoader)
-    assert set(workflow["on"]) == {"pull_request", "push", "workflow_dispatch"}
-    assert workflow["on"]["push"]["branches"] == ["main"]
+    import hermes_yaml
+
+    workflow = hermes_yaml.safe_load(_read(relative))
+    triggers = workflow.get("on", workflow.get(True))  # YAML 1.1 reads the bare key `on` as True
+    assert {"pull_request", "push", "workflow_dispatch"} <= set(triggers)
+    assert triggers["push"]["branches"] == ["main"]
 
 
 def test_manual_nix_cache_is_main_only_without_delete_permissions() -> None:
-    yaml = pytest.importorskip("yaml")
+    import hermes_yaml as yaml
     workflow = yaml.safe_load(_read(".github/workflows/nix.yml"))
     assert workflow["permissions"] == {"contents": "read"}
     cache_steps = [
@@ -93,7 +95,7 @@ def test_manual_nix_cache_is_main_only_without_delete_permissions() -> None:
 
 
 def test_detect_action_only_receives_declared_inputs() -> None:
-    yaml = pytest.importorskip("yaml")
+    import hermes_yaml as yaml
     action = yaml.safe_load(_read(".github/actions/detect-changes/action.yml"))
     workflow = yaml.safe_load(_read(".github/workflows/ci.yaml"))
     callers = [

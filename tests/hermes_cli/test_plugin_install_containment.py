@@ -5,12 +5,20 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import plugins_cmd as pc
+from hermes_cli import plugins_cmd_install as pci
+
+
+def _isolated_plugins_dir(tmp_path, monkeypatch):
+    """Publication only accepts plugin targets inside the dependency home, so the
+    staged install uses a real temp ``HERMES_HOME`` rather than a patched directory."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    return pc._plugins_dir()
+
 
 
 @pytest.mark.parametrize("target_kind", ["file", "directory", "missing"])
 def test_install_rejects_external_links_before_probing(tmp_path, monkeypatch, target_kind):
-    plugins_dir = tmp_path / "plugins"
-    plugins_dir.mkdir()
+    plugins_dir = _isolated_plugins_dir(tmp_path, monkeypatch)
     outside = tmp_path / "outside"
     if target_kind == "directory":
         outside.mkdir()
@@ -24,15 +32,14 @@ def test_install_rejects_external_links_before_probing(tmp_path, monkeypatch, ta
         (staging / "escape").symlink_to(outside, target_is_directory=target_kind == "directory")
         return "a" * 40
 
-    real_probe = pc._probe_readable
+    real_probe = pci._probe_readable
 
     def probe_inside_only(path):
         assert path.resolve().is_relative_to(plugins_dir), "probed an external link target"
         real_probe(path)
 
-    monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
     monkeypatch.setattr(pc, "_clone_plugin_repo", clone)
-    monkeypatch.setattr(pc, "_probe_readable", probe_inside_only)
+    monkeypatch.setattr(pci, "_probe_readable", probe_inside_only)
 
     with pytest.raises(pc.PluginOperationError, match="escapes the plugin tree"):
         pc._install_plugin_core("https://github.com/example/bounded", force=False)
@@ -45,8 +52,7 @@ def test_install_rejects_external_links_before_probing(tmp_path, monkeypatch, ta
 
 
 def test_install_preserves_readable_internal_links(tmp_path, monkeypatch):
-    plugins_dir = tmp_path / "plugins"
-    plugins_dir.mkdir()
+    _isolated_plugins_dir(tmp_path, monkeypatch)
 
     def clone(staging, *_args):
         staging.mkdir()
@@ -57,7 +63,6 @@ def test_install_preserves_readable_internal_links(tmp_path, monkeypatch):
         (staging / "assets-link").symlink_to("assets", target_is_directory=True)
         return "a" * 40
 
-    monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
     monkeypatch.setattr(pc, "_clone_plugin_repo", clone)
 
     target, manifest, name = pc._install_plugin_core("https://github.com/example/bounded", force=False)

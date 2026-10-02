@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-pytestmark = pytest.mark.windows_only
+pytestmark = pytest.mark.platforms("windows")  # live Windows background-executor E2E
 
 
 @pytest.fixture()
@@ -104,7 +104,6 @@ class TestWindowsSpawnParity:
         assert session.systemd_unit == ""
 
 
-@pytest.mark.windows_only
 def test_pty_close_reports_unsupported_without_injecting_input(registry, tmp_path):
     """Native Windows input stays writable, but unsupported EOF must not write Ctrl-D."""
     code = (
@@ -145,7 +144,6 @@ def test_pty_close_reports_unsupported_without_injecting_input(registry, tmp_pat
             registry.kill_process(session.id)
 
 
-@pytest.mark.windows_only
 @pytest.mark.parametrize("operation", ["poll", "wait", "list_sessions"])
 def test_exited_child_status_does_not_wait_for_inherited_pipe(
     registry, tmp_path, operation

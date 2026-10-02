@@ -26,16 +26,83 @@ import * as path from 'node:path'
 
 import { _electron, type ElectronApplication, type Page } from '@playwright/test'
 
+import { waitForChatReady } from '../../../tests-js/scripts/desktop-chat-smoke'
+import { writeEnvFile, writeMockProviderConfig } from '../../../tests-js/scripts/mock-provider-config'
+
+// Specs that build their own sandbox reuse the same inert mock-provider writers.
+export { writeEnvFile, writeMockProviderConfig }
 import { type MockServerOptions, startMockServer } from '../../../tests-js/scripts/mock-server'
 
 import { resolveElectronBinary } from './electron-binary'
-import { buildAppEnvFromParent } from './fixtures-env'
 import { installErrorBannerGuard } from './test'
-import { waitForPageWindowVisible } from './window-visibility'
 
 const DESKTOP_ROOT = path.resolve(import.meta.dirname, '..')
 const REPO_ROOT = path.resolve(DESKTOP_ROOT, '..', '..')
 const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
+
+// ─── Credential stripping (matches launch.spec.ts) ──────────────────────
+
+const CREDENTIAL_SUFFIXES: string[] = [
+  '_API_KEY',
+  '_TOKEN',
+  '_SECRET',
+  '_PASSWORD',
+  '_CREDENTIALS',
+  '_ACCESS_KEY',
+  '_PRIVATE_KEY',
+  '_OAUTH_TOKEN',
+]
+
+const CREDENTIAL_NAMES = new Set([
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_TOKEN',
+  'AWS_ACCESS_KEY_ID',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'CUSTOM_API_KEY',
+  'GEMINI_BASE_URL',
+  'OPENAI_BASE_URL',
+  'OPENROUTER_BASE_URL',
+  'OLLAMA_BASE_URL',
+  'GROQ_BASE_URL',
+  'XAI_BASE_URL',
+])
+
+function isCredentialEnvVar(name: string): boolean {
+  if (CREDENTIAL_NAMES.has(name)) {
+    return true
+  }
+
+  return CREDENTIAL_SUFFIXES.some((suffix) => name.endsWith(suffix))
+}
+
+// Runtime state of whatever Hermes launched this run. A spec driven from inside
+// an agent's terminal inherits HERMES_YOLO_MODE, HERMES_INTERACTIVE,
+// HERMES_SESSION_ID…, and the sandboxed backend then skips approvals or binds
+// the caller's session — the approval spec failed locally on the leaked yolo
+// flag while CI (which never has these) stayed green. The fixtures set every
+// HERMES_* the app needs themselves; only the harness's own knobs pass.
+function isInheritedHermesRuntimeVar(name: string): boolean {
+  return name.startsWith('HERMES_') && !name.startsWith('HERMES_DESKTOP_') && !name.startsWith('HERMES_E2E_')
+}
+
+function stripCredentials(env: Record<string, string | undefined>): Record<string, string> {
+  const clean: Record<string, string> = {}
+
+  for (const [key, value] of Object.entries(env)) {
+    if (!value) {
+      continue
+    }
+
+    if (isCredentialEnvVar(key) || isInheritedHermesRuntimeVar(key)) {
+      continue
+    }
+
+    clean[key] = value
+  }
+
+  return clean
+}
 
 // ─── Sandbox creation ──────────────────────────────────────────────────
 
@@ -61,8 +128,12 @@ export function createSandbox(prefix: string): Sandbox {
   // may resize after launch.
   fs.writeFileSync(
     path.join(userDataDir, 'window-state.json'),
-    JSON.stringify({ x: 0, y: 0, width: 1220, height: 800, isMaximized: false }, null, 2),
-    'utf8'
+    JSON.stringify(
+      { x: 0, y: 0, width: 1220, height: 800, isMaximized: false },
+      null,
+      2,
+    ),
+    'utf8',
   )
 
   // Pin Chromium actual-size zoom (level 0) for the suite. Fresh installs
@@ -70,7 +141,11 @@ export function createSandbox(prefix: string): Sandbox {
   // click hit-testing and the committed visual baselines were calibrated at
   // 100%. Without this file every sandbox would inherit the product default
   // and fail pointer interception + snapshot diffs.
-  fs.writeFileSync(path.join(userDataDir, 'zoom-state.json'), JSON.stringify({ zoomLevel: 0 }, null, 2), 'utf8')
+  fs.writeFileSync(
+    path.join(userDataDir, 'zoom-state.json'),
+    JSON.stringify({ zoomLevel: 0 }, null, 2),
+    'utf8',
+  )
 
   return {
     root,
@@ -82,80 +157,12 @@ export function createSandbox(prefix: string): Sandbox {
       } catch {
         // best-effort
       }
-    }
+    },
   }
 }
 
 // ─── Config writing ─────────────────────────────────────────────────────
 
-/**
- * Write a config.yaml that pre-configures a mock provider pointing at the
- * mock inference server. The provider is set as the active model provider so
- * the desktop app skips onboarding and boots straight to the chat UI.
- *
- * @param extraDisplayConfig optional YAML lines appended to the `display:`
- *   section, used by the interim-message e2e test.
- * @param extraConfig optional top-level YAML sections for a test scenario.
- * @param modelContextLength optional primary-model context limit.
- */
-export function writeMockProviderConfig(
-  hermesHome: string,
-  mockUrl: string,
-  extraDisplayConfig?: string,
-  extraConfig?: string,
-  modelContextLength?: number
-): void {
-  const configPath = path.join(hermesHome, 'config.yaml')
-
-  const displaySection = extraDisplayConfig ? `\ndisplay:\n${extraDisplayConfig}\n` : ''
-
-  // Title generation rides the MAIN model since 87af576e60 (#83636), so every
-  // completed turn fires an extra background /v1/chat/completions at the mock.
-  // That request contains the whole conversation — trigger keywords included —
-  // which advances the mock's scripted-turn indices and trips hold-for-prompt
-  // matchers from a request no spec ever sent. Disable it by default (no e2e
-  // spec asserts on session titles); a test that passes its own `auxiliary:`
-  // section via extraConfig owns the whole section instead.
-  const autoTitleDefault = extraConfig?.includes('auxiliary:')
-    ? ''
-    : 'auxiliary:\n  title_generation:\n    enabled: false\n'
-
-  // The scripted turns run REAL terminal commands, and anything the guard
-  // classifies as dangerous (e.g. the sidebar sentinel-wait loop) parks the
-  // turn behind a Run/Reject approval card. The default 'smart' mode then
-  // fires an aux LLM approval call at the SAME mock provider — consuming a
-  // scripted-turn index and never resolving — so the turn stalls until the
-  // spec times out (the CI failure mode for the sidebar-dot family). No e2e
-  // spec asserts on the approval flow, so run gate-free by default; a test
-  // that passes its own `approvals:` section via extraConfig owns it.
-  const approvalsDefault = extraConfig?.includes('approvals:') ? '' : 'approvals:\n  mode: "off"\n'
-
-  const config = `# Auto-generated by E2E test fixtures
-model:
-  default: mock-model
-  provider: mock
-${modelContextLength ? `  context_length: ${modelContextLength}\n` : ''}providers:
-  mock:
-    api: ${mockUrl}/v1
-    name: Mock
-    api_mode: chat_completions
-    key_env: MOCK_API_KEY
-    models:
-      mock-model: {}
-    context_length: 64000
-${autoTitleDefault}${approvalsDefault}${displaySection}${extraConfig ? `\n${extraConfig.trim()}\n` : ''}`
-
-  fs.writeFileSync(configPath, config, 'utf8')
-}
-
-/**
- * Write a minimal .env with the mock API key. The key_env in config.yaml
- * references MOCK_API_KEY, so the backend resolves credentials from here.
- */
-export function writeEnvFile(hermesHome: string, apiKey = 'e2e-mock-key'): void {
-  const envPath = path.join(hermesHome, '.env')
-  fs.writeFileSync(envPath, `MOCK_API_KEY=${apiKey}\n`, 'utf8')
-}
 
 /**
  * Write an empty config (no providers). The desktop app should show the
@@ -174,14 +181,50 @@ function writeEmptyConfig(hermesHome: string): void {
  * Key env vars:
  *  - HERMES_HOME → sandbox hermes-home (isolated config/sessions)
  *  - HERMES_DESKTOP_USER_DATA_DIR → sandbox electron-user-data
- *  - HERMES_DESKTOP_IGNORE_EXISTING=1 → don't pick up `hermes` from PATH
+ *  - HERMES_DESKTOP_IGNORE_EXISTING=1 → skip the installed runtime
  *    (we want the dev checkout at REPO_ROOT)
  *  - HERMES_DESKTOP_HERMES_ROOT → REPO_ROOT (dev checkout resolution)
  *  - HERMES_DESKTOP_APP_NAME → unique-ish per test (avoids single-instance lock)
  *  - XDG_RUNTIME_DIR → ensure Electron has a writable runtime dir on Linux
  */
 export function buildAppEnv(sandbox: Sandbox, extra: Record<string, string> = {}): Record<string, string> {
-  return buildAppEnvFromParent(process.env, sandbox, REPO_ROOT, extra)
+  const clean = stripCredentials(process.env)
+
+  // XDG_RUNTIME_DIR is needed for Electron on Linux when running in a
+  // headless/CI context — without it the zygote may fail to initialize.
+  if (!clean.XDG_RUNTIME_DIR && process.env.XDG_RUNTIME_DIR) {
+    clean.XDG_RUNTIME_DIR = process.env.XDG_RUNTIME_DIR
+  }
+
+  // DISPLAY — needed for Electron to open a window.
+  if (!clean.DISPLAY && process.env.DISPLAY) {
+    clean.DISPLAY = process.env.DISPLAY
+  }
+
+  return {
+    ...clean,
+    HERMES_HOME: sandbox.hermesHome,
+    HERMES_DESKTOP_USER_DATA_DIR: sandbox.userDataDir,
+    HERMES_DESKTOP_IGNORE_EXISTING: '1',
+    // One `hermes serve` per host, and profile roots are HOME-anchored
+    // (`~/.hermes/profiles`, the default profile's own home): without both of
+    // these a local e2e run attaches to the developer's running backend or
+    // lists and writes their real profiles, and chats through their real
+    // model and state.db instead of the sandbox + mock provider. CI never has
+    // either, so only local runs ever took that path.
+    HERMES_DESKTOP_ISOLATED_BACKEND: '1',
+    HOME: sandbox.root,
+    HERMES_DESKTOP_HERMES_ROOT: REPO_ROOT,
+    HERMES_DESKTOP_APP_NAME: `HermesE2E-${Date.now()}`,
+    // `app.close()` in teardown must exit even when a spec leaves a turn
+    // mid-flight — otherwise the quit confirmation waits on a click that no
+    // one is there to make, and the worker dies on a teardown timeout.
+    HERMES_DESKTOP_SKIP_QUIT_CONFIRM: '1',
+    // Clear dev-server override — we want the built dist/, not a vite server.
+    // The dev-server check in main.ts looks for this env var; if it's set,
+    // it loads from the vite URL instead of the local file.
+    ...extra,
+  }
 }
 
 // ─── Electron launch ────────────────────────────────────────────────────
@@ -198,13 +241,15 @@ function assertDistBuilt(): void {
 
   if (!fs.existsSync(electronMain)) {
     throw new Error(
-      `Desktop dist not built. Run 'cd apps/desktop && npm run build' first.\n` + `Missing: ${electronMain}`
+      `Desktop dist not built. Run 'cd apps/desktop && npm run build' first.\n` +
+        `Missing: ${electronMain}`,
     )
   }
 
   if (!fs.existsSync(indexHtml)) {
     throw new Error(
-      `Desktop dist/index.html not found. Run 'cd apps/desktop && npm run build' first.\n` + `Missing: ${indexHtml}`
+      `Desktop dist/index.html not found. Run 'cd apps/desktop && npm run build' first.\n` +
+        `Missing: ${indexHtml}`,
     )
   }
 }
@@ -230,13 +275,12 @@ export function findElectron(): string {
  *
  * @param sandbox  - isolated HERMES_HOME + userData
  * @param env      - the process environment (already has HERMES_HOME etc.)
- * @param onLaunched - optional early handle for specs that own setup-failure cleanup
  * @returns the ElectronApplication + first Page
  */
 export async function launchDesktop(
   env: Record<string, string>,
   onLaunched?: (app: ElectronApplication) => void,
-  launchArgs: readonly string[] = []
+  launchArgs: readonly string[] = [],
 ): Promise<{ app: ElectronApplication; page: Page }> {
   assertDistBuilt()
 
@@ -250,31 +294,15 @@ export async function launchDesktop(
       DESKTOP_ROOT, // `electron .` — the `.` is the desktop package dir
       '--disable-gpu',
       '--no-sandbox',
-      ...launchArgs
+      ...launchArgs,
     ],
     env,
-    cwd: DESKTOP_ROOT
+    cwd: DESKTOP_ROOT,
   })
 
   // Lifecycle-owning specs need the handle even if firstWindow fails.
   onLaunched?.(app)
   const page = await app.firstWindow()
-
-  if (env.HERMES_DESKTOP_APP_NAME?.startsWith('HermesE2E')) {
-    // Clearly distinguish only our owned test windows. Keep document.title
-    // and renderer/tab captions untouched; retain the native title after a
-    // single prefix even when Chromium later updates the page title.
-    await app.evaluate(({ BrowserWindow }) => {
-      for (const window of BrowserWindow.getAllWindows()) {
-        const label = (title: string) => (title.startsWith('[E2E] ') ? title : `[E2E] ${title}`)
-        window.setTitle(label(window.getTitle()))
-        window.on('page-title-updated', (event, title) => {
-          event.preventDefault()
-          window.setTitle(label(title))
-        })
-      }
-    })
-  }
 
   // Install the error-banner guard so any [role="alert"] that appears
   // during a test is collected and surfaced in afterEach.
@@ -296,6 +324,10 @@ export interface MockBackendFixture {
 
 export interface MockBackendOptions {
   /**
+   * Script and stream behavior for the mock inference server.
+   */
+  mockServer?: MockServerOptions
+  /**
    * Optional YAML lines to inject under the `display:` section of the
    * generated config.yaml. Used by the interim-message e2e test to toggle
    * `display.interim_assistant_messages`.
@@ -305,8 +337,6 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
-  /** Customize the mock inference server for an E2E scenario. */
-  mockServer?: MockServerOptions
 }
 
 /**
@@ -316,6 +346,7 @@ export interface MockBackendOptions {
  *   3. Launch the desktop app
  *   4. Return handles for test interaction
  */
+
 export async function setupMockBackend(options: MockBackendOptions = {}): Promise<MockBackendFixture> {
   // 1. Start mock server
   const mock = await startMockServer(options.mockServer)
@@ -327,7 +358,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
     mock.url,
     options.extraDisplayConfig,
     options.extraConfig,
-    options.modelContextLength
+    options.modelContextLength,
   )
   writeEnvFile(sandbox.hermesHome)
 
@@ -345,7 +376,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
       await app.close().catch(() => undefined)
       await mock.close()
       sandbox.cleanup()
-    }
+    },
   }
 }
 
@@ -374,7 +405,7 @@ export async function setupNoProvider(): Promise<NoProviderFixture> {
     cleanup: async () => {
       await app.close().catch(() => undefined)
       sandbox.cleanup()
-    }
+    },
   }
 }
 
@@ -404,34 +435,13 @@ export interface DeadBackendOptions {
  */
 export async function setupDeadBackend(options: DeadBackendOptions = {}): Promise<DeadBackendFixture> {
   const sandbox = createSandbox('dead')
-  const configPath = path.join(sandbox.hermesHome, 'config.yaml')
-  fs.writeFileSync(
-    configPath,
-    `# Auto-generated by E2E test fixtures — dead provider
-model:
-  default: mock-model
-  provider: mock
-providers:
-  mock:
-    api: http://127.0.0.1:1/v1
-    name: Mock
-    api_mode: chat_completions
-    key_env: MOCK_API_KEY
-    models:
-      mock-model: {}
-    context_length: 64000
-`,
-    'utf8'
-  )
-  writeEnvFile(sandbox.hermesHome)
+  // Same writer the install-e2e harness uses, pointed at a dead endpoint: one
+  // shape for "an external OpenAI-compatible provider", never a named 'mock'.
+  const deadUrl = 'http://127.0.0.1:1'
+  writeMockProviderConfig(sandbox.hermesHome, deadUrl)
+  writeEnvFile(sandbox.hermesHome, 'e2e-mock-key', deadUrl)
 
-  const env = buildAppEnv(
-    sandbox,
-    options.fakeError
-      ? { HERMES_DESKTOP_BOOT_FAKE_ERROR: 'Failed to connect to Hermes backend: connection refused' }
-      : {}
-  )
-
+  const env = buildAppEnv(sandbox, options.fakeError ? { HERMES_DESKTOP_BOOT_FAKE_ERROR: 'Failed to connect to Hermes backend: connection refused' } : {})
   const { app, page } = await launchDesktop(env)
 
   return {
@@ -441,7 +451,7 @@ providers:
     cleanup: async () => {
       await app.close().catch(() => undefined)
       sandbox.cleanup()
-    }
+    },
   }
 }
 
@@ -474,148 +484,70 @@ export function packagedBinaryExists(): boolean {
 export interface PackagedAppFixture {
   app: ElectronApplication
   page: Page
-  mock: Awaited<ReturnType<typeof startMockServer>>
-  mockUrl: string
   sandbox: Sandbox
   cleanup: () => Promise<void>
 }
 
 /**
  * Launch the *packaged* Electron binary (from `npm run pack` →
- * `electron-builder --dir`) with a real isolated Hermes backend and a local
- * mock inference provider. The renderer stays packaged: the explicit backend
- * root only supplies the CLI runtime, while HERMES_HOME and user data stay in
- * the test sandbox.
+ * `electron-builder --dir`) with `BOOT_FAKE=1` so it simulates boot
+ * progress without spawning a real Hermes backend.
  *
  * Uses the same sandbox isolation (credential stripping, isolated
  * HERMES_HOME + userData, unique app name) as the dev-mode fixtures.
- * Worktrees without their own Python environment can opt in to a known test
- * interpreter via HERMES_E2E_PYTHON; it is mapped explicitly and never
- * inherited by the packaged child process.
  *
  * Skips if the packaged binary doesn't exist — run `npm run pack` first.
  */
 export async function setupPackagedApp(): Promise<PackagedAppFixture> {
   if (!packagedBinaryExists()) {
-    throw new Error(`Built app binary not found: ${PACKAGED_BINARY_PATH}. Run 'npm run pack' first.`)
+    throw new Error(
+      `Built app binary not found: ${PACKAGED_BINARY_PATH}. Run 'npm run pack' first.`,
+    )
   }
 
   const sandbox = createSandbox('packaged')
-  let mock: Awaited<ReturnType<typeof startMockServer>> | undefined
 
-  try {
-    const startedMock = await startMockServer()
-    mock = startedMock
-    writeMockProviderConfig(sandbox.hermesHome, startedMock.url)
-    writeEnvFile(sandbox.hermesHome)
+  // Build the sandbox env using the shared helpers, then add the
+  // packaged-binary-specific overrides.
+  const env = buildAppEnv(sandbox, {
+    // Fake boot: simulates progress steps without spawning the real backend.
+    HERMES_DESKTOP_BOOT_FAKE: '1',
+    HERMES_DESKTOP_BOOT_FAKE_STEP_MS: '120',
+  })
 
-    // buildAppEnv supplies this worktree as the explicit backend root. Keep
-    // that deliberate test seam, but remove renderer-mode overrides so the
-    // process loads app.asar instead of a Vite/dev renderer.
-    const e2ePython = process.env.HERMES_E2E_PYTHON
+  // Clear dev-server + hermes-root overrides — the packaged binary
+  // should use its own bundled renderer, not the dev checkout.
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_DEV_SERVER
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_HERMES
+  delete (env as Record<string, string | undefined>).HERMES_DESKTOP_HERMES_ROOT
 
-    const env = buildAppEnv(sandbox, e2ePython ? { HERMES_DESKTOP_PYTHON: e2ePython } : {})
+  const app = await _electron.launch({
+    executablePath: PACKAGED_BINARY_PATH,
+    args: ['--disable-gpu', '--no-sandbox'],
+    env,
+  })
 
-    delete (env as Record<string, string | undefined>).HERMES_DESKTOP_DEV_SERVER
-    delete (env as Record<string, string | undefined>).HERMES_DESKTOP_HERMES
-    delete (env as Record<string, string | undefined>).HERMES_DESKTOP_FORCE_DEV
+  const page = await app.firstWindow()
+  installErrorBannerGuard(page)
 
-    const app = await _electron.launch({
-      executablePath: PACKAGED_BINARY_PATH,
-      args: ['--disable-gpu', '--no-sandbox'],
-      env
-    })
-
-    const page = await app.firstWindow()
-    installErrorBannerGuard(page)
-
-    return {
-      app,
-      page,
-      mock: startedMock,
-      mockUrl: startedMock.url,
-      sandbox,
-      cleanup: async () => {
-        await app.close().catch(() => undefined)
-        await startedMock.close().catch(() => undefined)
-        sandbox.cleanup()
-      }
-    }
-  } catch (error) {
-    await mock?.close().catch(() => undefined)
-    sandbox.cleanup()
-    throw error
+  return {
+    app,
+    page,
+    sandbox,
+    cleanup: async () => {
+      await app.close().catch(() => undefined)
+      sandbox.cleanup()
+    },
   }
 }
 
 // ─── Wait helpers ──────────────────────────────────────────────────────
 
-/**
- * Wait for the desktop app to finish booting and show the main chat UI.
- *
- * The boot overlay disappears when `completeDesktopBoot()` fires in the
- * renderer — at that point the gateway is open, config is loaded, and
- * sessions are loaded. We detect this by waiting for the boot/connecting
- * overlay to become invisible and the main app shell to be present.
- *
- * Two things must both be true before we return:
- *  1. The composer (chat input) is visible — it's disabled until the
- *     gateway is open.
- *  2. No full-screen overlay (onboarding Preparing, connecting overlay,
- *     boot-failure) covers the viewport center. The composer can be
- *     "visible" in Playwright's eyes (non-zero bounding box, not
- *     display:none) even when a z-1300+ overlay is painted on top of it,
- *     so checking the composer alone catches the app mid-boot at ~92%
- *     with the loading bar still showing.
- */
-export async function waitForAppReady(
-  fixture: Pick<MockBackendFixture, 'app' | 'page'>,
-  timeoutMs = 60_000
-): Promise<void> {
+/** Composer readiness includes hit testing, so boot overlays cannot produce an early pass. */
+export async function waitForAppReady(fixture: Pick<MockBackendFixture, 'app' | 'page'>, timeoutMs = 60_000): Promise<void> {
   const { page, app } = fixture
 
-  // Wait for the composer to exist in the DOM (not necessarily interactive yet).
-  await page.waitForSelector('textarea, [contenteditable="true"]', {
-    state: 'attached',
-    timeout: timeoutMs
-  })
-
-  // Now poll until no full-screen overlay covers the viewport center.
-  // elementFromPoint returns the topmost element at a point — if it's part
-  // of a fixed inset-0 overlay (onboarding/connecting/boot-failure), the
-  // app isn't ready yet.
-  await page.waitForFunction(
-    () => {
-      const el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2)
-
-      if (!el) {
-        return false
-      }
-
-      // Walk up to the nearest positioned ancestor — overlays are
-      // `position: fixed; inset: 0`. If the hit element or an ancestor
-      // is a full-viewport fixed overlay, we're still covered.
-      let node: Element | null = el
-
-      while (node) {
-        const cs = window.getComputedStyle(node)
-
-        if (cs.position === 'fixed') {
-          const rect = node.getBoundingClientRect()
-
-          if (rect.left <= 0 && rect.top <= 0 && rect.right >= window.innerWidth && rect.bottom >= window.innerHeight) {
-            return false
-          }
-        }
-
-        node = node.parentElement
-      }
-
-      return true
-    },
-    undefined,
-    { timeout: timeoutMs }
-  )
+  await waitForChatReady(page, timeoutMs)
 
   // On Electron 40.x, ready-to-show may never fire (electron/electron#51972)
   // and the window stays hidden even though the DOM is rendered. The main
@@ -624,7 +556,18 @@ export async function waitForAppReady(
   // ready before that lands. Poll until the window is actually visible so
   // interactions (click, screenshot) don't hit a hidden surface.
   if (app) {
-    await waitForPageWindowVisible(app, page, timeoutMs)
+    const deadline = Date.now() + timeoutMs
+
+    while (Date.now() < deadline) {
+      const visible = await app.evaluate(({ BrowserWindow }) => {
+        const w = BrowserWindow.getAllWindows()[0]
+
+        return w ? w.isVisible() : false
+      }).catch(() => false)
+
+      if (visible) {break}
+      await page.waitForTimeout(500)
+    }
   }
 }
 
@@ -653,7 +596,7 @@ export async function waitForOnboarding(page: Page, timeoutMs = 60_000): Promise
       )
     },
     undefined,
-    { timeout: timeoutMs }
+    { timeout: timeoutMs },
   )
 }
 
@@ -684,6 +627,6 @@ export async function waitForBootFailure(page: Page, timeoutMs = 60_000): Promis
       return hasFailureUI || hasErrorToast
     },
     undefined,
-    { timeout: timeoutMs }
+    { timeout: timeoutMs },
   )
 }

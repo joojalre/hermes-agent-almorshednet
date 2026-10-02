@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -14,14 +15,14 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[2]
 def _ci_workflow() -> dict:
-    yaml = pytest.importorskip("yaml")
+    import hermes_yaml as yaml
     return yaml.safe_load(
         (_REPO / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
     )
 
 
 def _workflow(name: str) -> dict:
-    yaml = pytest.importorskip("yaml")
+    import hermes_yaml as yaml
     return yaml.safe_load(
         (_REPO / ".github/workflows" / name).read_text(encoding="utf-8")
     )
@@ -104,19 +105,20 @@ def test_required_gate_evaluates_validation_results(tmp_path, job_name, result, 
         step for step in steps if step.get("name") == "Evaluate job results"
     )
 
-    shell_command = evaluate["run"]
-    python_source = shell_command.split('python3 -c "', 1)[1].rsplit('"', 1)[0]
-    python_source = python_source.replace(r"\"", '"').replace(
-        "'$GITHUB_OUTPUT'", repr(str(tmp_path / "github-output"))
-    )
+    # Run the step's real command; it pipes ``toJSON(needs)`` into scripts/ci/required_results.py.
+    bash = shutil.which("bash")
+    assert bash, "The gate step is a Bash command"
     completed = subprocess.run(
-        [sys.executable, "-c", python_source],
+        [bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", evaluate["run"]],
         cwd=_REPO,
-        input=json.dumps({job_name: {"result": result}}),
         text=True,
         capture_output=True,
         check=False,
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        env={
+            **os.environ, "PYTHONIOENCODING": "utf-8", "RELEASE": "",
+            "NEEDS": json.dumps({job_name: {"result": result}}),
+            "GITHUB_OUTPUT": str(tmp_path / "github-output"),
+        },
     )
 
     assert completed.returncode == expected_exit, completed.stdout + completed.stderr

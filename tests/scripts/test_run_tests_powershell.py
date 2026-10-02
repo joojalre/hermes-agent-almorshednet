@@ -37,7 +37,7 @@ def _run_launcher(tmp_path: Path, exit_code: int = 0):
     return result, json.loads(capture.read_text())
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_native_runner_isolates_environment_and_preserves_arguments(tmp_path):
     result, captured = _run_launcher(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -54,7 +54,7 @@ def test_native_runner_isolates_environment_and_preserves_arguments(tmp_path):
     assert env["SYSTEMROOT"] == os.environ["SYSTEMROOT"]
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_native_runner_preserves_child_failure_exit_code(tmp_path):
     result, _ = _run_launcher(tmp_path, exit_code=37)
     assert result.returncode == 37

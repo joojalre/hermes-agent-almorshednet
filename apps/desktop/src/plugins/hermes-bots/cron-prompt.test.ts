@@ -13,13 +13,24 @@
 
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
-// eslint-disable-next-line no-restricted-imports -- Native test oracle only; the plugin never imports or exposes this capability.
-import { findGitBash } from '../../../electron/find-git-bash'
-
 import { isLegacyDelegatedRoutine, normalizedProfileName, routineInputError, routinePrompt } from './cron'
+
+/** Git for Windows' bash, the shell a Windows runner provides (System32\\bash.exe is the WSL launcher). */
+function windowsGitBash(): null | string {
+  for (const root of [process.env.ProgramFiles, process.env.ProgramW6432]) {
+    const candidate = root ? join(root, 'Git', 'bin', 'bash.exe') : null
+
+    if (candidate && existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  return null
+}
 
 /** Run the delegation command under a `hermes` stub that prints its argv, so
  *  the assertion is what the SHELL passed — not what the string looks like. */
@@ -30,9 +41,7 @@ function argvOf(prompt: string): string[] {
   // a real shell oracle on both hosts: string assertions cannot prove quoting.
   const isWindows = process.platform === 'win32'
 
-  const shell = isWindows
-    ? findGitBash({ isWindows, env: process.env, fileExists: existsSync })
-    : 'sh'
+  const shell = isWindows ? windowsGitBash() : 'sh'
 
   expect(shell, 'Git Bash is required for the Windows shell-quoting regression').not.toBeNull()
 

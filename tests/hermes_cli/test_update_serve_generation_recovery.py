@@ -471,6 +471,35 @@ def test_gateway_units_are_not_restarted_by_the_serve_pass(linux_systemctl):
     assert out == {"verified": [], "failed": []}
 
 
+def test_dashboard_unit_is_restarted_and_verified_by_the_serve_pass(linux_systemctl):
+    """#125297: a systemd-supervised dashboard is the same stale-generation risk
+    as a serve unit — the abort-recovery pass must enumerate and restart it too."""
+    fake = _Systemctl(
+        listed=["hermes-serve.service", "hermes-dashboard-work.service"],
+        active={"hermes-serve.service": True, "hermes-dashboard-work.service": True},
+        main_pids={"hermes-serve.service": 7, "hermes-dashboard-work.service": 8},
+    )
+    out = recovery.restart_serve_units(run=fake, sleep=lambda _: None)
+    assert fake.restarted == ["hermes-serve.service", "hermes-dashboard-work.service"]
+    assert out == {
+        "verified": ["user/hermes-dashboard-work", "user/hermes-serve"],
+        "failed": [],
+    }
+
+
+def test_default_profile_dashboard_unit_is_restarted_by_the_serve_pass(linux_systemctl):
+    """#125297: the unprofiled ``hermes-dashboard.service`` — the exact unit from the
+    report's receipts — is enumerated and restarted alongside serve units."""
+    fake = _Systemctl(
+        listed=["hermes-dashboard.service"],
+        active={"hermes-dashboard.service": True},
+        main_pids={"hermes-dashboard.service": 9},
+    )
+    out = recovery.restart_serve_units(run=fake, sleep=lambda _: None)
+    assert fake.restarted == ["hermes-dashboard.service"]
+    assert out == {"verified": ["user/hermes-dashboard"], "failed": []}
+
+
 def test_no_systemctl_means_no_serve_pass(monkeypatch):
     monkeypatch.setattr(recovery.shutil, "which", lambda name: None)
 
@@ -902,6 +931,7 @@ def test_restarted_dashboard_unit_is_not_killed_by_the_continued_scan(monkeypatc
     assert result["killed"] == []
 
 
+@pytest.mark.platforms("posix")
 def test_serve_backend_survives_selection_when_the_dashboard_unit_restarts(monkeypatch):
     """A serve PID owned by a DIFFERENT unit is still selected for recovery."""
     from hermes_cli import dashboard_procs
@@ -1109,151 +1139,3 @@ def test_missing_incarnation_on_either_side_fails_closed(monkeypatch):
             "supervisor": "manual-serve",
         }
     ]
-
-
-@pytest.mark.windows_only
-@pytest.mark.real_post_swap_handoff
-@pytest.mark.parametrize("swap", ["git", "zip"])
-@pytest.mark.parametrize("outcome", ["complete", "tail-refused", "spawn-refused", "payload-refused"])
-def test_manual_serve_recovery_follows_handoff_owner(monkeypatch, tmp_path, swap, outcome):
-    """The parent's atexit cannot race the child's installs; failed starts retain recovery."""
-    import atexit
-    from pathlib import Path
-    from hermes_cli import update_cmd_config, update_cmd_windows, update_handoff, update_receipt
-
-    main = update_cmd._m()
-    home = tmp_path / "home"
-    events, hooks, spawned = [], [], {}
-    entry = {"pid": 41, "purpose": "serve", "profile": "work", "host": "127.0.0.1", "port": 19119}
-    holders = iter([[(41, "python", "synthetic serve")], []])
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path / "checkout")
-    monkeypatch.setattr(main, "_venv_scripts_dir", lambda: None)
-    monkeypatch.setattr(update_receipt, "_current", None)
-    monkeypatch.setattr(update_receipt, "_code_identity", lambda refresh=False: {})
-    monkeypatch.setattr(update_cmd_config, "_LAST_SIBLING_SNAPSHOTS", {})
-    monkeypatch.setattr(atexit, "register", lambda fn, *args: hooks.append((fn, args)))
-    monkeypatch.setattr(update_cmd_windows._time, "sleep", lambda _: None)
-    monkeypatch.setattr(main, "_detect_venv_python_processes", lambda: next(holders))
-    monkeypatch.setattr(main, "_leftover_pausable_gateway_pids", lambda matches: None)
-    monkeypatch.setattr(main, "_ledger_reapable_backend_pids", lambda matches: [])
-    monkeypatch.setattr(main, "_orphaned_desktop_backend_pids", lambda matches: None)
-    monkeypatch.setattr(main, "_ledger_manual_serve_holders", lambda matches: [entry])
-    monkeypatch.setattr(main, "_stop_process_trees", lambda pids: events.append("pause"))
-    monkeypatch.setattr(
-        main, "_respawn_dashboard_processes",
-        lambda commands: events.append(("relaunch", commands)) or [])
-    monkeypatch.setattr(main, "_write_update_incomplete_marker", lambda: events.append("marker"))
-    monkeypatch.setattr(update_handoff, "_running_from_windows_shim", lambda: True)
-    monkeypatch.setattr(update_handoff, "post_swap_python", lambda: Path(sys.executable))
-    update_receipt.begin_update_receipt()
-
-    # Exercise the actual guard's token registration, with all scans/stops stubbed.
-    token = {"resume_needed": False}  # serve-only install
-    update_cmd._clear_windows_venv_holders_or_exit(SimpleNamespace(), False, token)
-    parent_hooks = list(hooks)
-    assert token["stopped_serves"]["pending"] is True
-
-    def fake_popen(cmd, **kwargs):
-        spawned["payload"] = update_handoff.read_handoff(cmd[cmd.index("--post-swap") + 1])
-        if outcome == "spawn-refused":
-            raise OSError("synthetic spawn refusal")
-        return SimpleNamespace(wait=lambda *a, **k: pytest.fail("shim parent must not wait"))
-
-    def refuse_payload(payload):
-        raise OSError("synthetic payload refusal")
-
-    monkeypatch.setattr(update_handoff.subprocess, "Popen", fake_popen)
-    if outcome == "payload-refused":
-        monkeypatch.setattr(update_handoff, "write_handoff", refuse_payload)
-    opts = update_cmd._UpdateOptions(
-        active_lazy_features=None, active_tool_dependencies=None, pre_update_version="old",
-        gw_input_fn=None, assume_yes=True, keep_stash=False, switch_branch=False,
-        discard_local_changes=False)
-    with pytest.raises(SystemExit) as parent_exit:
-        update_cmd._hand_off_post_swap(
-            SimpleNamespace(yes=True), swap=swap, branch="main", opts=opts,
-            gateway_mode=False, had_desktop_app_before_update=False,
-            _windows_gateway_resume=token)
-
-    started = outcome in ("complete", "tail-refused")
-    assert parent_exit.value.code == (0 if started else 1)
-    # Successful spawn transferred ownership; refusal recovered in the parent.
-    assert token["stopped_serves"]["pending"] is False
-    for callback, args in parent_hooks:
-        callback(*args)
-    if not started:
-        assert events[:2] == ["pause", "marker"]
-        assert len([e for e in events if isinstance(e, tuple)]) == 1
-        assert update_receipt._current is not None
-        assert [s["name"] for s in update_receipt._current.data["steps"]] == [
-            "serve_pause", "post_swap_handoff", "serve_relaunch"]
-        return
-
-    assert events == ["pause"]
-    child_payload = spawned["payload"]
-    assert child_payload["windows_gateway_resume"]["stopped_serves"]["pending"] is True
-    update_receipt.resume_update_receipt(child_payload["receipt"])
-    monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *a: opts)
-    monkeypatch.setattr(update_cmd, "_ensure_non_trampoline_git", lambda cmd: cmd)
-
-    def finish_tail(*args, **kwargs):
-        events.append("dependencies-start")
-        for callback, callback_args in parent_hooks:
-            callback(*callback_args)
-        assert not any(isinstance(e, tuple) for e in events)
-        events.append("dependencies-end")
-        if outcome == "tail-refused":
-            raise SystemExit(2)
-        return True
-
-    monkeypatch.setattr(update_cmd, "_finish_pulled_update", finish_tail)
-    monkeypatch.setattr(update_cmd, "_finish_zip_update", finish_tail)
-    if outcome == "tail-refused":
-        with pytest.raises(SystemExit) as child_exit:
-            update_cmd._execute_post_swap(child_payload, SimpleNamespace(), False)
-        assert child_exit.value.code == 2
-    else:
-        update_cmd._execute_post_swap(child_payload, SimpleNamespace(), False)
-
-    assert events == [
-        "pause", "dependencies-start", "dependencies-end",
-        ("relaunch", [["hermes", "--profile", "work", "serve", "--host", "127.0.0.1", "--port", "19119"]]),
-    ]
-    # A normal unwind/atexit after explicit cleanup cannot launch a second copy.
-    for callback, args in hooks:
-        callback(*args)
-    assert len([e for e in events if isinstance(e, tuple)]) == 1
-    assert [s["name"] for s in update_receipt._current.data["steps"]] == ["serve_pause", "serve_relaunch"]
-
-
-def test_child_recovers_manual_serve_even_when_gateway_resume_fails(monkeypatch, tmp_path):
-    """Both independent cleanup obligations run before the hard-exit boundary."""
-    import atexit
-    from hermes_cli import update_cmd_config
-
-    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(update_cmd_config, "_LAST_SIBLING_SNAPSHOTS", {})
-    monkeypatch.setattr(atexit, "register", lambda *a: None)
-    events = []
-    token = {"resume_needed": True, "stopped_serves": {"pending": True, "entries": []}}
-
-    def refuse_options(*args):
-        raise SystemExit(2)
-
-    def fail_gateway(token):
-        events.append("gateway")
-        raise RuntimeError("synthetic gateway resume failure")
-
-    def resume_serves(token):
-        events.append("serve")
-        token["pending"] = False
-
-    monkeypatch.setattr(update_cmd, "_resolve_update_options", refuse_options)
-    monkeypatch.setattr(update_cmd._m(), "_resume_windows_gateways_after_update", fail_gateway)
-    monkeypatch.setattr(update_cmd._m(), "_relaunch_stopped_serves", resume_serves)
-    with pytest.raises(RuntimeError, match="synthetic gateway resume failure"):
-        update_cmd._execute_post_swap({"windows_gateway_resume": token}, SimpleNamespace(), False)
-    assert events == ["gateway", "serve"]
-    assert token["stopped_serves"]["pending"] is False
