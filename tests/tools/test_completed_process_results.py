@@ -20,7 +20,10 @@ def test_headless_terminal_result_survives_cli_exit(tmp_path):
     (home / "config.yaml").write_text(
         "model:\n  provider: custom\n  api_mode: chat_completions\n"
         "terminal:\n  env: local\n  oneshot_completion_wait_seconds: 10\n"
-        "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n",
+        "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
+        # The auto-title upgrade is a tool-less request to the same local endpoint on its
+        # own thread, and can land after the follow-up turn the last-request check reads.
+        "auxiliary:\n  title_generation:\n    enabled: false\n",
         encoding="utf-8",
     )
     release = tmp_path / "release"
