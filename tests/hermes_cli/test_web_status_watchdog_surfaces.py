@@ -64,3 +64,14 @@ def test_status_keeps_watchdog_degraded_verdict_and_reason_for_dead_pid(client, 
     data = client.get("/api/status").json()
     assert data["gateway_state"] == "stopped"
     assert data["gateway_exit_reason"] is None
+
+
+@pytest.mark.parametrize("base,derived", [("unknown", "git.1fd1827"), ("0.20.0", "0.20.0")])
+def test_status_surfaces_runtime_display_version(client, monkeypatch, base, derived):
+    from hermes_cli.version_info import VersionInfo
+    import hermes_cli.web_routers.status as status_router
+
+    info = VersionInfo(base, derived, 0, "1fd1827", "main", "git")
+    monkeypatch.setattr(status_router, "get_version_info", lambda: info)
+    assert client.get("/api/status").json()["version"] == derived
+    assert client.get("/api/system/stats").json()["hermes_version"] == derived

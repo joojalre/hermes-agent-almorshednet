@@ -1548,6 +1548,7 @@ export interface ActionResponse {
   name: string
   ok: boolean
   pid: number
+  message?: string
   action_id?: string
   already_running?: boolean
 }

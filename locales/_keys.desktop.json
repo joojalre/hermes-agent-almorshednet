@@ -589,6 +589,8 @@
     "commandCenter.days",
     "commandCenter.deleteSession",
     "commandCenter.exportSession",
+    "commandCenter.gatewayDegraded",
+    "commandCenter.gatewayDraining",
     "commandCenter.gatewayRestartFailed",
     "commandCenter.gatewayRunning",
     "commandCenter.gatewayStopped",

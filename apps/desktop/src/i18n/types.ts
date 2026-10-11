@@ -2248,6 +2248,8 @@ export interface Translations extends NoticeTranslations {
     noSessions: string
     gatewayRunning: string
     gatewayStopped: string
+    gatewayDegraded: string
+    gatewayDraining: string
     hermesActiveSessions: (version: string, count: number) => string
     restartGateway: string
     openBrowser: string

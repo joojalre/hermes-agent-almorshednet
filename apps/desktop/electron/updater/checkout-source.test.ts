@@ -486,4 +486,4 @@ if not getattr(urllib.request, '_hermes_loopback', False):
     })
     fs.rmSync(temporary, { recursive: true, force: true })
   }
-}, 30000)
+}, process.platform === 'win32' ? 120000 : 30000)

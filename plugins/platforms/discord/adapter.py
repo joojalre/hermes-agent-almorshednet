@@ -50,6 +50,16 @@ def _voice_mixer_module():
         return voice_mixer
 
 
+def _client_lifecycle_module():
+    """Resolve the sibling for both flat plugin and package imports."""
+    try:
+        import client_lifecycle
+        return client_lifecycle
+    except ImportError:
+        from . import client_lifecycle
+        return client_lifecycle
+
+
 def _image_ext_from_content_type(content_type: str) -> str:
     """Attachment extension for a downloaded image (png unless jpeg/gif/webp is evident)."""
     if "jpeg" in content_type or "jpg" in content_type:
@@ -1545,19 +1555,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             # READY itself is a DISPATCH event, so a healthy connection stamps almost immediately.
             self._last_dispatched_event_monotonic = None
             adapter_self = self  # capture for closure
+            connected_client = self._client
 
             @self._client.event
             async def on_ready():
-                logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
-                await adapter_self._resolve_allowed_usernames()
-                adapter_self._ready_event.set()
-                if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
-                    adapter_self._post_connect_task.cancel()
-                adapter_self._post_connect_task = asyncio.create_task(
-                    adapter_self._run_post_connect_initialization()
-                )
-                if adapter_self._missed_message_backfill_enabled():
-                    adapter_self._ensure_missed_message_backfill_task()
+                logger.info("[%s] Connected as %s", adapter_self.name, connected_client.user)
+                await _client_lifecycle_module().initialize_ready_client(adapter_self, connected_client)
 
             @self._client.event
             async def on_socket_event_type(event_type: str):
@@ -2097,6 +2100,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         await itself via ``disconnect()``); the runner owns the bounded teardown."""
         failed_websocket = getattr(client, "ws", None)
         try:
+            await _client_lifecycle_module().cancel_client_jobs(self)
             close_task = asyncio.create_task(client.close())
             try:
                 done, _pending = await asyncio.wait({close_task}, timeout=1.0)
@@ -2199,6 +2203,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         self._disconnecting = True
         # Cancel the liveness probe first so it can't fire a spurious fatal/reconnect mid-teardown.
         await self._cancel_liveness_task()
+        await _client_lifecycle_module().cancel_client_jobs(self)
         # Leave voice *before* cancelling the bot task: VoiceClient.disconnect() needs the main
         # gateway WS (run by the bot task) or it blocks until the timeout.
         for guild_id in list(self._voice_clients.keys()):
@@ -2214,13 +2219,6 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 await self._client.close()
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning("[%s] Error during disconnect: %s", self.name, e, exc_info=True)
-        for task in (self._post_connect_task, self._missed_message_backfill_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
         self._running = False
         self._client = None
         self._ready_event.clear()

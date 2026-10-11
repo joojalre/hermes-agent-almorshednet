@@ -2503,6 +2503,8 @@ export const en: Translations = {
     noSessions: 'No sessions yet.',
     gatewayRunning: 'Messaging gateway running',
     gatewayStopped: 'Messaging gateway stopped',
+    gatewayDegraded: 'Messaging gateway needs attention',
+    gatewayDraining: 'Messaging gateway draining',
     hermesActiveSessions: (version, count) => `Hermes ${version} · Active sessions ${count}`,
     restartGateway: 'Restart gateway',
     openBrowser: 'Toggle browser',

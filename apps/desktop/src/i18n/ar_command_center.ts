@@ -127,6 +127,8 @@ export const arCommandCenter = {
     noSessions: 'لا توجد جلسات',
     gatewayRunning: 'البوابة تعمل',
     gatewayStopped: 'البوابة متوقفة',
+    gatewayDegraded: 'بوابة الرسائل تحتاج متابعة',
+    gatewayDraining: 'بوابة الرسائل تنهي المهام الجارية',
     hermesActiveSessions: (version, count) => `Hermes ${version} لديه ${count} جلسة نشطة`,
     restartGateway: 'إعادة تشغيل البوابة',
     openBrowser: 'تبديل المتصفح',

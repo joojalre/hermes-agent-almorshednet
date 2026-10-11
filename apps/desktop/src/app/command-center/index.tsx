@@ -1,6 +1,8 @@
 import { compactNumber } from '@hermes/shared'
+import { useStore } from '@nanostores/react'
 import { type MouseEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { $apiRequestScope } from '@/api/client'
 import { LogSearchField, useLogSearch } from '@/components/chat/log-search'
 import { LogTail } from '@/components/chat/log-tail'
 import { PageLoader } from '@/components/page-loader'
@@ -10,8 +12,8 @@ import { SearchField } from '@/components/ui/search-field'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { ResponsiveTabs } from '@/components/ui/tab-dropdown'
 import { Tip } from '@/components/ui/tooltip'
-import { getActionStatus, getLogs, getStatus, getUsageAnalytics, restartGateway, updateHermes } from '@/hermes'
-import type { ActionStatusResponse, AnalyticsResponse, SessionInfo, StatusResponse } from '@/hermes'
+import { getActionStatus, getUsageAnalytics, restartGateway, updateHermes } from '@/hermes'
+import type { ActionStatusResponse, AnalyticsResponse, SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import {
@@ -33,7 +35,8 @@ import { upsertDesktopActionTask } from '@/store/activity'
 import { $pinnedSessionIds, pinSession, SIDEBAR_SESSIONS_PAGE_SIZE, unpinSession } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import { $sessionProfilesTruncated, $sessions, sessionPinId } from '@/store/session'
-import { confirmSharedGatewayRestart } from '@/store/system-actions'
+import { $gatewayRestarting, confirmSharedGatewayRestart } from '@/store/system-actions'
+import { $backendUpdateApply, $updateApply } from '@/store/updates'
 
 import { SidebarLoadMoreRow } from '../chat/sidebar/load-more-row'
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
@@ -44,6 +47,7 @@ import { OverlayMain, OverlayNav, OverlaySplitLayout } from '../overlays/overlay
 import { OverlayView } from '../overlays/overlay-view'
 
 import { MaintenancePanel } from './maintenance'
+import { useSystemStatus } from './use-system-status'
 
 export type CommandCenterSection = 'maintenance' | 'sessions' | 'system' | 'usage'
 
@@ -172,14 +176,31 @@ export function CommandCenterView({
   const [query, setQuery] = useState('')
   const [pendingDelete, setPendingDelete] = useState<SessionInfo | null>(null)
   const [loadMorePending, setLoadMorePending] = useState(false)
-  const [status, setStatus] = useState<StatusResponse | null>(null)
-  const [logs, setLogs] = useState<string[]>([])
   const [logFile, setLogFile] = useState<(typeof LOG_FILES)[number]>('agent')
   const [logLevel, setLogLevel] = useState<(typeof LOG_LEVELS)[number]>('ALL')
   const [logQuery, setLogQuery] = useState('')
-  const [systemLoading, setSystemLoading] = useState(false)
-  const [systemError, setSystemError] = useState('')
   const [systemAction, setSystemAction] = useState<ActionStatusResponse | null>(null)
+  const [actionStarting, setActionStarting] = useState<'restart' | 'update' | null>(null)
+  const actionEpoch = useRef(0)
+  const sharedRestartCount = useRef(0)
+
+  const {
+    status,
+    logs,
+    loading: systemLoading,
+    error: systemError,
+    setError: setSystemError,
+    refresh: refreshSystem,
+    scopeKey
+  } = useSystemStatus(section === 'system', logFile, logLevel)
+
+  const restarting = useStore($gatewayRestarting)
+  const desktopUpdate = useStore($updateApply)
+  const backendUpdate = useStore($backendUpdateApply)
+
+  const systemBusy =
+    !!actionStarting || !!systemAction?.running || restarting || desktopUpdate.applying || backendUpdate.applying
+
   const [usagePeriod, setUsagePeriod] = useState<UsagePeriod>(30)
   const [usage, setUsage] = useState<AnalyticsResponse | null>(null)
   const [usageLoading, setUsageLoading] = useState(false)
@@ -209,29 +230,6 @@ export function CommandCenterView({
     })
   }, [debouncedQuery, sessions])
 
-  const refreshSystem = useCallback(async () => {
-    setSystemLoading(true)
-    setSystemError('')
-
-    try {
-      const [nextStatus, nextLogs] = await Promise.all([
-        getStatus(),
-        getLogs({
-          file: logFile,
-          level: logLevel,
-          lines: 200
-        })
-      ])
-
-      setStatus(nextStatus)
-      setLogs(nextLogs.lines)
-    } catch (error) {
-      setSystemError(error instanceof Error ? error.message : String(error))
-    } finally {
-      setSystemLoading(false)
-    }
-  }, [logFile, logLevel])
-
   const refreshUsage = useCallback(async (days: UsagePeriod) => {
     const requestId = usageRequestRef.current + 1
     usageRequestRef.current = requestId
@@ -255,13 +253,75 @@ export function CommandCenterView({
     }
   }, [])
 
-  useEffect(() => {
-    // Refetch when the panel opens and whenever the log file/level filters
-    // change (refreshSystem's identity tracks them).
-    if (section === 'system') {
-      void refreshSystem()
+  const resetSystemAction = useCallback(() => {
+    ++actionEpoch.current
+    setSystemAction(null)
+    setActionStarting(null)
+    sharedRestartCount.current = 0
+  }, [])
+
+  useEffect(() => $apiRequestScope.listen(resetSystemAction), [resetSystemAction])
+
+  const notifySharedRestart = useCallback(() => {
+    if (sharedRestartCount.current) {
+      notify({ kind: 'success', message: cc.sharedGatewayRestarted(sharedRestartCount.current) })
+      sharedRestartCount.current = 0
     }
-  }, [refreshSystem, section])
+  }, [cc])
+
+  const actionName = systemAction?.name
+  const actionPending = !!systemAction && (systemAction.running || systemAction.exit_code == null)
+
+  useEffect(() => {
+    if (section !== 'system' || !actionName || !actionPending) {
+      return
+    }
+    let disposed = false
+    let timer: number
+    const deadline = Date.now() + 120_000
+
+    const poll = async () => {
+      try {
+        const next = await getActionStatus(actionName, 180)
+
+        if (disposed) {
+          return
+        }
+        // A restarted backend can temporarily lose the in-memory action handle.
+        // An absent exit code is not a completion receipt.
+        setSystemAction({ ...next, running: next.running || next.exit_code == null })
+        upsertDesktopActionTask(next)
+
+        if (!next.running && next.exit_code != null) {
+          if (next.exit_code === 0) {
+            notifySharedRestart()
+          }
+
+          void refreshSystem(false)
+
+          return
+        }
+      } catch (error) {
+        if (!disposed) {
+          setSystemError(error instanceof Error ? error.message : String(error))
+        }
+      }
+
+      if (!disposed && Date.now() < deadline) {
+        timer = window.setTimeout(() => void poll(), 2000)
+      } else if (!disposed) {
+        setSystemAction(null)
+        setSystemError(cc.actionStartedWaiting)
+      }
+    }
+
+    timer = window.setTimeout(() => void poll(), 1200)
+
+    return () => {
+      disposed = true
+      window.clearTimeout(timer)
+    }
+  }, [section, actionName, actionPending, scopeKey, refreshSystem, setSystemError, cc, notifySharedRestart])
 
   useEffect(() => {
     if (section === 'usage') {
@@ -302,53 +362,56 @@ export function CommandCenterView({
   const runSystemAction = useCallback(
     async (kind: 'restart' | 'update') => {
       setSystemError('')
+      const epoch = actionEpoch.current
+      const originScope = scopeKey
+
+      const stillCurrent = () =>
+        epoch === actionEpoch.current &&
+        originScope === JSON.stringify([$apiRequestScope.get().connectionId, $apiRequestScope.get().profile])
 
       // A profile served by the shared multiplexer restarts every bot on this device: ask first.
       const shared = kind === 'restart' ? await confirmSharedGatewayRestart() : null
 
-      if (shared === false) {
+      if (shared === false || !stillCurrent()) {
         return
       }
 
+      setActionStarting(kind)
+      sharedRestartCount.current = shared?.length || 0
+
       try {
         const started = kind === 'restart' ? await restartGateway() : await updateHermes()
-        let nextStatus: ActionStatusResponse | null = null
 
-        for (let attempt = 0; attempt < 18; attempt += 1) {
-          await new Promise(resolve => window.setTimeout(resolve, 1200))
-          const polled = await getActionStatus(started.name, 180)
-          nextStatus = polled
-          setSystemAction(polled)
-          upsertDesktopActionTask(polled)
-
-          if (!polled.running) {
-            break
-          }
+        if (!stillCurrent()) {
+          return
         }
 
-        if (shared && nextStatus && !nextStatus.running && (nextStatus.exit_code ?? 0) === 0) {
-          notify({ kind: 'success', message: cc.sharedGatewayRestarted(shared.length) })
+        if (!started.ok) {
+          throw new Error(started.message || cc.actionFailed)
         }
 
-        if (!nextStatus) {
-          const pendingStatus = {
-            exit_code: null,
-            lines: [cc.actionStartedWaiting],
-            name: started.name,
-            pid: started.pid,
-            running: true
-          }
-
-          setSystemAction(pendingStatus)
-          upsertDesktopActionTask(pendingStatus)
+        const pendingStatus = {
+          exit_code: null,
+          lines: [cc.actionStartedWaiting],
+          name: started.name,
+          pid: started.pid,
+          running: true
         }
+
+        setSystemAction(pendingStatus)
+        upsertDesktopActionTask(pendingStatus)
       } catch (error) {
-        setSystemError(error instanceof Error ? error.message : String(error))
+        if (stillCurrent()) {
+          setSystemError(error instanceof Error ? error.message : String(error))
+        }
       } finally {
-        void refreshSystem()
+        if (stillCurrent()) {
+          setActionStarting(null)
+          void refreshSystem(false)
+        }
       }
     },
-    [cc, refreshSystem]
+    [cc, refreshSystem, scopeKey, setSystemError]
   )
 
   const navGroups = useMemo(
@@ -481,7 +544,7 @@ export function CommandCenterView({
             ) : (
               <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-4">
                 <div>
-                  {status ? (
+                  {status || systemBusy ? (
                     <div className="grid gap-2">
                       <div className="flex items-start justify-between gap-3 max-[47.5rem]:flex-col max-[47.5rem]:gap-2">
                         <div className="min-w-0">
@@ -489,22 +552,58 @@ export function CommandCenterView({
                             <span
                               className={cn(
                                 'size-2 shrink-0 rounded-full',
-                                status.gateway_running ? 'bg-emerald-500' : 'bg-amber-500'
+                                status?.gateway_running &&
+                                  !status.gateway_heartbeat_stale_s &&
+                                  status.gateway_state === 'running' &&
+                                  !systemBusy
+                                  ? 'bg-emerald-500'
+                                  : 'bg-amber-500'
                               )}
                             />
                             <span className="text-[length:var(--conversation-text-font-size)] font-medium text-foreground">
-                              {status.gateway_running ? cc.gatewayRunning : cc.gatewayStopped}
+                              {actionStarting === 'update' ||
+                              desktopUpdate.applying ||
+                              backendUpdate.applying ||
+                              (systemAction?.running && systemAction.name === 'hermes-update')
+                                ? t.updates.installing
+                                : restarting || systemBusy
+                                  ? t.shell.statusbar.gatewayRestarting
+                                  : status?.gateway_heartbeat_stale_s || status?.gateway_state === 'degraded'
+                                    ? cc.gatewayDegraded
+                                    : status?.gateway_state === 'draining' || status?.gateway_state === 'stopping'
+                                      ? cc.gatewayDraining
+                                      : status?.gateway_state === 'starting'
+                                        ? t.messaging.states.connecting
+                                        : status?.gateway_running
+                                          ? cc.gatewayRunning
+                                          : cc.gatewayStopped}
                             </span>
                           </div>
                           <div className="mt-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-                            {cc.hermesActiveSessions(status.version, status.active_sessions)}
+                            {status
+                              ? cc.hermesActiveSessions(status.version, status.active_sessions)
+                              : t.updates.checkingShort}
+                            {' · '}
+                            <a href="https://github.com/NousResearch/hermes-agent" rel="noreferrer" target="_blank">
+                              NousResearch/hermes-agent
+                            </a>
                           </div>
                         </div>
                         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 whitespace-nowrap max-[47.5rem]:whitespace-normal">
-                          <Button onClick={() => void runSystemAction('restart')} size="xs" variant="text">
+                          <Button
+                            disabled={systemBusy}
+                            onClick={() => void runSystemAction('restart')}
+                            size="xs"
+                            variant="text"
+                          >
                             {cc.restartGateway}
                           </Button>
-                          <Button onClick={() => void runSystemAction('update')} size="xs" variant="textStrong">
+                          <Button
+                            disabled={systemBusy}
+                            onClick={() => void runSystemAction('update')}
+                            size="xs"
+                            variant="textStrong"
+                          >
                             {cc.updateHermes}
                           </Button>
                         </div>
@@ -514,14 +613,20 @@ export function CommandCenterView({
                           {systemAction.name} ·{' '}
                           {systemAction.running
                             ? cc.actionRunning
-                            : systemAction.exit_code === 0
-                              ? cc.actionDone
-                              : cc.actionFailed}
+                            : systemAction.exit_code == null
+                              ? cc.actionStartedWaiting
+                              : systemAction.exit_code === 0
+                                ? cc.actionDone
+                                : cc.actionFailed}
                         </div>
                       )}
                     </div>
-                  ) : (
+                  ) : systemLoading ? (
                     <PageLoader className="min-h-32" label={cc.loadingStatus} />
+                  ) : (
+                    <Button onClick={() => void refreshSystem()} size="xs" variant="text">
+                      {cc.retry}
+                    </Button>
                   )}
                 </div>
 

@@ -23,7 +23,7 @@ def _restore_stdout():
 
 
 @pytest.fixture()
-def server():
+def server(tmp_path):
     # The sys.modules mocks only need to cover the *initial* import — once
     # tui_gateway.server is cached, they are inert. Keeping them active for
     # the whole test poisons any module first imported inside a test body:
@@ -41,7 +41,7 @@ def server():
     import tui_gateway.transport
     import hermes_constants  # real get_process_hermes_home: a mocked one put state.db under the cwd (repo)
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test"),
+        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value=tmp_path),
                                       get_process_hermes_home=hermes_constants.get_process_hermes_home),
         "hermes_cli.env_loader": MagicMock(),
         "hermes_cli.banner": MagicMock(),
@@ -1929,16 +1929,20 @@ def test_approval_for_a_ws_client_that_never_advertised_settles_the_queue_entry(
     _ws_session(server, "ws-old-approval", peer)
     monkeypatch.setattr(wait_mod._ctx, "_get_approval_timeout", lambda: 3)
     monkeypatch.setattr(wait_mod._ctx, "_fire_approval_hook", lambda name, **kw: None)
+    original_poll = wait_mod._poll_event
+
+    def require_settled_event(event, *args, **kwargs):
+        assert event.is_set(), "an unanswerable approval must be settled before the blocking wait"
+        return original_poll(event, *args, **kwargs)
+
+    monkeypatch.setattr(wait_mod, "_poll_event", require_settled_event)
     approval_mod.register_gateway_notify("ws-old-approval", lambda data: server._emit_approval_request("ws-old-approval", data))
     try:
-        t0 = time.monotonic()
         decision = wait_mod._await_gateway_decision(
             "ws-old-approval", approval_mod._gateway_notify_cbs["ws-old-approval"],
             {"command": "rm -rf build", "description": "", "pattern_key": "dangerous", "pattern_keys": ["dangerous"]})
-        waited = time.monotonic() - t0
     finally:
         approval_mod.unregister_gateway_notify("ws-old-approval")
-    assert waited < 1, decision
     assert decision["choice"] is None and decision["cancelled"]
     assert peer.frames == []
     assert "ws-old-approval" not in approval_mod._gateway_queues
