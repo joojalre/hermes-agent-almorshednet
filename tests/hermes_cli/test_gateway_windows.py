@@ -687,6 +687,26 @@ def test_reconcile_scheduled_task_reregisters_only_on_drift(monkeypatch, tmp_pat
     assert not any(c[0] in ("/Delete", "/Create") for c in calls)
 
 
+def test_reconcile_scheduled_task_preserves_disabled_power_shell_task(monkeypatch, tmp_path):
+    """An update must not enable an operator-disabled task or replace its action."""
+    registered = """<Task version="1.3"><Settings><Enabled>false</Enabled></Settings>
+      <Actions><Exec><Command>powershell.exe</Command>
+      <Arguments>-WindowStyle Hidden -File gateway.ps1</Arguments></Exec></Actions></Task>"""
+    calls = []
+
+    def fake_schtasks(args):
+        calls.append(list(args))
+        return 0, registered, ""
+
+    monkeypatch.setattr(gateway_windows, "_exec_schtasks", fake_schtasks)
+    monkeypatch.setattr(gateway_windows, "get_task_script_path", lambda: tmp_path / "gateway.cmd")
+    monkeypatch.setattr(gateway_windows, "_resolve_task_user", lambda: r"PC\me")
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: pytest.fail("disabled task launcher rewritten"))
+
+    assert gateway_windows.reconcile_scheduled_task("Hermes_Gateway") is False
+    assert [call[0] for call in calls] == ["/Query"]
+
+
 def _arrange_uninstalled_start(monkeypatch):
     """start() with no Scheduled Task / Startup entry; returns (install_calls, spawn_count)."""
     installs, spawns = [], []

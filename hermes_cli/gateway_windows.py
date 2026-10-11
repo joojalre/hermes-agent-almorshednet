@@ -1457,7 +1457,16 @@ def reconcile_scheduled_task(task_name: str) -> bool:
     of ``gateway.py::refresh_systemd_unit_if_needed``. Template hardening (``RestartOnFailure``, logon
     ``Delay``) otherwise only ever reaches fresh installs. False when aligned/unqueryable or when
     ``schtasks`` refused (typically Access Denied — the elevating ``hermes gateway install`` is the fallback)."""
-    drift = scheduled_task_drift(task_name)
+    registered = _query_scheduled_task_xml(task_name)
+    if registered is None:
+        return False
+    leaves = _task_xml_leaf_values(registered)
+    if leaves is None or leaves.get("Task/Settings/Enabled", "").casefold() == "false":
+        # Re-registration uses an enabled template. Respect the operator's disabled
+        # task and its existing action during automatic start/update reconciliation.
+        return False
+    template = _build_scheduled_task_xml(task_name, get_task_script_path().with_suffix(".vbs"), _resolve_task_user())
+    drift = compare_scheduled_task_drift(registered, template)
     if not drift:
         return False
     print(f"↻ Repairing outdated Scheduled Task registration ({'; '.join(drift)})")
