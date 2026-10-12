@@ -18,6 +18,9 @@ const gitRootCache = new Map<string, Promise<string | null>>()
 const gitignoreCache = new Map<string, Promise<GitignoreRule | null>>()
 const nestedRepoCache = new Map<string, Promise<boolean>>()
 
+export const PROJECT_DIR_READ_TIMEOUT = 'read-timeout'
+const PROJECT_DIR_READ_TIMEOUT_MS = 20_000
+
 function decodeDataUrl(dataUrl: string) {
   const match = dataUrl.match(/^data:[^,]*,(.*)$/)
   const data = match?.[1] || ''
@@ -155,7 +158,12 @@ function ignoredBy(rules: GitignoreRule[], entry: HermesReadDirEntry) {
   })
 }
 
-async function filterIgnored(entries: HermesReadDirEntry[], rootPath: string, dirPath: string) {
+async function filterIgnored(
+  entries: HermesReadDirEntry[],
+  rootPath: string,
+  dirPath: string,
+  isExpired: () => boolean
+) {
   // Opting a project into its ignored files skips the gitignore pass entirely —
   // no git-root probe, no .gitignore reads. ALWAYS_EXCLUDED still applies: `.git`
   // internals and dependency/build dirs are never worth browsing, in any repo.
@@ -169,9 +177,15 @@ async function filterIgnored(entries: HermesReadDirEntry[], rootPath: string, di
   // inside dev/<repo> only <repo>'s own .gitignore chain governs. Without this,
   // the parent's `dev/*` pattern matches every entry inside the nested repo and
   // the tree shows an empty folder one level down.
-  const root = (await gitRootFor(dirPath)) ?? (await gitRootFor(rootPath))
+  const listedRoot = await gitRootFor(dirPath)
 
-  if (!root) {
+  if (isExpired()) {
+    return entries
+  }
+
+  const root = listedRoot ?? (await gitRootFor(rootPath))
+
+  if (!root || isExpired()) {
     return entries
   }
 
@@ -179,7 +193,7 @@ async function filterIgnored(entries: HermesReadDirEntry[], rootPath: string, di
     Boolean(r)
   )
 
-  if (rules.length === 0) {
+  if (rules.length === 0 || isExpired()) {
     return entries
   }
 
@@ -198,7 +212,11 @@ async function filterIgnored(entries: HermesReadDirEntry[], rootPath: string, di
   return visible.filter((entry): entry is HermesReadDirEntry => entry !== null)
 }
 
-export async function readProjectDir(dirPath: string, rootPath = dirPath): Promise<HermesReadDirResult> {
+async function readProjectDirWithoutDeadline(
+  dirPath: string,
+  rootPath: string,
+  isExpired: () => boolean
+): Promise<HermesReadDirResult> {
   if (!window.hermesDesktop) {
     return { entries: [], error: 'no-bridge' }
   }
@@ -210,9 +228,47 @@ export async function readProjectDir(dirPath: string, rootPath = dirPath): Promi
   const showIgnored = showsIgnoredFiles(rootPath)
   const filterSet = showIgnored ? SHOW_IGNORED_EXCLUDED : ALWAYS_EXCLUDED
   const result = await readDesktopDir(dirPath)
+
+  if (isExpired()) {
+    return { entries: [], error: PROJECT_DIR_READ_TIMEOUT }
+  }
+
   const entries = (result?.entries ?? []).filter(entry => !filterSet.has(entry.name))
 
-  return { ...result, entries: showIgnored ? entries : await filterIgnored(entries, rootPath, dirPath) }
+  return { ...result, entries: showIgnored ? entries : await filterIgnored(entries, rootPath, dirPath, isExpired) }
+}
+
+/** Bound the whole listing, including the gitignore IPC reads. Native IPC cannot
+ * be cancelled, so a late answer must lose the race rather than keep the tree's
+ * loading state forever. Evict this connection's cached promises on expiry so
+ * an explicit retry also re-probes a stalled ancestor .gitignore read. */
+export async function readProjectDir(dirPath: string, rootPath = dirPath): Promise<HermesReadDirResult> {
+  const cachePrefix = `${desktopFsCacheKey()}:`
+  let timer: number | undefined
+  let expired = false
+
+  try {
+    return await Promise.race([
+      readProjectDirWithoutDeadline(dirPath, rootPath, () => expired),
+      new Promise<HermesReadDirResult>(resolve => {
+        timer = window.setTimeout(() => {
+          expired = true
+
+          for (const cache of [gitRootCache, gitignoreCache, nestedRepoCache]) {
+            for (const key of cache.keys()) {
+              if (key.startsWith(cachePrefix)) {
+                cache.delete(key)
+              }
+            }
+          }
+
+          resolve({ entries: [], error: PROJECT_DIR_READ_TIMEOUT })
+        }, PROJECT_DIR_READ_TIMEOUT_MS)
+      })
+    ])
+  } finally {
+    window.clearTimeout(timer)
+  }
 }
 
 export function clearProjectDirCache(rootPath?: string) {

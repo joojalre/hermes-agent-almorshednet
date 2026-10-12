@@ -6,7 +6,7 @@ import { desktopFsCacheKey } from '@/lib/desktop-fs'
 import { $connection } from '@/store/session'
 import { $workspaceChangeTick, consumeWorkspaceChange } from '@/store/workspace-events'
 
-import { clearProjectDirCache, type ProjectTreeEntry, readProjectDir } from './ipc'
+import { clearProjectDirCache, PROJECT_DIR_READ_TIMEOUT, type ProjectTreeEntry, readProjectDir } from './ipc'
 import { $showIgnoredRoots, setShowIgnoredFiles, showsIgnoredFiles } from './prefs'
 
 export interface TreeNode {
@@ -148,6 +148,7 @@ let lastConnectionKey = ''
 // reappears after a checkout, a remote that wasn't ready), keep retrying on a
 // slow cadence so the tree self-heals instead of staying "UNREADABLE" forever.
 const ROOT_ERROR_RETRY_MS = 3_000
+const ROOT_FALLBACK_TIMEOUT_MS = 20_000
 
 function setProjectTree(updater: (current: ProjectTreeState) => ProjectTreeState) {
   $projectTree.set(updater($projectTree.get()))
@@ -164,24 +165,75 @@ function clearProjectTree() {
  *  than bricking the tree, display the sanitized workspace fallback (main
  *  prefers the configured default project dir). Local connections only —
  *  remote trees are read through the remote bridge. */
-async function fallbackRootFor(cwd: string, sourceIsRemote: boolean): Promise<string | null> {
+async function fallbackRootFor(cwd: string, sourceIsRemote: boolean): Promise<{ cwd?: string; error?: string }> {
   if (sourceIsRemote) {
-    return null
+    return {}
   }
 
   const sanitize = window.hermesDesktop?.sanitizeWorkspaceCwd
 
   if (!sanitize) {
-    return null
+    return {}
   }
+
+  let timer: number | undefined
 
   try {
-    const { cwd: fallback, sanitized } = await sanitize(cwd)
-
-    return sanitized && fallback && fallback !== cwd ? fallback : null
+    // The native sanitizer is another IPC seam. A late answer must not start
+    // a fallback listing after this recovery attempt has already expired.
+    return await Promise.race([
+      sanitize(cwd).then(({ cwd: fallback, sanitized }) =>
+        sanitized && fallback && fallback !== cwd ? { cwd: fallback } : {}
+      ),
+      new Promise<{ error: string }>(resolve => {
+        timer = window.setTimeout(() => resolve({ error: PROJECT_DIR_READ_TIMEOUT }), ROOT_FALLBACK_TIMEOUT_MS)
+      })
+    ])
   } catch {
-    return null
+    return {}
+  } finally {
+    window.clearTimeout(timer)
   }
+}
+
+async function readRootEntries(cwd: string, connectionKey: string, requestId: number) {
+  const sourceIsRemote = $connection.get()?.mode === 'remote'
+  let resolvedCwd = cwd
+  let entries: ProjectTreeEntry[] = []
+  let error: string | undefined
+
+  try {
+    ;({ entries, error } = await readProjectDir(cwd, cwd))
+
+    // A deadline says nothing about whether the cwd exists. Keep this scope
+    // and avoid an unbounded native sanitizer after the listing timed out.
+    if (
+      error &&
+      error !== PROJECT_DIR_READ_TIMEOUT &&
+      desktopFsCacheKey() === connectionKey &&
+      $projectTree.get().requestId === requestId
+    ) {
+      const fallback = await fallbackRootFor(cwd, sourceIsRemote)
+
+      if (fallback.error) {
+        error = fallback.error
+      } else if (fallback.cwd && desktopFsCacheKey() === connectionKey && $projectTree.get().requestId === requestId) {
+        const retry = await readProjectDir(fallback.cwd, fallback.cwd)
+
+        if (!retry.error) {
+          resolvedCwd = fallback.cwd
+          entries = retry.entries
+          error = undefined
+        } else if (retry.error === PROJECT_DIR_READ_TIMEOUT) {
+          error = retry.error
+        }
+      }
+    }
+  } catch (cause) {
+    error = readError(cause)
+  }
+
+  return { entries, error, resolvedCwd }
 }
 
 async function loadRoot(
@@ -234,30 +286,7 @@ async function loadRoot(
     rootLoading: true
   })
 
-  const sourceIsRemote = $connection.get()?.mode === 'remote'
-  let resolvedCwd = cwd
-  let entries: ProjectTreeEntry[] = []
-  let error: string | undefined
-
-  try {
-    ;({ entries, error } = await readProjectDir(cwd, cwd))
-
-    if (error && desktopFsCacheKey() === connectionKey) {
-      const fallback = await fallbackRootFor(cwd, sourceIsRemote)
-
-      if (fallback) {
-        const retry = await readProjectDir(fallback, fallback)
-
-        if (!retry.error) {
-          resolvedCwd = fallback
-          entries = retry.entries
-          error = undefined
-        }
-      }
-    }
-  } catch (cause) {
-    error = readError(cause)
-  }
+  const { entries, error, resolvedCwd } = await readRootEntries(cwd, connectionKey, requestId)
 
   setProjectTree(latest => {
     if (latest.cwd !== cwd || latest.requestId !== requestId || desktopFsCacheKey() !== connectionKey) {
@@ -555,14 +584,22 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
   // mounted. Each attempt bumps requestId, so a persistent error re-arms the
   // timer; a success clears rootError and stops it.
   useEffect(() => {
-    if (!cwd || state.cwd !== cwd || !state.rootError) {
+    // A stalled native IPC is still running underneath its deadline. Require
+    // an explicit retry instead of launching another stalled read every 3s.
+    if (
+      !cwd ||
+      state.cwd !== cwd ||
+      state.rootLoading ||
+      !state.rootError ||
+      state.rootError === PROJECT_DIR_READ_TIMEOUT
+    ) {
       return
     }
 
     const timer = window.setTimeout(() => void loadRoot(cwd, { connectionKey, force: true }), ROOT_ERROR_RETRY_MS)
 
     return () => window.clearTimeout(timer)
-  }, [connectionKey, cwd, state.cwd, state.requestId, state.rootError])
+  }, [connectionKey, cwd, state.cwd, state.requestId, state.rootError, state.rootLoading])
 
   // While showing the fallback root, quietly re-probe the session's real cwd
   // (a worktree re-created, a checkout restored) and switch back when it
@@ -575,15 +612,30 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
     }
 
     let cancelled = false
+    let probing = false
 
     const timer = window.setInterval(() => {
+      if (cancelled || probing || $projectTree.get().rootLoading) {
+        return
+      }
+
+      probing = true
       void readProjectDir(cwd, cwd)
         .then(({ error }) => {
-          if (!cancelled && !error && desktopFsCacheKey() === connectionKey) {
+          if (cancelled || desktopFsCacheKey() !== connectionKey) {
+            return
+          }
+
+          if (error === PROJECT_DIR_READ_TIMEOUT) {
+            window.clearInterval(timer)
+          } else if (!error) {
             void loadRoot(cwd, { connectionKey, force: true })
           }
         })
         .catch(() => undefined)
+        .finally(() => {
+          probing = false
+        })
     }, ROOT_ERROR_RETRY_MS)
 
     return () => {
