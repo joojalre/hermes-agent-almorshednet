@@ -939,14 +939,15 @@ def publish_release_draft(repository: str, release_id: int, tag: str, *, run=out
         raise ValueError("Stable release publication did not persist")
 
 
-def publish_attempt(record: dict, *, repository: str, run=output, read_archive) -> str:
+def publish_attempt(record: dict, *, repository: str, run=output, read_archive) -> dict:
     """The one ordered publication pass, steps 1-4, each read back before the next.
 
     Explicit publish and autopublish converge here. The manifest digest is
     hashed from the attempt archive (nothing records it earlier), the receipt
     tag is written, the draft is retargeted and stripped while still a draft,
-    and only then does the final call make it public. Returns the Docker
-    manifest digest the receipt binds, for the alias move that follows.
+    and only then does the final call make it public. Returns the two digests
+    the receipt binds (candidate manifest and Docker manifest), so the head
+    advance that follows in the same pass checks the receipt it just wrote.
     """
     from scripts.releases import docker
 
@@ -963,7 +964,7 @@ def publish_attempt(record: dict, *, repository: str, run=output, read_archive) 
                      release_id=record["release_id"], run=run)
     edit_draft_release(repository, record["release_id"], record["tag"], record["commit"], run=run)
     publish_release_draft(repository, record["release_id"], record["tag"], run=run)
-    return docker_digest
+    return {"candidate_manifest_sha256": manifest_sha256, "docker_manifest_digest": docker_digest}
 
 
 def complete(env: dict) -> None:

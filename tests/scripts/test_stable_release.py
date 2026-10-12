@@ -670,12 +670,13 @@ def test_publish_attempt_writes_the_receipt_retargets_and_copies_no_bytes(tmp_pa
         requested_keys.append(key)
         return manifest_bytes
 
-    digest = stable.publish_attempt(
+    digests = stable.publish_attempt(
         _publish_record(commit, tag_object, epoch=epoch),
         repository="example/project", run=run, read_archive=read_archive,
     )
 
-    assert digest == docker_digest
+    assert digests == {"candidate_manifest_sha256": manifest_digest,
+                       "docker_manifest_digest": docker_digest}
     receipt = tag_record(subprocess.check_output(
         ["git", "tag", "-l", "v1.2.3", "--format=%(contents)"],
         text=True, encoding="utf-8"))
