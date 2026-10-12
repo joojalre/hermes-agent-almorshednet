@@ -455,7 +455,8 @@ class TestHttpSessionLifecycle:
         adapter = _make_adapter()
         mock_proc = MagicMock()
         mock_proc.pid = 12345
-        mock_proc.poll.side_effect = [0]
+        mock_proc.poll.return_value = None
+        mock_proc.wait.return_value = 0
         adapter._bridge_process = mock_proc
         adapter._poll_task = None
         adapter._http_session = None

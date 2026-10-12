@@ -740,19 +740,29 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except (ProcessLookupError, PermissionError):
             getattr(self._bridge_process, "kill" if force else "terminate")()
 
+    async def _stop_managed_bridge(self) -> None:
+        proc = self._bridge_process
+        if proc.poll() is not None:
+            return
+        try:
+            self._terminate_bridge(force=False)
+            await asyncio.to_thread(proc.wait, timeout=1)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            if proc.poll() is not None:
+                return
+        # A failed graceful stop still needs escalation. Ownership is retained if
+        # forcing or reaping fails, so another adapter cannot lose this live child.
+        self._terminate_bridge(force=True)
+        await asyncio.to_thread(proc.wait, timeout=1)
+
     async def disconnect(self) -> None:
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
         self._shutting_down = True  # flip BEFORE signalling so send()/poll loop don't report the intentional exit as fatal
         if not self._bridge_process:
             print(f"[{self.name}] Disconnecting (external bridge left running)")
         else:
-            try:
-                self._terminate_bridge(force=False)
-                await asyncio.sleep(1)
-                if self._bridge_process.poll() is None:
-                    self._terminate_bridge(force=True)
-            except Exception as e:
-                print(f"[{self.name}] Error stopping bridge: {e}")
+            await self._stop_managed_bridge()
         if self._bridge_process or not getattr(self, "_runtime_status_platform_key", ""):
             _unlink_quietly(self._session_path / "bridge.pid")
         await cancel_task(self._poll_task)
