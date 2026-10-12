@@ -779,7 +779,37 @@ def _restore_windows_gateway_service(name: str, *, timeout: float = 60.0) -> Non
         raise RuntimeError(f"Windows service {name} did not reach a restorable state within {timeout:.0f}s")
 
 
+@contextmanager
+def _windows_cold_start_home_scope(token: dict | None = None):
+    """Bind selectorless multiplex recovery to the root, including its attestation."""
+    from hermes_constants import get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import get_hermes_home
+    from hermes_cli.update_cmd import _m
+
+    home = Path((token or {}).get("cold_start_home") or get_hermes_home())
+    if not (token or {}).get("cold_start_home") and _m().explicit_cli_profile() is None:
+        root = get_default_hermes_root()
+        if home.parent == root / "profiles":
+            from hermes_cli.gateway_multiplex_mode import default_gateway_multiplexes
+            if default_gateway_multiplexes(root):
+                home = root
+    override = set_hermes_home_override(home)
+    try:
+        yield home
+    finally:
+        reset_hermes_home_override(override)
+
+
 def _windows_cold_start_plan() -> dict | None:
+    with _windows_cold_start_home_scope() as home:
+        token = _windows_cold_start_plan_for_home()
+        if token is not None:
+            # Resume can run in a fresh interpreter or under a different active profile.
+            token["cold_start_home"] = str(home)
+        return token
+
+
+def _windows_cold_start_plan_for_home() -> dict | None:
     """Pause token for the no-running-gateway case: cold-start after update when an autostart entry exists.
 
     An installed autostart entry is an explicit "I want a gateway" signal; a gateway that died between
@@ -1073,8 +1103,8 @@ def _record_attested_cold_start_profiles(token: dict, running_profiles: set) -> 
 
     The all-or-nothing plan only ever probed the ACTIVE profile and only when NO gateway ran at all, so a
     dead-but-attested default beside a still-running ``beta`` never got a cold-start obligation. Only
-    Desktop-owned installs need this (elsewhere autostart brings the profile back); the active profile is
-    left to the existing plan so it is never spawned twice. Best-effort: never blocks the pause."""
+    Desktop-owned installs need this (elsewhere autostart brings the profile back); the planned cold-start
+    home is left to the existing plan so it is never spawned twice. Best-effort: never blocks the pause."""
     from hermes_cli.update_cmd import _desktop_owns_gateway_lifecycle
     from hermes_cli import gateway_windows
     with _best_effort("Could not evaluate per-profile attested cold-starts before update: %s"):
@@ -1082,10 +1112,12 @@ def _record_attested_cold_start_profiles(token: dict, running_profiles: set) -> 
             return
         from hermes_cli.profiles import get_active_profile_name, profiles_to_serve
         active = get_active_profile_name() or "default"
+        planned_home = token.get("cold_start_home")
         cold: dict[str, str] = {}
         # An activation list, not inventory: parked profiles stay offline.
         for name, home in profiles_to_serve(multiplex=True, include_standalone=True):
-            if name in running_profiles or (name == active and token.get("cold_start_if_installed")):
+            planned = Path(home) == Path(planned_home) if planned_home else name == active
+            if name in running_profiles or (planned and token.get("cold_start_if_installed")):
                 continue
             generation = gateway_windows.attested_death_generation([], home=Path(home))
             if generation:
@@ -1126,6 +1158,14 @@ def _cold_start_attested_profiles(token: dict) -> None:
 
 
 def _cold_start_windows_gateway_after_update(token: dict | None = None) -> bool:
+    from hermes_cli.update_cmd import _m
+    if not _m()._is_windows():
+        return True
+    with _windows_cold_start_home_scope(token):
+        return _cold_start_windows_gateway_for_home_after_update(token)
+
+
+def _cold_start_windows_gateway_for_home_after_update(token: dict | None = None) -> bool:
     """Direct-spawn a detached gateway after update for the ``cold_start_if_installed`` case (installed but down).
 
     Idempotent: re-checks nothing is running so a concurrent autostart can't duplicate. A successful Popen
@@ -1145,9 +1185,7 @@ def _cold_start_windows_gateway_after_update(token: dict | None = None) -> bool:
     ``hermes gateway status``/``start`` consumes, which would otherwise skip this spawn and clear the
     token (#110020 review). Only that generation is consumed afterwards — never a newer marker.
     """
-    from hermes_cli.update_cmd import _desktop_owns_gateway_lifecycle, _m
-    if not _m()._is_windows():
-        return True
+    from hermes_cli.update_cmd import _desktop_owns_gateway_lifecycle
     with _abort_on_error("Could not load Windows gateway cold-start helpers"):
         from hermes_cli import gateway_windows
         from hermes_cli.gateway import find_gateway_pids

@@ -66,6 +66,42 @@ test('read-only dependency preparation reuses complete receipts but refuses miss
   expect(readFileSync(join(source, 'node_modules/.hermes-node-deps'))).toEqual(receipt)
 }, 30000)
 
+test.each(['PATH', 'Path'])('npm lifecycle uses the selected Node when inherited %s omits it', async (pathKey) => {
+  const { prepareNodeDependencies } = await import('../scripts/build/node-deps.mjs')
+  const source = fixture()
+  const [, npm] = npmCommand()
+  const manifest = JSON.parse(readFileSync(join(source, 'package.json'), 'utf8'))
+  manifest.scripts = { postinstall: `node -e "require('fs').writeFileSync('lifecycle-node', process.execPath)"` }
+  json(join(source, 'package.json'), manifest)
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path'))
+  Object.assign(env, { [pathKey]: '', npm_execpath: npm,
+    npm_config_offline: 'true', npm_config_cache: join(source, '.npm-cache') })
+  const inherited = { ...env }
+  prepareNodeDependencies({ source, workspaces: ['web'], env, reuse: true })
+  expect(readFileSync(join(source, 'lifecycle-node'), 'utf8')).toBe(process.execPath)
+  expect(env).toEqual(inherited)
+  prepareNodeDependencies({ source, workspaces: ['web'], env, reuse: true, install: false })
+}, 30000)
+
+test('npm command mode binds lifecycle Node and preserves inherited PATH entries', () => {
+  const source = fixture()
+  const [, npm] = npmCommand()
+  const manifest = JSON.parse(readFileSync(join(source, 'package.json'), 'utf8'))
+  const bin = join(source, 'retained-bin')
+  mkdirSync(bin)
+  writeFileSync(join(source, 'probe.cjs'), `require('fs').writeFileSync('lifecycle-node', JSON.stringify({
+    node: process.execPath, retained: (process.env.PATH || process.env.Path).split(require('path').delimiter).includes(${JSON.stringify(bin)})
+  }))`)
+  manifest.scripts = { probe: 'node probe.cjs' }
+  json(join(source, 'package.json'), manifest)
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'path'))
+  Object.assign(env, { PATH: bin, Path: '', npm_execpath: npm,
+    npm_config_offline: 'true', npm_config_cache: join(source, '.npm-cache') })
+  execFileSync(process.execPath, [join(repo, 'scripts/build/node-deps.mjs'), '--npm', 'run', 'probe'],
+    { cwd: source, env, stdio: 'pipe' })
+  expect(JSON.parse(readFileSync(join(source, 'lifecycle-node'), 'utf8'))).toEqual({ node: process.execPath, retained: true })
+}, 30000)
+
 test('reuse refuses a gutted package directory and repairs it with npm ci', async () => {
   const { prepareNodeDependencies } = await import('../scripts/build/node-deps.mjs')
   const source = fixture()

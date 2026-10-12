@@ -865,10 +865,30 @@ def split_draining(token: dict) -> dict:
     return draining
 
 
+def _merge_cold_start_authority(token: dict, adopted: dict) -> None:
+    """Keep a cold-start home paired with its authority before retiring an adopted record."""
+    if not adopted.get("cold_start_if_installed"):
+        return
+    current_home, adopted_home = token.get("cold_start_home"), adopted.get("cold_start_home")
+    if token.get("cold_start_if_installed"):
+        if current_home and adopted_home and Path(current_home) != Path(adopted_home):
+            raise RecordConflict("Cannot merge different Windows gateway cold-start homes")
+    else:
+        # A discharged cold-start's leftover fields are not a current obligation.
+        for key in ("attested_generation", "cold_start_home"):
+            token.pop(key, None)
+    token["cold_start_if_installed"] = True
+    if "attested_generation" in adopted:
+        token.setdefault("attested_generation", adopted["attested_generation"])
+    if "cold_start_home" in adopted and token.get("attested_generation") == adopted.get("attested_generation"):
+        token.setdefault("cold_start_home", adopted["cold_start_home"])
+
+
 def merge_into(token: dict | None, adopted: dict) -> dict:
     """Fold an orphaned pause into this update's token so its resume brings both sets back; its
     obligation id (and every id it absorbed) is recorded so a leftover copy is never resumed twice."""
     token = token if token is not None else {"resume_needed": True, "profiles": {}, "unmapped_pids": [], "unmapped": []}
+    _merge_cold_start_authority(token, adopted)
     token["resume_needed"] = True
     # Every pause keeps its own tree evidence: the adopted baseline stops this run's stamp from
     # certifying what a killed update left half-written as "dirty before the pause", and this
@@ -894,10 +914,6 @@ def merge_into(token: dict | None, adopted: dict) -> dict:
     cold = token.setdefault("cold_start_profiles", {})
     for name, generation in (adopted.get("cold_start_profiles") or {}).items():
         cold.setdefault(name, generation)
-    if adopted.get("cold_start_if_installed"):
-        token["cold_start_if_installed"] = True
-        if "attested_generation" in adopted:
-            token.setdefault("attested_generation", adopted["attested_generation"])
     if adopted.get("platform"):  # a POSIX set (update_cmd_posix_pause): its supervised units ride along
         token["platform"] = adopted["platform"]
         units = token.setdefault("posix_units", [])

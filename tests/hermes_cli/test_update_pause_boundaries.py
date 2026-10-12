@@ -78,6 +78,8 @@ def test_consumption_checkpoints_debt_before_unlink_and_producer_death(cell, cla
         while True: time.sleep(.05)
     ''', base / "ready", base / "consume", base / "consumed")
     _wait(base / "ready", consumer)
+    # Windows venv launchers can have a different PID from the marker consumer.
+    consumer_pid = int((base / "ready").read_text(encoding="utf-8-sig"))
     owner = launch('''
         from hermes_cli import update_cmd_windows as w
         from types import SimpleNamespace
@@ -94,7 +96,7 @@ def test_consumption_checkpoints_debt_before_unlink_and_producer_death(cell, cla
             while True: time.sleep(.05)
         w._request_socket_pauses([pid], {pid: SimpleNamespace(profile="default", path=home)},
                                  set(), on_request=on_request)
-    ''', consumer.pid, base / "published")
+    ''', consumer_pid, base / "published")
     _wait(base / "published", owner)
     recovery = None
     if claim_first:
@@ -126,8 +128,8 @@ def test_consumption_checkpoints_debt_before_unlink_and_producer_death(cell, cla
         ''')
     after = _result(recovery)
     assert len(after) == 1, "consumed request lost all durable restart debt"
-    assert after[0]["profiles"] == {"default": consumer.pid}
-    assert after[0]["stop_sent"] == [str(consumer.pid)]
+    assert after[0]["profiles"] == {"default": consumer_pid}
+    assert after[0]["stop_sent"] == [str(consumer_pid)]
 
 
 def test_failed_consumer_checkpoint_keeps_request_and_user_stop_is_not_update_debt(cell):
@@ -228,9 +230,10 @@ def test_recovery_only_accepts_markers_the_live_consumer_accepts(cell):
 
 
 def test_orphan_adoption_preserves_cold_start_generation_and_current_precedence(cell):
-    _, _, launch = cell
+    _, home, launch = cell
     _result(launch('''
         token = {"resume_needed": True, "profiles": {}, "cold_start_if_installed": True,
+                 "cold_start_home": os.environ["HERMES_HOME"],
                  "attested_generation": "old-active", "cold_start_profiles": {"beta": "old-beta", "gamma": "old-gamma"}}
         r.write(r.stamp_tree(token), owner=r.UNOWNED)
         print(json.dumps(r.read()["token"]))
@@ -243,12 +246,38 @@ def test_orphan_adoption_preserves_cold_start_generation_and_current_precedence(
     '''))
     assert adopted.get("cold_start_if_installed") is True
     assert adopted.get("attested_generation") == "old-active"
+    assert adopted.get("cold_start_home") == str(home)
     assert adopted.get("cold_start_profiles") == {"beta": "current-beta", "gamma": "old-gamma"}
     again = _result(launch('''
         adopted, claims = r.adopt_orphans()
         r.record_pause({"resume_needed": True, "profiles": {}, "cold_start_if_installed": True,
+                        "cold_start_home": os.environ["HERMES_HOME"],
                         "attested_generation": "current-active"}, adopted, claims)
         print(json.dumps(r.read()["token"]))
     '''))
     assert again["attested_generation"] == "current-active"
+    assert again["cold_start_home"] == str(home)
     assert again["cold_start_profiles"] == adopted["cold_start_profiles"]
+
+
+def test_conflicting_cold_start_home_keeps_current_plan_and_durable_adopted_claim(cell):
+    _, _, launch = cell
+    result = _result(launch('''
+        token = {"resume_needed": True, "profiles": {}, "cold_start_if_installed": True,
+                 "cold_start_home": os.environ["HERMES_HOME"], "attested_generation": "dead-root"}
+        r.write(r.stamp_tree(token), owner=r.UNOWNED)
+        adopted, claims = r.adopt_orphans()
+        claimed_before = r.read(claims[0])
+        current = {"resume_needed": True, "profiles": {}, "cold_start_if_installed": True,
+                   "cold_start_home": str(Path(os.environ["HERMES_HOME"]) / "profiles" / "alpha")}
+        before = dict(current)
+        rejected = False
+        try:
+            r.record_pause(current, adopted, claims)
+        except r.RecordConflict:
+            rejected = True
+        print(json.dumps({"rejected": rejected, "current_unchanged": current == before,
+                          "claim_retained": claims[0].exists(),
+                          "claim_token_unchanged": r.read(claims[0]) == claimed_before if claims[0].exists() else False}))
+    '''))
+    assert result == {"rejected": True, "current_unchanged": True, "claim_retained": True, "claim_token_unchanged": True}

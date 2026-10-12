@@ -34,6 +34,18 @@ export function npmCommand({ env = process.env } = {}) {
   return [process.execPath, cli]
 }
 
+// npm's lifecycle scripts invoke plain `node`; executing npm by absolute path
+// alone does not make that Node available to them. Keep the selected runtime
+// first, including when a Windows caller supplies differently cased PATH keys.
+function nodeEnvironment(node, env) {
+  const pathKeys = Object.keys(env).filter(key => process.platform === 'win32' ? /^path$/i.test(key) : key === 'PATH')
+  const inherited = pathKeys.map(key => env[key]).filter(Boolean)
+  return {
+    ...Object.fromEntries(Object.entries(env).filter(([key]) => !pathKeys.includes(key))),
+    PATH: [dirname(node), ...inherited].join(delimiter),
+  }
+}
+
 // npm's own manifest states its version — no child spawn. A node-under-node spawn
 // hits Windows Job-Object EBUSY (#123933), and the probe runs before the reuse
 // short-circuit: a read-only version read must not abort an otherwise complete run.
@@ -74,7 +86,7 @@ function runNpmCi(node, npm, args, { source, env }) {
   // Builders set CI=1, which turns npm's spinner off. Ask for it back: npm
   // still shows it only on a terminal. Kept out of `args`, which keys the receipt.
   const run = () => execFileSync(node, [npm, ...args, '--progress=true', `--logs-dir=${logsDir}`],
-    { cwd: source, env, stdio: 'inherit' })
+    { cwd: source, env: nodeEnvironment(node, env), stdio: 'inherit' })
   try {
     run()
   } catch (error) {
@@ -162,7 +174,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   // The Python bundle driver uses this same resolver, not a second layout probe.
   if (process.argv[2] === '--npm') {
     const [node, ...command] = npmCommand()
-    const child = spawnSync(node, [...command, ...process.argv.slice(3)], { stdio: 'inherit' })
+    const child = spawnSync(node, [...command, ...process.argv.slice(3)], { env: nodeEnvironment(node, process.env), stdio: 'inherit' })
     if (child.error) throw child.error
     process.exit(child.status ?? 1)
   }
