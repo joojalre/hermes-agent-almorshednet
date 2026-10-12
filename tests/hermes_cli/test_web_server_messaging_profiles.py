@@ -323,6 +323,55 @@ def test_scoped_enablement_uses_only_own_credentials(client, isolated_profiles, 
     assert "root-token" in (isolated_profiles["default"] / ".env").read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    "flag,platform_config,enabled,configured",
+    [
+        pytest.param("true", None, True, True, id="own-env-opt-in"),
+        pytest.param("false", None, False, False, id="own-env-opt-out"),
+        pytest.param(None, None, False, False, id="never-inherit-root-opt-in"),
+        pytest.param("true", {"enabled": False}, False, True, id="yaml-disable-wins"),
+        pytest.param("false", {"enabled": True, "extra": {"bridge_port": 3001}}, False, False,
+                     id="env-opt-out-wins"),
+        pytest.param(None, {"enabled": True, "extra": {"bridge_port": 3001}}, True, True,
+                     id="yaml-configured-without-env"),
+        pytest.param(None, {"enabled": True}, True, True, id="yaml-opt-in-without-env"),
+    ],
+)
+def test_scoped_whatsapp_enablement_matches_gateway_opt_in(
+    client, isolated_profiles, monkeypatch, flag, platform_config, enabled, configured,
+):
+    monkeypatch.setenv("WHATSAPP_ENABLED", "true")
+    worker = isolated_profiles["worker_alpha"]
+    (worker / ".env").write_text(f"WHATSAPP_ENABLED={flag}\n" if flag is not None else "", encoding="utf-8")
+    if platform_config is not None:
+        (worker / "config.yaml").write_text(
+            yaml.safe_dump({"platforms": {"whatsapp": platform_config}}), encoding="utf-8",
+        )
+    response = client.get("/api/messaging/platforms", params={"profile": "worker_alpha"})
+    assert response.status_code == 200
+    whatsapp = next(row for row in response.json()["platforms"] if row["id"] == "whatsapp")
+    assert (whatsapp["enabled"], whatsapp["configured"]) == (enabled, configured)
+    if not enabled:
+        assert whatsapp["state"] == "disabled"
+
+
+def test_scoped_whatsapp_opt_in_preserves_live_connected_state(client, isolated_profiles, monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli.web_routers import messaging
+
+    (isolated_profiles["worker_alpha"] / ".env").write_text("WHATSAPP_ENABLED=true\n", encoding="utf-8")
+    monkeypatch.setattr(_gw_status, "read_runtime_status", lambda **kwargs: {
+        "gateway_state": "running", "platforms": {"whatsapp": {"state": "connected"}},
+    })
+    monkeypatch.setattr(messaging, "multiplexer_liveness_for_profile", lambda home: None)
+    monkeypatch.setattr(messaging, "resolve_gateway_liveness", lambda **kwargs: SimpleNamespace(running=True))
+    response = client.get("/api/messaging/platforms", params={"profile": "worker_alpha"})
+    assert response.status_code == 200
+    whatsapp = next(row for row in response.json()["platforms"] if row["id"] == "whatsapp")
+    assert (whatsapp["enabled"], whatsapp["configured"], whatsapp["state"]) == (True, True, "connected")
+
+
 @pytest.mark.parametrize("topology", ["scoped_query", "pooled_unscoped"])
 def test_credential_write_hot_serves_a_multiplexed_profile(client, isolated_profiles, monkeypatch, topology):
     """A token saved for a profile the live multiplexer serves is handed to the multiplexer right

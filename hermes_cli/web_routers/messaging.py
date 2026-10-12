@@ -40,6 +40,7 @@ from hermes_cli.web_models import (
     MessagingPlatformUpdate, TelegramOnboardingApply, TelegramOnboardingStart,
     WhatsAppOnboardingApply, WhatsAppOnboardingStart,
 )
+from utils import is_truthy_value
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter()
@@ -185,6 +186,12 @@ def _platform_enablement(
             hc = plat_cfg.get("home_channel")
             # Setup writes credentials without a platforms entry; explicit disable wins.
             raw_enabled = plat_cfg.get("enabled")
+            if platform_id == "whatsapp":
+                # QR auth has no required credential fields; match the gateway's own opt-in.
+                flag = env_on_disk.get("WHATSAPP_ENABLED", "").strip().lower()
+                configured = is_truthy_value(flag) or bool(raw_enabled)
+                if flag in {"false", "0", "no"}:
+                    raw_enabled, configured = False, False
             enabled = False if raw_enabled is False else bool(raw_enabled) or configured
             home_channel = hc if isinstance(hc, dict) else None
         except Exception:
