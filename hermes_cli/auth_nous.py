@@ -1378,16 +1378,17 @@ def _nous_device_code_login(
     timeout_seconds: float = 15.0, insecure: bool = False, ca_bundle: Optional[str] = None,
     on_verification: Optional[Callable[[str, str], None]] = None) -> dict[str, Any]:
     """Run the Nous device-code flow and return full OAuth state without persisting."""
+    from agent.secret_scope import get_secret
     from hermes_cli.auth import (
         PROVIDER_REGISTRY, _coerce_ttl_seconds, _is_remote_session, _optional_base_url,
         _poll_for_token, _print_device_code_instructions, _request_device_code,
         _tls_state_from_verify, format_auth_error, refresh_nous_oauth_from_state)
     pconfig = PROVIDER_REGISTRY["nous"]
     portal_base_url = (
-        portal_base_url or os.getenv("HERMES_PORTAL_BASE_URL") or os.getenv("NOUS_PORTAL_BASE_URL")
+        portal_base_url or get_secret("HERMES_PORTAL_BASE_URL") or get_secret("NOUS_PORTAL_BASE_URL")
         or pconfig.portal_base_url).rstrip("/")
     requested_inference_url = (
-        inference_base_url or os.getenv("NOUS_INFERENCE_BASE_URL")
+        inference_base_url or get_secret("NOUS_INFERENCE_BASE_URL")
         or pconfig.inference_base_url).rstrip("/")
     client_id = client_id or pconfig.client_id
     scope = scope or pconfig.scope

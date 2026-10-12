@@ -1838,13 +1838,11 @@ def _(rid, params: dict) -> dict:
 
 
 # ── billing / subscription ───────────────────────────────────────────
-# All fail-open: a logged-out / unreachable portal yields an ``ok`` envelope with a typed
-# ``error`` (not a JSON-RPC error) so the TUI maps it to copy. ``billing:manage`` routes
-# return error=insufficient_scope on 403, which drives the ``billing.step_up`` device flow.
+# Fail-open portal envelopes retain typed errors; billing:manage refusals drive step-up.
 def _billing_view(name: str, module: str, builder: str, serializer: str, fallback: dict) -> None:
-    """Read-only view RPC (no scope required): ``serializer(module.builder())``, ``fallback`` on any error.
-    The view module stays a lazy import (startup budget); the serializer is a server global."""
+    """Profile-bound read view, no billing:manage required; lazy build with fail-open fallback."""
     @method(name)
+    @_profile_scoped
     def _(rid, params: dict) -> dict:
         try:
             from importlib import import_module
@@ -1854,10 +1852,10 @@ def _billing_view(name: str, module: str, builder: str, serializer: str, fallbac
 
 
 @method("billing.state")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
-    """Read-only billing view (no scope required); fail-open. The Nous free tier has no account to
-    bill, so its state is answered locally (``free_tier_account`` set, ``logged_in`` false) without a portal
-    round-trip that could only fail."""
+    """Profile-bound billing view (no billing:manage required); fail-open. The free tier is
+    answered locally with ``free_tier_account`` set and ``logged_in`` false."""
     try:
         from agent.billing_view import BillingState, build_billing_state
         from hermes_cli.anon_auth import has_free_tier_account
@@ -1876,6 +1874,7 @@ _billing_view("subscription.state", "agent.subscription_view", "build_subscripti
 
 
 @method("subscription.preview")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """POST /api/billing/subscription/preview → chargeless effect quote. billing:manage."""
     from agent.subscription_view import subscription_change_preview_from_payload
@@ -1888,10 +1887,10 @@ def _(rid, params: dict) -> dict:
 
 def _billing_route(name: str, call, *, invalid=None, message: str = "", error: str = "invalid_request",
                    idempotent: bool = False):
-    """Portal write route on ``hermes_cli.nous_billing`` (lazy; tests patch its functions): ``invalid(params)``
-    → ``_billing_invalid(message, error)``; ``call(nb, params, key)`` performs the request. ``idempotent``
-    mints ``idempotency_key`` if absent and echoes it (also on error) so the TUI retries the SAME operation."""
+    """Profile-bound portal route: validate, call, and retain the idempotency key on errors.
+    Lazy imports keep startup light; an absent key is minted only for idempotent routes."""
     @method(name)
+    @_profile_scoped
     def _(rid, params: dict) -> dict:
         import hermes_cli.nous_billing as nb
         if invalid is not None and invalid(params):
@@ -1941,6 +1940,7 @@ _billing_route("billing.auto_reload", _auto_reload, message="threshold and top_u
 
 
 @method("billing.step_up")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """billing:manage step-up device flow → {ok, granted} (false when the server downscopes). Pooled (blocks
     for minutes); URL/code reach the TUI via ``billing.step_up.verification`` (stdout is the RPC pipe) and the
