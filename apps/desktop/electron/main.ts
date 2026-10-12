@@ -575,6 +575,7 @@ import { ensureLoginShellPath } from './shell-path'
 import { removeStaleSingletonLock } from './singleton-lock'
 import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
 import { resolveSourcePython } from './source-python'
+import { createSourceRootSelection } from './source-root-selection'
 import { resolveSshBinary } from './ssh-binary'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -629,6 +630,7 @@ import {
   type UpdaterStrategy
 } from './updater'
 import {
+  launcherInstallDirectory,
   observeUpdaterHandoff,
   repairMacUpdaterHelper,
   resolveInstallationLauncher,
@@ -3676,9 +3678,8 @@ function writeZoomState(zoomLevel) {
   }
 }
 
-// Match the backend's source resolution but bias toward a real git checkout.
-// Dev → SOURCE_REPO_ROOT. Packaged/CLI install → ACTIVE_HERMES_ROOT.
-// HERMES_DESKTOP_HERMES_ROOT always wins so devs can pin a worktree.
+// Backend selection owns checkout identity. Before it completes, use the same
+// explicit/development/published-install order to locate the source root.
 function resolveUpdateRoot() {
   const candidates = [
     process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
@@ -3686,7 +3687,7 @@ function resolveUpdateRoot() {
     isHermesSourceRoot(ACTIVE_HERMES_ROOT) ? ACTIVE_HERMES_ROOT : null
   ].filter(Boolean)
 
-  return candidates.find(isGitCheckout) || candidates[0] || ACTIVE_HERMES_ROOT
+  return sourceRoots.updateRoot(candidates as string[])
 }
 
 function emitUpdateProgress(payload) {
@@ -5236,6 +5237,18 @@ function writeDefaultProjectDir(dir) {
 
 const installedRuntimeGate = createInstalledRuntimeGate(process.env, rememberLog)
 
+const sourceRoots = createSourceRootSelection({
+  canonicalRoot: ACTIVE_HERMES_ROOT,
+  isSourceRoot: isHermesSourceRoot,
+  isManagedRoot: root => directoryExists(path.join(root, 'pm')),
+  developerPython: () => Boolean(process.env.HERMES_DESKTOP_PYTHON),
+  sourcePython: async (root, args) => createSourcePythonBackend(root, await findPythonForRoot(root), args),
+  installation: (root, args) => resolveSourceInstallationBackend(root, args, { hermesHome: HERMES_HOME }),
+  publishedInstall: () => userLauncherInstallRoot(IS_WINDOWS, HERMES_HOME),
+  installedGate: installedRuntimeGate,
+  log: rememberLog
+})
+
 async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHermesBackend> {
   const payload = bundledPayload(process.resourcesPath)
 
@@ -5262,17 +5275,9 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
   const overrideRoot: string | undefined =
     process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT)
 
-  if (overrideRoot && isHermesSourceRoot(overrideRoot)) {
-    const backend: SourceBackend | null = createSourcePythonBackend(
-      overrideRoot,
-      await findPythonForRoot(overrideRoot),
-      backendArgs
-    )
+  const overrideBackend = await sourceRoots.explicit(overrideRoot, backendArgs)
 
-    if (backend) {
-      return backend
-    }
-  }
+  if (overrideBackend) {return overrideBackend}
 
   // 2. Development source -- when running `npm run dev` from a checkout, the
   //    cloned repo at SOURCE_REPO_ROOT takes precedence over ACTIVE and any
@@ -5286,6 +5291,8 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
     )
 
     if (backend) {
+      sourceRoots.record(backend.root)
+
       return backend
     }
   }
@@ -5317,6 +5324,8 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
           await unwrapWindowsVenvHermesCommand(hermesCommand, backendArgs)
 
         if (unwrapped) {
+          sourceRoots.record(unwrapped.root)
+
           return unwrapped
         }
 
@@ -5326,9 +5335,13 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
           shouldTrustHermesOverride(hermesOverride) ||
           (await verifyHermesCli(hermesCommand, { shell: shellForProbe }))
         ) {
+          const root = launcherInstallDirectory(hermesCommand)
+          sourceRoots.record(root)
+
           return {
             label: `existing Hermes CLI at ${hermesCommand}`,
             command: hermesCommand,
+            root,
             args: backendArgs,
             bootstrap: false,
             env: {},
@@ -5345,57 +5358,17 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
     }
   }
 
-  // 4. ACTIVE_HERMES_ROOT — the canonical install at
-  //    %LOCALAPPDATA%\\hermes\\hermes-agent (Windows) or ~/.hermes/hermes-agent.
-  //    A valid bootstrap marker proves Desktop finished the first-run install
-  //    flow, but marker provenance is NOT the same thing as runtime usability:
-  //    the CLI can publish the same installation launcher, and older desktop
-  //    builds could leave a healthy install behind without the marker. If the
-  //    active runtime is usable, launch it directly; only fall through to
-  //    bootstrap when the runtime itself is unusable.
-  //    HERMES_DESKTOP_IGNORE_EXISTING=1 skips this rung (see backend-resolution).
-  const activeBackend: SourceBackend | null = await installedRuntimeGate.resolve(ACTIVE_HERMES_ROOT, () =>
-    resolveSourceInstallationBackend(ACTIVE_HERMES_ROOT, backendArgs, { hermesHome: HERMES_HOME })
-  )
+  const installedBackend = bootstrapRepairRequested ? null : await sourceRoots.installed(backendArgs)
 
-  const activeRuntime: ActiveRuntimeState = activeRuntimeState(activeBackend)
-
-  if (activeBackend && !bootstrapRepairRequested) {
-    if (!activeRuntime.hasValidMarker) {
-      rememberLog(
-        `[bootstrap] Active Hermes runtime at ${ACTIVE_HERMES_ROOT} is usable but the bootstrap marker is missing or stale; skipping first-run bootstrap.`
-      )
+  if (installedBackend) {
+    if (!activeRuntimeState(installedBackend).hasValidMarker) {
+      rememberLog(`[bootstrap] Hermes runtime at ${installedBackend.root} is usable without a current bootstrap marker; skipping bootstrap.`)
     }
 
-    return activeBackend
+    return installedBackend
   }
 
-  if (bootstrapRepairRequested) {
-    rememberLog('[bootstrap] repair requested; bypassing the usable active runtime to re-run the installer')
-  } else {
-    // 5. A source install outside ACTIVE_HERMES_ROOT (install.sh --dir, a
-    //    setup-hermes.sh clone), found through the launcher it published at a
-    //    fixed user-bin location: a Finder/Dock launch inherits a PATH without
-    //    ~/.local/bin. The reported root is then resolved and probed like any
-    //    installed runtime; HERMES_DESKTOP_IGNORE_EXISTING=1 skips it too.
-    const userInstall: ReturnType<typeof userLauncherInstallRoot> = userLauncherInstallRoot(IS_WINDOWS, HERMES_HOME)
-
-    if (userInstall) {
-      const userBackend: SourceBackend | null = await installedRuntimeGate.resolve(userInstall.root, () =>
-        resolveSourceInstallationBackend(userInstall.root, backendArgs, { hermesHome: HERMES_HOME })
-      )
-
-      if (userBackend) {
-        rememberLog(`[boot] Using Hermes install at ${userInstall.root} (published launcher ${userInstall.launcher})`)
-
-        return userBackend
-      }
-
-      rememberLog(`[bootstrap] Hermes install at ${userInstall.root} (from ${userInstall.launcher}) is not usable`)
-    } else {
-      rememberLog(`[bootstrap] no usable Hermes install at ${ACTIVE_HERMES_ROOT} and no published user-bin launcher`)
-    }
-  }
+  if (bootstrapRepairRequested) {rememberLog('[bootstrap] repair requested; bypassing installed runtimes')}
 
   // 6. Nothing usable yet -- signal the bootstrap runner that we need to
   //    clone+install. Phase 1D's bootstrap-runner consumes this sentinel

@@ -161,8 +161,8 @@ def _branch_tip(repository: str | None, branch: str, root: Path, git: str,
             return sha, False, None
         if failure is None:
             failure = "api.github.com returned no commit for the branch."
-        if branch == "main" and remote == "origin":
-            return None, False, failure
+    # Git's ref advertisement remains available when the GitHub API is rate-limited.
+    # Only a successful empty advertisement can establish that the branch is gone.
     result = _git_run(["ls-remote", "--exit-code", "--heads", remote, f"refs/heads/{branch}"],
                       cwd=root, git=git, timeout=10)
     if result is None:

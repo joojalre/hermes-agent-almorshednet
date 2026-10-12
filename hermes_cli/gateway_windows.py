@@ -745,7 +745,8 @@ def windowless_gateway_restart_spec(run_argv: list[str], home: str | None = None
         hermes_home = str(Path(home or _hermes_home()).resolve())
     except Exception:
         hermes_home = ""
-    env_overlay: dict[str, str] = {"PYTHONIOENCODING": "utf-8", "HERMES_GATEWAY_DETACHED": "1", "VIRTUAL_ENV": str(venv_dir)}
+    # Like a fresh detached launch, a respawn must not follow the sticky active profile.
+    env_overlay: dict[str, str] = {**dict(_GATEWAY_ENV), "VIRTUAL_ENV": str(venv_dir)}
     if hermes_home:
         env_overlay["HERMES_HOME"] = hermes_home
     _prepend_pythonpath(env_overlay, [str(PROJECT_ROOT), *extra_pythonpath])

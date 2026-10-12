@@ -529,9 +529,81 @@ def test_github_calls_carry_the_configured_token_and_retry_anonymously_on_401(in
     assert github_authorizations(installation, url)[-2:] == ["Bearer ghp_fixture", None]
 
 
-def test_branch_tip_failure_names_the_cause(installation):
+def redirect_ref_advertisement(monkeypatch, remote, target):
+    """Keep the GitHub origin identity; redirect only Git's transport to a local fixture."""
+    original = subprocess.run
+    commands = []
+
+    def record(args, **kwargs):
+        commands.append((args, kwargs))
+        if "ls-remote" in args:
+            kwargs = {**kwargs, "env": {**kwargs["env"], "GIT_CONFIG_COUNT": "1",
+                                       "GIT_CONFIG_KEY_0": f"url.{target.as_uri()}.insteadOf",
+                                       "GIT_CONFIG_VALUE_0": remote}}
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    return commands
+
+
+@pytest.mark.parametrize("code", [403, 404, 503])
+def test_main_branch_tip_recovers_with_read_only_git_after_http_failure(installation, monkeypatch, code):
+    from hermes_cli.source_check import check_for_updates
+    from hermes_cli.update_channel import set_install_channel
+
+    root, _linked, home, _base, head, responses, requests, git = installation
+    official = "https://github.com/NousResearch/hermes-agent.git"
+    git("remote", "set-url", "origin", official)
+    set_install_channel("main", root)
+    url = "/repos/NousResearch/hermes-agent/commits/main"
+    responses[url] = (code, {})
+    if code == 403:
+        installation.response_headers[url] = {"X-RateLimit-Remaining": "0"}
+    before = {str(p.relative_to(root)): p.read_bytes() for p in (root / ".git").rglob("*") if p.is_file()}
+    commands = redirect_ref_advertisement(monkeypatch, official, root)
+    status = check_for_updates(install_root=root, home=home)
+    assert "error" not in status, status
+    assert status["targetSha"] == head
+    assert status["behind"] == 0 and status["updateAvailable"] is False
+    assert status["branch"] == "main" and requests == [url]
+    probes = [(args, kwargs) for args, kwargs in commands if "ls-remote" in args]
+    assert len(probes) == 1
+    args, kwargs = probes[0]
+    assert args[1:] == ["ls-remote", "--exit-code", "--heads", "origin", "refs/heads/main"]
+    assert kwargs["timeout"] == 10 and kwargs["stdin"] == subprocess.DEVNULL
+    assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert all(not any(arg in {"fetch", "push", "checkout", "reset", "update-ref", "stash"} for arg in args)
+               for args, _kwargs in commands)
+    after = {str(p.relative_to(root)): p.read_bytes() for p in (root / ".git").rglob("*") if p.is_file()}
+    assert before == after
+
+
+@pytest.mark.parametrize("reachable", [True, False])
+def test_main_branch_absence_requires_a_successful_git_advertisement(installation, monkeypatch, reachable):
+    from hermes_cli.source_check import _branch_tip
+
+    root, _linked, home, _base, _head, responses, _requests, git = installation
+    empty = home / "empty.git"
+    if reachable:
+        git("init", "--bare", str(empty))
+    official = "https://github.com/NousResearch/hermes-agent.git"
+    git("remote", "set-url", "origin", official)
+    redirect_ref_advertisement(monkeypatch, official, empty)
+    responses["/repos/NousResearch/hermes-agent/commits/main"] = (404, {})
+    target, missing, failure = _branch_tip("NousResearch/hermes-agent", "main", root, "git")
+    assert target is None
+    assert missing is reachable
+    assert (failure is None) is reachable
+    if not reachable:
+        assert "404" in failure
+
+
+def test_branch_tip_failure_names_the_cause(installation, monkeypatch):
     from hermes_cli.source_check import check_for_updates
     root, _linked, home, _base, _head, responses, _requests, _git = installation
+    # Both transports fail: the ref advertisement targets an absent local repository.
+    redirect_ref_advertisement(monkeypatch, "https://github.com/fixture/fork.git", home / "unreachable")
     url = "/repos/fixture/fork/commits/main"
     responses[url] = (403, {})
     installation.response_headers[url] = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "4102444800"}
