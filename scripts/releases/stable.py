@@ -832,6 +832,19 @@ def _final_metadata(tag: str, commit: str, claim: dict, candidate_manifest_sha25
     }
 
 
+def authenticated_push(ref: str, env: dict | None = None) -> list[str]:
+    """``git push origin <ref>`` that authenticates with GH_TOKEN when it is set.
+
+    The publication checkout runs with persist-credentials: false, so git has
+    no token of its own; gh hands GH_TOKEN to this one push as a credential
+    helper, keeping the token out of argv and out of .git/config.
+    """
+    env = os.environ if env is None else env
+    auth = (["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
+            if env.get("GH_TOKEN") else [])
+    return ["git", *auth, "push", "origin", ref]
+
+
 def ensure_final_tag(tag: str, commit: str, claim: dict, *, candidate_manifest_sha256: str | None,
                      docker_manifest_digest: str, release_id: int, run=output) -> str:
     """Create or verify the immutable annotated final tag."""
@@ -856,7 +869,7 @@ def ensure_final_tag(tag: str, commit: str, claim: dict, *, candidate_manifest_s
                     or run(["git", "rev-parse", f"{ref}^{{commit}}"]) != commit
                     or tag_record(run(["git", "tag", "-l", tag, "--format=%(contents)"])) != expected):
                 raise ValueError("Local final tag collision")
-        run(["git", "push", "origin", ref])
+        run(authenticated_push(ref))
         remote_raw = run(["git", "ls-remote", "origin", ref, f"{ref}^{{}}"])
     remote = dict(line.split()[::-1] for line in remote_raw.splitlines())
     tag_object, peeled = remote.get(ref), remote.get(f"{ref}^{{}}")

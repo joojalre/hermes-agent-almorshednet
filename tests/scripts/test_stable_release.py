@@ -1161,3 +1161,15 @@ def test_a_claim_that_skipped_tests_records_skipped_smokes_never_passed(
     stable.require_smokes_match_claim(manifest, skip_tests=True)
     with pytest.raises(ValueError, match="test policy"):
         stable.require_smokes_match_claim(manifest, skip_tests=False)
+
+
+def test_the_final_tag_push_authenticates_with_gh_token_without_persisted_credentials():
+    """The publication checkout persists no credentials; the push brings GH_TOKEN itself."""
+    from scripts.releases.stable import authenticated_push
+    ref = "refs/tags/v1.2.3"
+    argv = authenticated_push(ref, {"GH_TOKEN": "token"})
+    assert argv[0] == "git" and argv[-3:] == ["push", "origin", ref]
+    # Reset inherited helpers first, then hand git the token through gh.
+    assert argv[1:5] == ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential"]
+    assert "token" not in " ".join(argv)
+    assert authenticated_push(ref, {}) == ["git", "push", "origin", ref]

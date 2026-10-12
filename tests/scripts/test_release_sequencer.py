@@ -457,7 +457,7 @@ def _sequencer_fixture(*versions, manifest_digest, docker_digest="sha256:" + "b"
             tag = argv[argv.index("-a") + 1]
             tags[tag] = (str(len(tags)) * 40, tags[claim_tag][1], tags[tag][2])
             return ""
-        if argv[:2] == ["git", "push"]:
+        if argv[0] == "git" and "push" in argv:
             return ""
         if argv[:3] == ["docker", "buildx", "imagetools"]:
             return json.dumps(docker_digest)
