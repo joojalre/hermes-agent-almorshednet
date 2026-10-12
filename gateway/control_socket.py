@@ -255,19 +255,44 @@ class _PipeControlProtocol(asyncio.Protocol):
         self._server = server
         self._transport: Any = None
         self._buffer = bytearray()
+        self._request_received = False
+        self._response_task: asyncio.Task[None] | None = None
 
     def connection_made(self, transport) -> None:  # pragma: no cover - windows
         self._transport = transport
 
+    def connection_lost(self, exc) -> None:  # pragma: no cover - windows
+        self._transport = None
+
     def data_received(self, data: bytes) -> None:  # pragma: no cover - windows
+        if self._request_received or self._transport is None:
+            return
         self._buffer.extend(data)
         if len(self._buffer) > _MAX_REQUEST_BYTES:
+            self._request_received = True
             self._transport.close()
         elif b"\n" in self._buffer:
-            try:
-                self._transport.write(self._server.handle_request_line(bytes(self._buffer).partition(b"\n")[0]))
-            finally:
-                self._transport.close()
+            self._request_received = True
+            raw = bytes(self._buffer).partition(b"\n")[0]
+            self._buffer.clear()
+            # Control handlers marshal work back onto this loop and wait for it;
+            # running them here blocks that work (and every platform heartbeat).
+            self._response_task = asyncio.create_task(self._respond(raw))
+
+    async def _respond(self, raw: bytes) -> None:  # pragma: no cover - windows
+        try:
+            # Carry the connection's profile context across the worker hop.
+            response = await asyncio.to_thread(self._server.handle_request_line, raw)
+            if self._transport is not None:
+                self._transport.write(response)
+        except (ConnectionError, OSError):
+            pass
+        except Exception as exc:  # health: allow BLE001 -- IPC boundary logs types without request data
+            logger.debug("Control pipe connection handler error: %s", type(exc).__name__)
+        finally:
+            if self._transport is not None:
+                with contextlib.suppress(Exception):
+                    self._transport.close()
 
 
 def query_gateway_control(home: Path, verb: str, *, params: Optional[dict[str, Any]] = None,

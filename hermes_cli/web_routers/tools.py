@@ -20,7 +20,7 @@ from hermes_cli.web_models import (
     TerminalBackendSelect, ToolsetEnvUpdate, ToolsetModelSelect, ToolsetPostSetup,
     ToolsetProviderSelect, ToolsetToggle)
 from hermes_cli.web_routers._common import (
-    _CONFIG_MUTATION_LOCK, _profile_cli_args, _profile_scope, _spawn_hermes_action,
+    _CONFIG_MUTATION_LOCK, _config_profile_scope, _profile_cli_args, _profile_scope, _spawn_hermes_action,
     config_write_scope, log as _log, scoped_to_thread, spawn_profile_action)
 
 router = APIRouter()
@@ -238,7 +238,8 @@ async def get_toolsets(profile: Optional[str] = None):
     from utils import is_truthy_value
 
     def _read():
-        with _profile_scope(profile):
+        # Config and secret reads do not need the process-wide skills-directory lock.
+        with _config_profile_scope(profile):
             config = load_config()
             toolset_rows = _get_effective_configurable_toolsets()
             target_platforms = {

@@ -23,6 +23,7 @@ export function useSkillsQuery(profile: ProfileScope) {
   return useQuery({
     queryKey: skillsQueryKey(profile),
     queryFn: () => getSkills(profile),
+    retry: false,
     staleTime: 0
   })
 }

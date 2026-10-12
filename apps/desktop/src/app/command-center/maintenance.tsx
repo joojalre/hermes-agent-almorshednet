@@ -3,15 +3,13 @@ import { useCallback, useEffect, useState } from 'react'
 import { PageLoader } from '@/components/page-loader'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ErrorState } from '@/components/ui/error-state'
 import {
   type ActionResponse,
   type CuratorStatusResponse,
   type DebugShareResponse,
   getActionStatus,
   getCuratorStatus,
-  getMemoryStatus,
-  type MemoryStatusResponse,
-  resetMemory,
   runBackup,
   runCurator,
   runDebugShare,
@@ -23,12 +21,17 @@ import { useI18n } from '@/i18n'
 import { AlertCircle } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
-import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import type { ActionStatusResponse } from '@/types/hermes'
 
+import { useMemoryFiles } from './use-memory-files'
+
 const ACTION_POLL_MS = 1200
 const ACTION_POLL_LIMIT = 240 // ~5 minutes of polling before giving up.
+
+interface MaintenancePanelProps {
+  onOpenFile?: () => void
+}
 
 function formatBytes(size: number): string {
   if (size <= 0) {
@@ -50,7 +53,7 @@ function formatBytes(size: number): string {
  *  `backup` / `debug share` / `curator` / `memory` (the dashboard System page's
  *  ops section). Spawn-based actions tail their logs inline via the shared
  *  /api/actions status endpoint. */
-export function MaintenancePanel() {
+export function MaintenancePanel({ onOpenFile }: MaintenancePanelProps) {
   const { t } = useI18n()
   const mm = t.commandCenter.maintenance
 
@@ -60,8 +63,7 @@ export function MaintenancePanel() {
   const [actionStatus, setActionStatus] = useState<ActionStatusResponse | null>(null)
   const [curator, setCurator] = useState<CuratorStatusResponse | null>(null)
   const [curatorBusy, setCuratorBusy] = useState(false)
-  const [memory, setMemory] = useState<MemoryStatusResponse | null>(null)
-  const [memoryBusy, setMemoryBusy] = useState(false)
+  const { memory, memoryBusy, memoryError, doResetMemory, openMemoryFile, retryMemory } = useMemoryFiles(onOpenFile)
   const [share, setShare] = useState<DebugShareResponse | null>(null)
   const [sharing, setSharing] = useState(false)
   const [error, setError] = useState('')
@@ -71,9 +73,6 @@ export function MaintenancePanel() {
 
     getCuratorStatus()
       .then(next => !cancelled && setCurator(next))
-      .catch(() => {})
-    getMemoryStatus()
-      .then(next => !cancelled && setMemory(next))
       .catch(() => {})
 
     return () => void (cancelled = true)
@@ -170,27 +169,6 @@ export function MaintenancePanel() {
       setCuratorBusy(false)
     }
   }, [curator, mm])
-
-  const doResetMemory = useCallback(
-    async (target: 'all' | 'memory' | 'user', label: string) => {
-      if (!(await confirm({ destructive: true, title: mm.resetConfirm(label) }))) {
-        return
-      }
-
-      setMemoryBusy(true)
-
-      try {
-        const result = await resetMemory(target)
-        notify({ kind: 'success', title: mm.resetDone(result.deleted.join(', ') || label), message: '' })
-        setMemory(await getMemoryStatus())
-      } catch (err) {
-        notifyError(err, mm.resetFailed)
-      } finally {
-        setMemoryBusy(false)
-      }
-    },
-    [mm]
-  )
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto pb-2">
@@ -317,7 +295,13 @@ export function MaintenancePanel() {
 
       <section>
         <SectionLabel>{mm.memoryData}</SectionLabel>
-        {!memory ? (
+        {memoryError ? (
+          <ErrorState description={memoryError} title={mm.memoryData}>
+            <Button onClick={retryMemory} size="xs" variant="textStrong">
+              {t.common.retry}
+            </Button>
+          </ErrorState>
+        ) : !memory ? (
           <PageLoader className="min-h-16" label={mm.memoryData} />
         ) : (
           <div>
@@ -329,6 +313,7 @@ export function MaintenancePanel() {
             <MemoryFileRow
               busy={memoryBusy}
               label={mm.memoryFile}
+              onOpen={() => void openMemoryFile('MEMORY.md')}
               onReset={() => void doResetMemory('memory', mm.memoryFile)}
               resetLabel={mm.resetMemory}
               size={memory.builtin_files.memory}
@@ -337,6 +322,7 @@ export function MaintenancePanel() {
             <MemoryFileRow
               busy={memoryBusy}
               label={mm.userFile}
+              onOpen={() => void openMemoryFile('USER.md')}
               onReset={() => void doResetMemory('user', mm.userFile)}
               resetLabel={mm.resetUser}
               size={memory.builtin_files.user}
@@ -386,6 +372,7 @@ function OpRow({
 function MemoryFileRow({
   busy,
   label,
+  onOpen,
   onReset,
   resetLabel,
   size,
@@ -393,6 +380,7 @@ function MemoryFileRow({
 }: {
   busy: boolean
   label: string
+  onOpen: () => void
   onReset: () => void
   resetLabel: string
   size: number
@@ -401,7 +389,9 @@ function MemoryFileRow({
   return (
     <div className="flex items-center justify-between gap-3 py-2">
       <div className="min-w-0">
-        <span className="text-[length:var(--conversation-text-font-size)] font-medium">{label}</span>
+        <Button disabled={busy} onClick={onOpen} size="inline" variant="textStrong">
+          {label}
+        </Button>
         <span className="ml-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
           {sizeLabel}
         </span>

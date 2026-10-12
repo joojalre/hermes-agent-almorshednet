@@ -543,7 +543,7 @@ export function CommandCenterView({
                 usage={usage}
               />
             ) : section === 'maintenance' ? (
-              <MaintenancePanel />
+              <MaintenancePanel onOpenFile={onClose} />
             ) : (
               <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-4">
                 <SystemStatusSummary

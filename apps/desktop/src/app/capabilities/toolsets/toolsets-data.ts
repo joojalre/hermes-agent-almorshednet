@@ -22,6 +22,7 @@ export function useToolsetsQuery(profile: ProfileScope) {
   return useQuery({
     queryKey: toolsetsQueryKey(profile),
     queryFn: () => getToolsets(profile),
+    retry: false,
     staleTime: 0
   })
 }

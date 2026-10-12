@@ -8,7 +8,7 @@ import { getStatus } from '@/hermes'
 import { I18nProvider, type Locale, TRANSLATIONS, type Translations } from '@/i18n'
 import { $freeTierStatus } from '@/store/free-tier'
 import { $setupReadyTick, notifySetupReady } from '@/store/live-sync'
-import { clearNotifications } from '@/store/notifications'
+import { $notifications, clearNotifications, notify } from '@/store/notifications'
 import { $desktopOnboarding } from '@/store/onboarding'
 
 import { deferred } from '../../../test/deferred'
@@ -50,6 +50,72 @@ afterEach(() => {
 })
 
 describe('useStatusSnapshot', () => {
+  it('dismisses only the startup runtime notice when scoped readiness recovers', async () => {
+    let phase: 'fallback' | 'not-ready' | 'ready' = 'fallback'
+    const onboarding = $desktopOnboarding.get()
+    notify({ id: 'runtime-not-ready', kind: 'info', message: 'Backend startup could not be verified.' })
+    notify({ id: 'unrelated-notice', kind: 'info', message: 'Keep this notice.' })
+    const requestGateway = vi.fn(async (method: string) => {
+      if (phase === 'fallback') {
+        throw new Error('connection closed')
+      }
+
+      return (method === 'setup.runtime_check' ? { ok: phase === 'ready' } : { provider_configured: true }) as never
+    }) as unknown as GatewayRequester
+
+    const { result } = renderHook(() => useStatusSnapshot('open', requestGateway, 'local\0full'))
+    await flushAsync()
+    expect(result.current.inferenceStatus).toBeNull()
+    expect($notifications.get().map(notice => notice.id)).toContain('runtime-not-ready')
+
+    phase = 'not-ready'
+    await act(async () => {
+      notifySetupReady()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(result.current.inferenceStatus).toMatchObject({ ready: false, source: 'runtime_check' })
+    expect($notifications.get().map(notice => notice.id)).toContain('runtime-not-ready')
+
+    phase = 'ready'
+    await act(async () => {
+      notifySetupReady()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(result.current.inferenceStatus).toMatchObject({ ready: true, source: 'runtime_check' })
+    expect($notifications.get().map(notice => notice.id)).toEqual(['unrelated-notice'])
+    expect($desktopOnboarding.get()).toBe(onboarding)
+  })
+
+  it('keeps the startup runtime notice when a previous scope answers ready', async () => {
+    const oldSetup = deferred<unknown>()
+    const oldRuntime = deferred<unknown>()
+    let scope = 'old'
+    notify({ id: 'runtime-not-ready', kind: 'info', message: 'Backend startup could not be verified.' })
+    const requestGateway = vi.fn((method: string) => {
+      if (scope === 'old') {
+        return method === 'setup.runtime_check' ? oldRuntime.promise : oldSetup.promise
+      }
+
+      return Promise.resolve(method === 'setup.runtime_check' ? { ok: false } : { provider_configured: true })
+    }) as unknown as GatewayRequester
+    const { rerender, result } = renderHook(
+      ({ activeScope }) => useStatusSnapshot('open', requestGateway, activeScope),
+      { initialProps: { activeScope: 'local\0old' } }
+    )
+
+    scope = 'current'
+    rerender({ activeScope: 'local\0current' })
+    await flushAsync()
+    await act(async () => {
+      oldSetup.resolve({ provider_configured: true })
+      oldRuntime.resolve({ ok: true })
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    expect(result.current.inferenceStatus).toMatchObject({ ready: false, source: 'runtime_check' })
+    expect($notifications.get().map(notice => notice.id)).toEqual(['runtime-not-ready'])
+  })
+
   it.each(Object.entries(TRANSLATIONS) as [Locale, Translations][])(
     'localizes and deduplicates shared-profile warnings in %s',
     async (locale: Locale, copy: Translations): Promise<void> => {

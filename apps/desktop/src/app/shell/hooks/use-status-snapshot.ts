@@ -119,6 +119,10 @@ export function useStatusSnapshot(
         // of flashing "Inference not ready" during a gateway flap.
         publishInferenceStatus(inference)
         setFreeTierRoute(inference.freeTier)
+
+        if (inference.ready) {
+          dismissNotification('runtime-not-ready')
+        }
       }
     }
 
