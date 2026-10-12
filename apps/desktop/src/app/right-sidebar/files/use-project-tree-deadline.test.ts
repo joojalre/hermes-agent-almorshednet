@@ -46,6 +46,61 @@ afterEach(() => {
 })
 
 describe('file tree stalled native reads', () => {
+  it.each(['pending', 'completed'] as const)(
+    'starts a bounded replacement read after resetting a mounted %s root in the same scope',
+    async phase => {
+      const oldRead = deferred<HermesReadDirResult>()
+      const replacementRead = deferred<HermesReadDirResult>()
+      $connection.set({ mode: 'local', connectionId: 'device', profile: 'full' } as never)
+
+      if (phase === 'pending') {
+        readDir.mockImplementationOnce(() => oldRead.promise)
+      } else {
+        readDir.mockResolvedValueOnce(listing('before-reset.ts'))
+      }
+
+      readDir.mockImplementationOnce(() => replacementRead.promise)
+      const { result } = renderHook(() => useProjectTree('/same'))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(result.current.rootLoading).toBe(phase === 'pending')
+
+      await act(async () => {
+        resetProjectTreeState()
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(result.current.rootLoading).toBe(true)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_001)
+      })
+      expect(result.current.rootLoading).toBe(false)
+      expect(result.current.rootError).toBe('read-timeout')
+      expect(readDir).toHaveBeenCalledTimes(2)
+      expect(readDir.mock.calls.map(([path]) => path)).toEqual(['/same', '/same'])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(9_000)
+      })
+      expect(readDir).toHaveBeenCalledTimes(2)
+
+      await act(async () => {
+        await result.current.refreshRoot()
+      })
+      expect(readDir).toHaveBeenCalledTimes(3)
+      expect(result.current.rootError).toBeNull()
+      expect(result.current.data.map(node => node.name)).toEqual(['current.ts'])
+      await act(async () => {
+        oldRead.resolve(listing('old-generation.ts'))
+        replacementRead.resolve(listing('expired-replacement.ts'))
+        await vi.advanceTimersByTimeAsync(9_000)
+      })
+      expect(readDir).toHaveBeenCalledTimes(3)
+      expect(result.current.data.map(node => node.name)).toEqual(['current.ts'])
+      expect(result.current.rootLoading).toBe(false)
+    }
+  )
+
   it.each(['readDir', 'gitRoot'] as const)(
     'ends a stalled %s read with manual recovery and ignores its late result',
     async seam => {

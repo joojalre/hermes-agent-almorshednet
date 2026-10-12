@@ -578,7 +578,10 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
     }
 
     void loadRoot(cwd, { connectionKey })
-  }, [connectionKey, cwd])
+    // Gateway wiring can reset the shared tree after this effect has run,
+    // without changing the connection or requested cwd. Re-home that empty
+    // state into a new bounded read; loadRoot skips an already active root.
+  }, [connectionKey, cwd, state.cwd])
 
   // Self-heal: an errored root re-probes every few seconds while the tree is
   // mounted. Each attempt bumps requestId, so a persistent error re-arms the
