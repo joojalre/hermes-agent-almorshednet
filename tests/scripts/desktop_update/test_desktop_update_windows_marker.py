@@ -106,6 +106,97 @@ def _result(home: Path) -> dict:
     return json.loads((home / '.hermes-update-result.json').read_text(encoding='utf-8-sig'))
 
 
+_RELAUNCH_HARNESS = r"""
+param([string]$Script, [string]$InstallRoot, [string]$HermesHome, [string]$RelaunchExe,
+      [string]$Elevated)
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw $errors[0] }
+foreach ($function in $ast.FindAll({ param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -in @('Start-DesktopRelaunch', 'Start-SourceDesktopRelaunch', 'Test-DesktopRelaunchElevated')
+}, $false)) {
+    . ([scriptblock]::Create($function.Extent.Text))
+}
+. (Join-Path (Split-Path -Parent $Script) 'runtime.ps1')
+function Write-HandoffLog([string]$Message) { [Console]::Error.WriteLine($Message) }
+function Test-DesktopRelaunchElevated { return $Elevated -eq 'True' }
+function Invoke-CimMethod { $script:RawLaunch = $true; return @{ ReturnValue = 0; ProcessId = 4321 } }
+function Get-CimInstance {
+    if (Test-Path -LiteralPath (Join-Path $HermesHome 'relaunch.json')) {
+        return [pscustomobject]@{ ProcessId = 4321; ExecutablePath = $RelaunchExe; CreationDate = Get-Date }
+    }
+}
+$env:HERMES_HOME = $HermesHome
+$env:HERMES_INSTALL_ROOT = 'retained old root'
+$env:HERMES_DESKTOP_HERMES_ROOT = 'retained old root'
+$env:HERMES_DESKTOP_HERMES = 'retained old command'
+$script:Win32 = $false; $script:RawLaunch = $false
+$accepted = Start-DesktopRelaunch
+[Console]::Out.WriteLine((@{
+    accepted = [bool]$accepted; raw_launch = $script:RawLaunch
+    restored_root = $env:HERMES_DESKTOP_HERMES_ROOT
+    restored_command = $env:HERMES_DESKTOP_HERMES
+} | ConvertTo-Json -Compress))
+"""
+
+
+@pytest.mark.platforms('windows')
+@pytest.mark.parametrize('elevated, exit_code, source_checkout', [
+    (False, 0, True), (False, 4, True), (True, 0, True), (False, 0, False),
+])
+def test_source_relaunch_preserves_binding_or_refuses_unsafe_fallback(
+    tmp_path: Path, elevated: bool, exit_code: int, source_checkout: bool,
+) -> None:
+    """Run the production relaunch function and launcher; process discovery is the seam."""
+    home = tmp_path / 'user home'
+    home.mkdir()
+    install = home / 'selected source'
+    launcher = publish_fixture_launcher(install, f'''
+import json, os, sys
+from pathlib import Path
+def main():
+    Path(os.environ['HERMES_HOME'], 'relaunch.json').write_text(json.dumps({{
+        'args': sys.argv[1:],
+        'home': os.environ.get('HERMES_HOME'),
+        'install': os.environ.get('HERMES_INSTALL_ROOT'),
+        'root': os.environ.get('HERMES_DESKTOP_HERMES_ROOT'),
+        'command': os.environ.get('HERMES_DESKTOP_HERMES'),
+    }}), encoding='utf-8')
+    return {exit_code}
+if __name__ == '__main__':
+    sys.exit(main())
+''')
+    exe = install / 'apps' / 'desktop' / 'release' / 'win-unpacked' / 'Hermes.exe'
+    exe.parent.mkdir(parents=True)
+    exe.touch()
+    if source_checkout:
+        (install / 'apps' / 'desktop' / 'package.json').write_text('{}', encoding='utf-8')
+    harness = tmp_path / 'relaunch-harness.ps1'
+    harness.write_text(_RELAUNCH_HARNESS, encoding='utf-8')
+    result = subprocess.run([
+        'powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(harness),
+        '-Script', str(SCRIPT), '-InstallRoot', str(install), '-HermesHome', str(home),
+        '-RelaunchExe', str(exe), '-Elevated', str(elevated),
+    ], capture_output=True, text=True, timeout=90, check=True,
+        env={**os.environ, 'HERMES_RUNTIME_DIR': str(home / 'empty-store')})
+    observed = json.loads(result.stdout)
+    assert observed['accepted'] is (not source_checkout or (not elevated and exit_code == 0))
+    assert observed['raw_launch'] is (not source_checkout)
+    assert observed['restored_root'] == 'retained old root'
+    assert observed['restored_command'] == 'retained old command'
+    receipt = home / 'relaunch.json'
+    if elevated or not source_checkout:
+        assert not receipt.exists()
+    else:
+        child = json.loads(receipt.read_text(encoding='utf-8'))
+        assert child == {
+            'args': ['desktop', '--skip-build', '--hermes-root', str(install)],
+            'home': str(home), 'install': str(install), 'root': str(install),
+            'command': str(launcher),
+        }
+
+
 @pytest.mark.platforms('windows')
 def test_claim_is_the_first_action_and_writes_a_v2_body(tmp_path: Path) -> None:
     pid, code, out = _run(tmp_path, '-SelfTestMarker', '-NoMarkerCleanup')

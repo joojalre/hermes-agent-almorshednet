@@ -742,6 +742,72 @@ function Wait-DesktopExit([int]$Seconds) {
     return -not (Test-DesktopAlive)
 }
 
+function Test-DesktopRelaunchElevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal $identity
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Start-SourceDesktopRelaunch {
+    # WMI and Explorer do not inherit this hand-off's source overrides. The
+    # installation CLI supplies those overrides and detaches Electron itself.
+    if (Test-DesktopRelaunchElevated) {
+        Write-HandoffLog 'WARNING: source Desktop needs a non-elevated manual launch'
+        return $false
+    }
+    $launcher = @('hermes.exe', 'hermes.cmd') | ForEach-Object {
+        Join-Path $InstallRoot ".hermes\bin\$_"
+    } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $launcher) {
+        Write-HandoffLog 'WARNING: source Desktop installation launcher is missing'
+        return $false
+    }
+    $saved = @{}
+    $binding = @{
+        HERMES_HOME = $HermesHome; HERMES_INSTALL_ROOT = $InstallRoot
+        HERMES_DESKTOP_HERMES_ROOT = $InstallRoot; HERMES_DESKTOP_HERMES = $launcher
+    }
+    try {
+        foreach ($name in $binding.Keys) {
+            $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+            [Environment]::SetEnvironmentVariable($name, $binding[$name], 'Process')
+        }
+        if (-not (Get-Command Invoke-HermesProbe -ErrorAction SilentlyContinue)) {
+            . (Join-Path $PSScriptRoot 'runtime.ps1')
+        }
+        $before = @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { $_.ProcessId })
+        $started = [DateTime]::UtcNow
+        $probe = Invoke-HermesProbe $launcher @('desktop', '--skip-build', '--hermes-root', $InstallRoot)
+        if ($probe.TimedOut -or $probe.Code) {
+            Write-HandoffLog 'WARNING: source Desktop launch failed; refusing an unbound executable fallback'
+            return $false
+        }
+        $deadline = (Get-Date).AddSeconds(15)
+        do {
+            $fresh = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+                $before -notcontains $_.ProcessId -and $_.CreationDate -and
+                $_.CreationDate.ToUniversalTime() -ge $started -and
+                [string]::Equals($_.ExecutablePath, $RelaunchExe, [StringComparison]::OrdinalIgnoreCase)
+            })
+            if ($fresh.Count) {
+                Write-HandoffLog "desktop relaunched with installation binding (pid $($fresh[0].ProcessId))"
+                return $true
+            }
+            Start-Sleep -Milliseconds 400
+            if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
+        } while ((Get-Date) -lt $deadline)
+        Write-HandoffLog 'WARNING: source launch did not produce the expected Desktop executable'
+        return $false
+    } catch {
+        Write-HandoffLog "WARNING: source Desktop relaunch failed: $($_.Exception.Message)"
+        return $false
+    } finally {
+        foreach ($name in $saved.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process')
+        }
+    }
+}
+
 function Start-DesktopRelaunch {
     # Returns $true only when a launch VERIFIABLY happened (WMI accepted and
     # the pid exists, or the fallback spawn returned a live process). The
@@ -761,6 +827,10 @@ function Start-DesktopRelaunch {
         if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
     }
     Write-HandoffLog "relaunching desktop: $RelaunchExe"
+    if ((Test-Path -LiteralPath (Join-Path $InstallRoot 'hermes_cli/main.py') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $InstallRoot 'apps/desktop/package.json') -PathType Leaf)) {
+        return Start-SourceDesktopRelaunch
+    }
     # DO NOT spawn Hermes.exe as our child: Electron/Chromium calls
     # AttachConsole(ATTACH_PARENT_PROCESS) at boot, so a Desktop launched
     # directly from this console PowerShell latches onto OUR console --
