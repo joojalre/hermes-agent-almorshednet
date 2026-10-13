@@ -730,7 +730,10 @@ def _profile_verdict(c: _Ctx) -> Optional[Verdict]:
         return None
     try:
         from providers import get_provider_profile
-        hook = getattr(get_provider_profile(c.provider_slug), "classify_api_error", None)
+        profile = get_provider_profile(c.provider_slug)
+        if profile is None and c.provider_slug.endswith("-oauth"):
+            profile = get_provider_profile(c.provider_slug.removesuffix("-oauth"))
+        hook = getattr(profile, "classify_api_error", None)
         if not callable(hook):
             return None
         result = hook(c.error, status_code=c.status_code, error_code=c.error_code, message=c.msg,
