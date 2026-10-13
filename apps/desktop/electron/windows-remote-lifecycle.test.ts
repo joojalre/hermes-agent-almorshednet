@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback, spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
@@ -76,7 +76,17 @@ test.runIf(process.platform === 'win32')(
   async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'hermes-win-marker-'))
     const marker = path.join(root, '.hermes-update-in-progress')
-    const run = (command: string) => promisify(execCallback)(command, { timeout: 30_000 })
+    const run = (command: string, options: SshExecOptions = {}) => {
+      // Exercise the generated PowerShell program directly: a local cmd.exe wrapper
+      // adds an unrelated 8191-character limit to this marker-state fixture.
+      const invocation = command.match(/^powershell\.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -(EncodedCommand|Command) (.+)$/)
+      assert.ok(invocation, 'expected the production PowerShell invocation')
+      const child = promisify(execFile)('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', `-${invocation[1]}`, invocation[2]
+      ], { timeout: 30_000 })
+      child.child.stdin?.end(options.stdinData)
+      return child
+    }
     const command = atomicWindowsSpawnCommand({ hermesHome: root, python: path.join(root, 'missing-python.exe') })
 
     // An updater: hold <marker>.lock sharing nothing (marker.ps1 Open-MarkerLock),
@@ -113,7 +123,7 @@ test.runIf(process.platform === 'win32')(
       updater.kill()
       await new Promise(resolve => updater.once('exit', resolve))
       await assertWindowsRemoteInstallUpdateClear(
-        sshWith(async (probe: string) => (await run(probe)).stdout),
+        sshWith(async (probe: string, options: SshExecOptions) => (await run(probe, options)).stdout),
         root
       )
       // The dead claim is deleted inside the hold; the missing python then fails the spawn itself.
