@@ -101,6 +101,7 @@ def test_screen_started_or_stopped_by_another_process_is_broadcast_as_status(tmp
     """A start/stop made by the CLI or gateway process must reach an open Desktop: the portal's
     status was otherwise one-shot (fetched once, then only lease events)."""
     from tui_gateway import server
+    from hermes_constants import hermes_home_key
 
     home = tmp_path / "home"
     (home / "bot-desktop").mkdir(parents=True)
@@ -113,7 +114,7 @@ def test_screen_started_or_stopped_by_another_process_is_broadcast_as_status(tmp
     (home / "bot-desktop" / "env").write_text("DISPLAY=:77\n", encoding="utf-8")
     server._poll_runtime_files()
     statuses = [p for e, p in events if e == "display.status"]
-    assert statuses and statuses[-1]["profile_key"] == str(home)
+    assert statuses and statuses[-1]["profile_key"] == hermes_home_key(home)
 
     (home / "bot-desktop" / "env").unlink()  # stop() from the other process
     server._poll_runtime_files()
