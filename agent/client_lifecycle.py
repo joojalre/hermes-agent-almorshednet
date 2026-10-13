@@ -960,6 +960,9 @@ class ClientLifecycleMixin:
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
 
+        from agent.agent_init import _apply_xai_oauth_proxy_header_policy
+        _apply_xai_oauth_proxy_header_policy(self, self._client_kwargs, base_url)
+
     def _apply_user_default_headers(self) -> None:
         """Merge config ``model.default_headers`` onto the OpenAI client (user wins; WAFs rejecting SDK headers).
         Delegates to ``agent.auxiliary_client`` so main and aux clients cannot drift. No-op for Anthropic/Bedrock."""

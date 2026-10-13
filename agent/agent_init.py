@@ -816,6 +816,11 @@ def _init_bedrock_client(agent, base_url):
 def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> dict[str, Any]:
     """OpenAI-client kwargs from explicit CLI/gateway credentials (auth already resolved)."""
     _parsed_url = urlparse(base_url)
+    from tools.xai_http import is_xai_oauth_proxy_url
+
+    if (agent.provider == "xai-oauth" and _parsed_url.hostname == "cli-chat-proxy.grok.com"
+            and not is_xai_oauth_proxy_url(base_url)):
+        raise ValueError("xAI OAuth proxy requires its canonical HTTPS /v1 URL")
     client_kwargs = {"api_key": api_key, "base_url": base_url}
     if _parsed_url.query:
         client_kwargs["base_url"] = urlunparse(_parsed_url._replace(query=""))
@@ -953,6 +958,19 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     )
 
 
+def _apply_xai_oauth_proxy_header_policy(agent, client_kwargs: dict[str, Any], base_url: str = "") -> None:
+    """Keep proxy session defaults free of stale model/identity headers across rebuilds."""
+    from tools.xai_http import hermes_xai_default_headers, is_xai_oauth_proxy_url, xai_oauth_proxy_headers
+
+    base_url = base_url or client_kwargs.get("base_url", "")
+    if agent.provider == "xai-oauth" and is_xai_oauth_proxy_url(base_url):
+        headers = {k: v for k, v in (client_kwargs.get("default_headers") or {}).items()
+                   if k.lower() != "user-agent"}
+        headers.update(hermes_xai_default_headers())
+        client_kwargs["default_headers"] = xai_oauth_proxy_headers(
+            base_url, provider=agent.provider, headers=headers)
+
+
 def _apply_openai_header_policy(agent, client_kwargs: dict[str, Any]) -> None:
     """Mutate ``client_kwargs`` (== ``agent._client_kwargs``) with header/TLS policy, in order:
     OpenRouter Claude beta header → model.default_headers → custom-provider TLS/extra_headers."""
@@ -983,6 +1001,8 @@ def _apply_openai_header_policy(agent, client_kwargs: dict[str, Any]) -> None:
         apply_custom_provider_extra_headers_to_client_kwargs(client_kwargs, _cp_base_url, _cp_entries)
     except Exception:
         logger.debug("custom-provider TLS resolution skipped", exc_info=True)
+
+    _apply_xai_oauth_proxy_header_policy(agent, client_kwargs)
 
 
 def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_timeout):

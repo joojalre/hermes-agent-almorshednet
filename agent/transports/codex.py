@@ -874,6 +874,12 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs["extra_body"].setdefault("prompt_cache_key", kwargs.get("prompt_cache_key", cache_key))
 
         _bound_prompt_cache_key_field(kwargs.get("extra_body"))
+        from tools.xai_http import is_xai_oauth_proxy_url, xai_oauth_proxy_headers
+
+        if params.get("provider") == "xai-oauth" and is_xai_oauth_proxy_url(params.get("base_url")):
+            kwargs["extra_headers"] = xai_oauth_proxy_headers(
+                params["base_url"], provider="xai-oauth", model=kwargs["model"],
+                headers=kwargs.get("extra_headers"))
         return kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

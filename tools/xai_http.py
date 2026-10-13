@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
@@ -61,6 +62,31 @@ def hermes_xai_user_agent() -> str:
 def hermes_xai_default_headers() -> dict[str, str]:
     """Default headers for OpenAI-SDK and raw HTTP clients talking to xAI (replaces the SDK User-Agent)."""
     return {"User-Agent": hermes_xai_user_agent()}
+
+
+def is_xai_oauth_proxy_url(base_url: str) -> bool:
+    """Recognize only the canonical production OAuth inference origin and API root."""
+    value = str(base_url or "").strip()
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return (parsed.scheme == "https" and parsed.netloc.lower() == "cli-chat-proxy.grok.com"
+            and parsed.path in {"/v1", "/v1/"} and "?" not in value and "#" not in value)
+
+
+def xai_oauth_proxy_headers(base_url: str, *, provider: str, model: Optional[str] = None,
+                            headers: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Merge documented session headers only for the explicit OAuth proxy route."""
+    result = dict(headers or {})
+    if provider != "xai-oauth" or not is_xai_oauth_proxy_url(base_url):
+        return result
+    protected = {"x-xai-token-auth", "x-grok-model-override"}
+    result = {key: value for key, value in result.items() if key.lower() not in protected}
+    result["X-XAI-Token-Auth"] = "xai-grok-cli"
+    if model:
+        result["x-grok-model-override"] = model
+    return result
 
 
 _TRUE_WORDS = {"1", "true", "yes", "on", "enabled"}

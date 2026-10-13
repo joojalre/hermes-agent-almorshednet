@@ -1412,9 +1412,13 @@ class _CodexCompletionsAdapter:
         model = kwargs.get("model", self._model)
         wire_model = _wire_model_identity(model)
         host = str(getattr(self._client, "base_url", "") or "")
+        from tools.xai_http import is_xai_oauth_proxy_url, xai_oauth_proxy_headers
+
+        provider = getattr(self._client, "_hermes_aux_effective_provider", None)
         is_copilot = base_url_host_matches(host, "githubcopilot.com")
         # Same route classifier as the main transport, so the issuer stamp matches what it minted.
-        route = classify_responses_route(SimpleNamespace(provider=None, base_url=host))
+        route_provider = provider if provider == "xai-oauth" and is_xai_oauth_proxy_url(host) else None
+        route = classify_responses_route(SimpleNamespace(provider=route_provider, base_url=host))
         is_xai = route.is_xai_responses
         is_github = route.is_github_responses
         tools = kwargs.get("tools")
@@ -1544,6 +1548,9 @@ class _CodexCompletionsAdapter:
         # Last, like the main transport: caller extra_body must not put a rejected Astra field back.
         from agent.transports.codex import _sanitize_astra_request_kwargs
         _sanitize_astra_request_kwargs(resp_kwargs, model, host)
+        if provider == "xai-oauth" and is_xai_oauth_proxy_url(host):
+            resp_kwargs["extra_headers"] = xai_oauth_proxy_headers(
+                host, provider=provider, model=wire_model, headers=resp_kwargs.get("extra_headers"))
         return resp_kwargs, model, timeout
 
     def create(self, **kwargs) -> Any:
@@ -2946,10 +2953,12 @@ def _build_xai_oauth_aux_client(model: str) -> tuple[Optional[Any], Optional[str
         return None, None
     api_key, base_url = resolved
     logger.debug("Auxiliary client: xAI OAuth (%s via Responses API)", model)
-    from tools.xai_http import hermes_xai_default_headers
+    from tools.xai_http import hermes_xai_default_headers, xai_oauth_proxy_headers
     real_client = _create_openai_client(
-        api_key=api_key, base_url=base_url, default_headers=hermes_xai_default_headers()
+        api_key=api_key, base_url=base_url, default_headers=xai_oauth_proxy_headers(
+            base_url, provider="xai-oauth", headers=hermes_xai_default_headers())
     )
+    real_client._hermes_aux_effective_provider = "xai-oauth"
     return CodexAuxiliaryClient(real_client, model), model
 
 
@@ -3654,6 +3663,7 @@ _POOL_PROVIDER_BY_HOST = (
     ("chatgpt.com", "openai-codex"), ("openrouter.ai", "openrouter"),
     ("inference-api.nousresearch.com", "nous"), ("api.anthropic.com", "anthropic"),
     ("githubcopilot.com", "copilot"), ("api.kimi.com", "kimi-coding"), ("api.x.ai", "xai-oauth"),
+    ("cli-chat-proxy.grok.com", "xai-oauth"),
 )
 _AUTH_REFRESH_PROVIDER_BY_HOST = (
     ("api.githubcopilot.com", "copilot"), ("chatgpt.com", "openai-codex"),
@@ -3661,13 +3671,18 @@ _AUTH_REFRESH_PROVIDER_BY_HOST = (
     # An aux call that inherits the main xai-oauth route arrives as "auto"; without this row the
     # 403 bad-credentials rung skipped the refresh and benched the only grant (#84845).
     ("api.x.ai", "xai-oauth"),
+    ("cli-chat-proxy.grok.com", "xai-oauth"),
 )
 
 
 def _provider_for_host(base_url: str, table: tuple[tuple[str, str], ...]) -> Optional[str]:
     """First provider in ``table`` whose host matches ``base_url``, else None."""
+    from tools.xai_http import is_xai_oauth_proxy_url
+
     for host, provider in table:
-        if base_url_host_matches(base_url, host):
+        matches = (is_xai_oauth_proxy_url(base_url) if host == "cli-chat-proxy.grok.com"
+                   else base_url_host_matches(base_url, host))
+        if matches:
             return provider
     return None
 
@@ -5005,6 +5020,11 @@ def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
     if routed_client is not None and effective_provider:
         try:
             routed_client._hermes_aux_effective_provider = effective_provider
+            from tools.xai_http import is_xai_oauth_proxy_url
+
+            if (effective_provider == "xai-oauth" and isinstance(routed_client, CodexAuxiliaryClient)
+                    and is_xai_oauth_proxy_url(str(routed_client._real_client.base_url))):
+                routed_client._real_client._hermes_aux_effective_provider = effective_provider
         except (AttributeError, TypeError):
             logger.debug("Auxiliary client %s cannot retain effective provider %s",
                          type(routed_client).__name__, effective_provider)

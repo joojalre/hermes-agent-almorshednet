@@ -233,13 +233,17 @@ def _xai_validate_oauth_endpoint(url: str, *, field: str) -> str:
 
 
 def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
-    """Pin the OAuth inference base_url to ``*.x.ai``; warn and use *fallback* on rejection.
+    """Pin inference to ``*.x.ai`` or the canonical CLI proxy; reject other origins.
 
     Warn-not-raise: a bad env var must not deadlock auth, but the bearer must never leak elsewhere.
     """
     candidate = (value or "").strip().rstrip("/")
     if not candidate:
         return fallback
+    from tools.xai_http import is_xai_oauth_proxy_url
+
+    if is_xai_oauth_proxy_url((value or "").strip()):
+        return candidate
     try:
         problem, host = _xai_url_problem(candidate)
     except Exception:
@@ -258,7 +262,7 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
     else:
         logger.warning(
             "Refusing xAI base_url override %r — host %r is not on the xAI origin "
-            "(expected x.ai or a *.x.ai subdomain). The xai-oauth bearer is only "
+            "(expected x.ai, a *.x.ai subdomain, or the canonical CLI proxy). The xai-oauth bearer is only "
             "valid against xAI's inference API; sending it elsewhere would leak "
             "the credential. Falling back to %s.",
             candidate, host, fallback,

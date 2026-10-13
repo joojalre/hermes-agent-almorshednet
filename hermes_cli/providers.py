@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_cli.auth_constants import DEFAULT_XAI_OAUTH_BASE_URL
 from utils import base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ HERMES_OVERLAYS: dict[str, HermesOverlay] = {
     "openai-api": HermesOverlay(transport="codex_responses", base_url_override="https://api.openai.com/v1",
                                 base_url_env_var="OPENAI_BASE_URL"),
     "xai-oauth": HermesOverlay(transport="codex_responses", auth_type="oauth_external",
-                               base_url_override="https://api.x.ai/v1", base_url_env_var="XAI_BASE_URL"),
+                               base_url_override=DEFAULT_XAI_OAUTH_BASE_URL, base_url_env_var="XAI_BASE_URL"),
     "qwen-oauth": HermesOverlay(auth_type="oauth_external", base_url_override="https://portal.qwen.ai/v1",
                                 base_url_env_var="HERMES_QWEN_BASE_URL"),
     "lmstudio": HermesOverlay(extra_env_vars=("LM_API_KEY",), base_url_override="http://127.0.0.1:1234/v1",
