@@ -1,23 +1,15 @@
-"""Tests for Gemini legacy Standard-key auth guidance.
+"""Gemini key guidance must distinguish invalid credentials from type rejection.
 
-Google began rejecting unrestricted legacy "Standard" Google Cloud API keys
-on the Gemini API on June 19, 2026 (all Standard keys stop working in
-September 2026). Two wire shapes exist:
-
-- Original: 401 + ``ACCESS_TOKEN_TYPE_UNSUPPORTED`` / "expected OAuth 2 access
-  token". ``gemini_http_error`` must append key-migration guidance.
-- After the September cutoff: 400 ``API_KEY_INVALID`` ("API key not valid")
-  for leftover AIza Standard keys. That shape must get the same guidance
-  when the presented key is still AIza-shaped — otherwise vision/chat just
-  says the key is invalid and hides the real fix. A mistyped Auth (``AQ.``)
-  key must keep the raw invalid-key message.
-
-Port of Kilo-Org/kilocode#12162, adapted to Hermes' GeminiAPIError surface.
+An API_KEY_INVALID 400 and a key prefix do not establish a legacy key type.
+Preserve the native error and offer neutral guidance; explicit 401 type rejection
+retains the existing migration advice.
 """
 from __future__ import annotations
 
 import json
 from unittest.mock import MagicMock
+
+import pytest
 
 from agent.gemini_native_adapter import (
     gemini_http_error,
@@ -72,8 +64,8 @@ class TestIsStandardKeyAuthError:
     def test_oauth_message_requires_401(self):
         assert not is_standard_key_auth_error(400, GOOGLE_AUTH_MESSAGE)
         assert not is_standard_key_auth_error(403, GOOGLE_AUTH_MESSAGE)
-        # The 400 path stays narrowed to API_KEY_INVALID: a generic 400 on an AIza-shaped key
-        # (malformed payload, unknown model) must not claim the key TYPE was rejected.
+        # A generic 400 on an AIza-shaped key (malformed payload, unknown model)
+        # must not claim the key TYPE was rejected either.
         assert not is_standard_key_auth_error(
             400, "Invalid JSON payload received. Unknown name \"x\".", "INVALID_ARGUMENT",
             api_key=_AIZA_STANDARD_KEY,
@@ -85,11 +77,11 @@ class TestIsStandardKeyAuthError:
         assert not is_standard_key_auth_error(401, None)  # type: ignore[arg-type]
 
 
-    def test_400_api_key_invalid_with_aiza_key_is_standard_key(self):
-        assert is_standard_key_auth_error(
+    def test_400_api_key_invalid_with_aiza_key_does_not_prove_standard_key(self):
+        assert not is_standard_key_auth_error(
             400, API_KEY_INVALID_MESSAGE, "API_KEY_INVALID", api_key=_AIZA_STANDARD_KEY
         )
-        assert is_standard_key_auth_error(
+        assert not is_standard_key_auth_error(
             400, API_KEY_INVALID_MESSAGE, api_key=_AIZA_STANDARD_KEY
         )
 
@@ -115,16 +107,32 @@ class TestGeminiHttpErrorGuidance:
         assert err.code == "gemini_unauthorized"
 
 
-    def test_guidance_appended_on_400_api_key_invalid_for_aiza_key(self):
+    @pytest.mark.parametrize("api_key", [_AIZA_STANDARD_KEY, _AQ_AUTH_KEY, ""])
+    def test_400_invalid_key_guidance_is_neutral_and_preserves_native_error(self, api_key):
         body = _google_error_body(
             400, API_KEY_INVALID_MESSAGE, status="INVALID_ARGUMENT",
             reason="API_KEY_INVALID",
         )
-        err = gemini_http_error(_mock_response(400, body), api_key=_AIZA_STANDARD_KEY)
+        err = gemini_http_error(_mock_response(400, body), api_key=api_key)
         text = str(err)
-        assert GUIDANCE_MARKER in text
+        assert GUIDANCE_MARKER not in text
+        assert "all Standard keys stop working" not in text
+        assert API_KEY_INVALID_MESSAGE in text
         assert "aistudio.google.com/api-keys" in text
+        assert "status and restrictions" in text
         assert err.code == "gemini_http_400"
+        assert err.details["reason"] == "API_KEY_INVALID"
+
+    def test_oauth_caller_does_not_receive_api_key_guidance(self):
+        body = _google_error_body(400, API_KEY_INVALID_MESSAGE, reason="API_KEY_INVALID")
+        err = gemini_http_error(_mock_response(400, body), api_key=_AIZA_STANDARD_KEY, key_guidance=False)
+        assert "aistudio.google.com/api-keys" not in str(err)
+        assert API_KEY_INVALID_MESSAGE in str(err)
+
+    def test_unrelated_400_does_not_receive_invalid_key_guidance(self):
+        body = _google_error_body(400, "Invalid JSON payload", status="INVALID_ARGUMENT")
+        err = gemini_http_error(_mock_response(400, body), api_key=_AIZA_STANDARD_KEY)
+        assert "aistudio.google.com/api-keys" not in str(err)
 
 
     def test_400_api_key_invalid_for_auth_key_keeps_raw_message(self):
@@ -163,6 +171,16 @@ class TestSummarizerPreservesGuidance:
         summary = AIAgent._summarize_api_error(err)
         assert GUIDANCE_MARKER in summary
         assert "aistudio.google.com/api-keys" in summary
+
+    def test_invalid_key_guidance_survives_summarizer_without_type_claim(self):
+        from run_agent import AIAgent
+
+        body = _google_error_body(400, API_KEY_INVALID_MESSAGE, reason="API_KEY_INVALID")
+        err = gemini_http_error(_mock_response(400, body), api_key=_AIZA_STANDARD_KEY)
+        summary = AIAgent._summarize_api_error(err)
+        assert API_KEY_INVALID_MESSAGE in summary
+        assert "status and restrictions" in summary
+        assert GUIDANCE_MARKER not in summary
 
 
     def test_free_tier_guidance_survives_summarizer(self):

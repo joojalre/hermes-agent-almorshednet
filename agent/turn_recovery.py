@@ -35,6 +35,7 @@ from agent.turn_failure_copy import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.turn_recovery_codex import _is_codex_token_expired, _recover_stale_codex_reasoning
+from agent.turn_recovery_pool import _recover_with_pool_if_allowed
 from hermes_constants import display_hermes_home
 from utils import base_url_host_matches
 
@@ -660,10 +661,9 @@ def recover_after_classification(
             _vlines(agent, "🔐 Nous paid access verified — refreshed runtime credentials and retrying request...")
             return True, False
 
-    recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-        status_code=status_code, has_retried_429=_retry.has_retried_429,
-        classified_reason=classified.reason, error_context=error_context,
-        billing_unverified=classified.billing_unverified,
+    recovered_with_pool, _retry.has_retried_429 = _recover_with_pool_if_allowed(
+        agent, classified, status_code=status_code,
+        has_retried_429=_retry.has_retried_429, error_context=error_context,
     )
     if recovered_with_pool:
         return True, recovered_with_pool

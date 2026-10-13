@@ -758,9 +758,9 @@ def _record_matches_live_gateway_pid(
         return _record_looks_like_gateway(record)
     if not looks_like_gateway_runtime_command_line(live_cmdline):
         return False
-    if expected_home is not None and _host_gateway_serves_home(pid, expected_home):
-        return True
-    return expected_home is None or _command_line_belongs_to_profile(live_cmdline, expected_home)
+    # Exact-home ownership avoids unnecessary IPC; multiplex claims still use live verification.
+    return (expected_home is None or _command_line_belongs_to_profile(live_cmdline, expected_home)
+            or _host_gateway_serves_home(pid, expected_home))
 
 
 def _record_argv() -> list[str]:

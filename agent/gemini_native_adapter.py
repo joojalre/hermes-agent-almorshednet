@@ -56,6 +56,11 @@ _STANDARD_KEY_GUIDANCE = (
     "delete any leftover Windows/system copy of those variables, and restart. A stale shell key can hide "
     "the .env value. Details: https://ai.google.dev/gemini-api/docs/api-key"
 )
+_INVALID_KEY_GUIDANCE = (
+    "\n\nCheck the selected Gemini API key's status and restrictions in Google AI Studio: "
+    "https://aistudio.google.com/api-keys. Confirm the credential selected for this provider, "
+    "then update it through Hermes setup if needed."
+)
 # Google issues ``AQ.…`` keys for both AI Studio and Vertex express mode; each surface only accepts
 # its own keys, so a 403 usually means the key/host pairing is crossed rather than a bad key (#115306).
 _EXPRESS_KEY_ON_STUDIO_GUIDANCE = (
@@ -229,24 +234,13 @@ def wrong_gemini_surface_guidance(base_url: str, api_key: str, err_status: str) 
 def is_standard_key_auth_error(
     status: int, error_message: str, reason: str = "", *, api_key: str = "",
 ) -> bool:
-    """True when Google rejected a legacy "Standard" (AIza) Cloud key.
+    """True for Google's explicit 401 credential-type rejection.
 
-    Original shape (June 2026): 401 + ``ACCESS_TOKEN_TYPE_UNSUPPORTED`` / "expected OAuth 2
-    access token". After the September 2026 cutoff the same leftover AIza key often comes
-    back as 400 ``API_KEY_INVALID`` ("API key not valid") — attach migration guidance on
-    that 400 only when the presented key is still AIza-shaped, so a mistyped Auth (``AQ.``)
-    key keeps the raw invalid-key message.
+    A 400 API_KEY_INVALID and an AIza prefix cannot establish the rejected key's type.
+    Keep those errors on neutral invalid-key guidance instead of asserting a migration cause.
     """
     msg = (error_message or "").lower()
-    if status == 401 and (reason == "ACCESS_TOKEN_TYPE_UNSUPPORTED" or "expected oauth 2 access token" in msg):
-        return True
-    if (
-        status == 400
-        and (api_key or "").startswith("AIza")
-        and (reason == "API_KEY_INVALID" or "api key not valid" in msg)
-    ):
-        return True
-    return False
+    return status == 401 and (reason == "ACCESS_TOKEN_TYPE_UNSUPPORTED" or "expected oauth 2 access token" in msg)
 
 
 class GeminiAPIError(Exception):
@@ -813,13 +807,13 @@ def gemini_http_error(
         f"Gemini HTTP {status} ({err_status or 'error'}): {err_message}" if err_message
         else f"Gemini returned HTTP {status}: {body_text[:500]}"
     )
-    # Users who bypassed the setup wizard (raw GOOGLE_API_KEY in .env) still need to learn the free
-    # tier cannot sustain an agent session; a legacy "Standard" key gets the real fix (Google's raw
-    # 401 asks for OAuth; after Sept 2026 the same AIza key is often a 400 API_KEY_INVALID).
+    # Guidance must follow the response's evidence: invalid-key 400s do not establish a key type.
     if key_guidance and status == 429 and is_free_tier_quota_error(err_message or body_text):
         message += _FREE_TIER_GUIDANCE
     if key_guidance and is_standard_key_auth_error(status, err_message or body_text, reason, api_key=api_key):
         message += _STANDARD_KEY_GUIDANCE
+    if key_guidance and status == 400 and (reason == "API_KEY_INVALID" or "api key not valid" in err_message.lower()):
+        message += _INVALID_KEY_GUIDANCE
     if key_guidance and status == 403:
         message += wrong_gemini_surface_guidance(base_url, api_key, err_status)
     return GeminiAPIError(
