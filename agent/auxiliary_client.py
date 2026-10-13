@@ -41,6 +41,7 @@ from agent.codex_headers import (
 )
 from agent.codex_runtime import _codex_event_has_content
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
+from tools import xai_http
 
 # `openai.OpenAI` is imported lazily (~240 ms cold); `OpenAI` below is a proxy
 # so in-module calls, `auxiliary_client.OpenAI` reads and
@@ -1412,13 +1413,10 @@ class _CodexCompletionsAdapter:
         model = kwargs.get("model", self._model)
         wire_model = _wire_model_identity(model)
         host = str(getattr(self._client, "base_url", "") or "")
-        from tools.xai_http import is_xai_oauth_proxy_url, xai_oauth_proxy_headers
-
-        provider = getattr(self._client, "_hermes_aux_effective_provider", None)
         is_copilot = base_url_host_matches(host, "githubcopilot.com")
         # Same route classifier as the main transport, so the issuer stamp matches what it minted.
-        route_provider = provider if provider == "xai-oauth" and is_xai_oauth_proxy_url(host) else None
-        route = classify_responses_route(SimpleNamespace(provider=route_provider, base_url=host))
+        route = classify_responses_route(SimpleNamespace(
+            provider=xai_http._xai_oauth_proxy_client_provider(self._client), base_url=host))
         is_xai = route.is_xai_responses
         is_github = route.is_github_responses
         tools = kwargs.get("tools")
@@ -1548,9 +1546,7 @@ class _CodexCompletionsAdapter:
         # Last, like the main transport: caller extra_body must not put a rejected Astra field back.
         from agent.transports.codex import _sanitize_astra_request_kwargs
         _sanitize_astra_request_kwargs(resp_kwargs, model, host)
-        if provider == "xai-oauth" and is_xai_oauth_proxy_url(host):
-            resp_kwargs["extra_headers"] = xai_oauth_proxy_headers(
-                host, provider=provider, model=wire_model, headers=resp_kwargs.get("extra_headers"))
+        xai_http._apply_xai_oauth_proxy_request_headers(resp_kwargs, self._client)
         return resp_kwargs, model, timeout
 
     def create(self, **kwargs) -> Any:
@@ -2938,10 +2934,8 @@ def _try_custom_endpoint() -> tuple[Optional[Any], Optional[str]]:
 
 
 def _build_xai_oauth_aux_client(model: str) -> tuple[Optional[Any], Optional[str]]:
-    """CodexAuxiliaryClient for xAI Grok OAuth (Responses API); (None, None) if not authed.
-
-    Caller must pass an explicit model — a pinned Grok default would rot as xAI's allowlist drifts.
-    """
+    """Build xAI OAuth Responses client; without auth return (None, None).
+    An explicit model avoids a pinned default when xAI's allowlist changes."""
     if not model:
         logger.warning(
             "Auxiliary client: xai-oauth requested without a model; "
@@ -2953,12 +2947,7 @@ def _build_xai_oauth_aux_client(model: str) -> tuple[Optional[Any], Optional[str
         return None, None
     api_key, base_url = resolved
     logger.debug("Auxiliary client: xAI OAuth (%s via Responses API)", model)
-    from tools.xai_http import hermes_xai_default_headers, xai_oauth_proxy_headers
-    real_client = _create_openai_client(
-        api_key=api_key, base_url=base_url, default_headers=xai_oauth_proxy_headers(
-            base_url, provider="xai-oauth", headers=hermes_xai_default_headers())
-    )
-    real_client._hermes_aux_effective_provider = "xai-oauth"
+    real_client = xai_http._create_xai_oauth_proxy_client(_create_openai_client, api_key, base_url)
     return CodexAuxiliaryClient(real_client, model), model
 
 
@@ -3670,19 +3659,14 @@ _AUTH_REFRESH_PROVIDER_BY_HOST = (
     ("api.anthropic.com", "anthropic"), ("inference-api.nousresearch.com", "nous"),
     # An aux call that inherits the main xai-oauth route arrives as "auto"; without this row the
     # 403 bad-credentials rung skipped the refresh and benched the only grant (#84845).
-    ("api.x.ai", "xai-oauth"),
-    ("cli-chat-proxy.grok.com", "xai-oauth"),
+    ("api.x.ai", "xai-oauth"), ("cli-chat-proxy.grok.com", "xai-oauth"),
 )
 
 
 def _provider_for_host(base_url: str, table: tuple[tuple[str, str], ...]) -> Optional[str]:
     """First provider in ``table`` whose host matches ``base_url``, else None."""
-    from tools.xai_http import is_xai_oauth_proxy_url
-
     for host, provider in table:
-        matches = (is_xai_oauth_proxy_url(base_url) if host == "cli-chat-proxy.grok.com"
-                   else base_url_host_matches(base_url, host))
-        if matches:
+        if xai_http._xai_oauth_proxy_host_matches(base_url, host):
             return provider
     return None
 
@@ -5020,11 +5004,8 @@ def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
     if routed_client is not None and effective_provider:
         try:
             routed_client._hermes_aux_effective_provider = effective_provider
-            from tools.xai_http import is_xai_oauth_proxy_url
-
-            if (effective_provider == "xai-oauth" and isinstance(routed_client, CodexAuxiliaryClient)
-                    and is_xai_oauth_proxy_url(str(routed_client._real_client.base_url))):
-                routed_client._real_client._hermes_aux_effective_provider = effective_provider
+            if effective_provider == "xai-oauth" and isinstance(routed_client, CodexAuxiliaryClient):
+                xai_http._tag_xai_oauth_proxy_client(routed_client._real_client, effective_provider)
         except (AttributeError, TypeError):
             logger.debug("Auxiliary client %s cannot retain effective provider %s",
                          type(routed_client).__name__, effective_provider)
@@ -5085,8 +5066,7 @@ def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
 
 
 def _resolve_xai_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
-    """xAI Grok OAuth (device code → Responses API). Without this branch xai-oauth falls to the generic
-    oauth_external arm, returns (None, None), and silently re-routes every aux task to the Step-2 fallback."""
+    """Resolve xAI OAuth through Responses without falling into generic OAuth provider discovery."""
     client, default = _build_xai_oauth_aux_client(req.model)
     return _route_or_warn(req, client, default,
                           "resolve_provider_client: xai-oauth requested but no xAI "

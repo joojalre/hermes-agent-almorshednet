@@ -20,7 +20,7 @@ from contextlib import suppress
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.agent_init_fallback import _fallback_entries, _init_fallback_chain, recompute_init_fallback_api_mode
@@ -44,6 +44,7 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
 from hermes_state_ids import new_session_id
 from utils import base_url_host_matches, is_truthy_value
+from tools import xai_http
 
 # Same logger name as run_agent so caplog/patches on "run_agent" see our records.
 logger = logging.getLogger("run_agent")
@@ -815,16 +816,7 @@ def _init_bedrock_client(agent, base_url):
 
 def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> dict[str, Any]:
     """OpenAI-client kwargs from explicit CLI/gateway credentials (auth already resolved)."""
-    _parsed_url = urlparse(base_url)
-    from tools.xai_http import is_xai_oauth_proxy_url
-
-    if (agent.provider == "xai-oauth" and _parsed_url.hostname == "cli-chat-proxy.grok.com"
-            and not is_xai_oauth_proxy_url(base_url)):
-        raise ValueError("xAI OAuth proxy requires its canonical HTTPS /v1 URL")
-    client_kwargs = {"api_key": api_key, "base_url": base_url}
-    if _parsed_url.query:
-        client_kwargs["base_url"] = urlunparse(_parsed_url._replace(query=""))
-        client_kwargs["default_query"] = {k: v[0] for k, v in parse_qs(_parsed_url.query).items()}
+    client_kwargs = xai_http._explicit_xai_oauth_proxy_client_kwargs(api_key, base_url, agent.provider)
     if _provider_timeout is not None:
         client_kwargs["timeout"] = _provider_timeout
     # ACP/subprocess providers take launch kwargs instead of HTTP credentials. Keyed on the
@@ -958,19 +950,6 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
     )
 
 
-def _apply_xai_oauth_proxy_header_policy(agent, client_kwargs: dict[str, Any], base_url: str = "") -> None:
-    """Keep proxy session defaults free of stale model/identity headers across rebuilds."""
-    from tools.xai_http import hermes_xai_default_headers, is_xai_oauth_proxy_url, xai_oauth_proxy_headers
-
-    base_url = base_url or client_kwargs.get("base_url", "")
-    if agent.provider == "xai-oauth" and is_xai_oauth_proxy_url(base_url):
-        headers = {k: v for k, v in (client_kwargs.get("default_headers") or {}).items()
-                   if k.lower() != "user-agent"}
-        headers.update(hermes_xai_default_headers())
-        client_kwargs["default_headers"] = xai_oauth_proxy_headers(
-            base_url, provider=agent.provider, headers=headers)
-
-
 def _apply_openai_header_policy(agent, client_kwargs: dict[str, Any]) -> None:
     """Mutate ``client_kwargs`` (== ``agent._client_kwargs``) with header/TLS policy, in order:
     OpenRouter Claude beta header → model.default_headers → custom-provider TLS/extra_headers."""
@@ -1002,7 +981,7 @@ def _apply_openai_header_policy(agent, client_kwargs: dict[str, Any]) -> None:
     except Exception:
         logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
-    _apply_xai_oauth_proxy_header_policy(agent, client_kwargs)
+    xai_http._apply_xai_oauth_proxy_default_headers(client_kwargs, agent.provider)
 
 
 def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_timeout):

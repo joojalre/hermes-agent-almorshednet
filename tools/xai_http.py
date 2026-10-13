@@ -7,7 +7,7 @@ import json
 import os
 import uuid
 from typing import Any, Dict, Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlparse, urlsplit, urlunparse
 
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
@@ -87,6 +87,61 @@ def xai_oauth_proxy_headers(base_url: str, *, provider: str, model: Optional[str
     if model:
         result["x-grok-model-override"] = model
     return result
+
+
+def _explicit_xai_oauth_proxy_client_kwargs(api_key: str, base_url: str, provider: str) -> dict:
+    """Preserve explicit SDK query handling while refusing malformed OAuth proxy origins."""
+    parsed = urlparse(base_url)
+    if (provider == "xai-oauth" and parsed.hostname == "cli-chat-proxy.grok.com"
+            and not is_xai_oauth_proxy_url(base_url)):
+        raise ValueError("xAI OAuth proxy requires its canonical HTTPS /v1 URL")
+    kwargs = {"api_key": api_key, "base_url": base_url}
+    if parsed.query:
+        kwargs["base_url"] = urlunparse(parsed._replace(query=""))
+        kwargs["default_query"] = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+    return kwargs
+
+
+def _apply_xai_oauth_proxy_default_headers(client_kwargs: dict, provider: str, base_url: str = "") -> None:
+    """Sanitize only OAuth proxy defaults after user/custom policy, including rebuilds."""
+    base_url = base_url or client_kwargs.get("base_url", "")
+    if provider == "xai-oauth" and is_xai_oauth_proxy_url(base_url):
+        headers = {k: v for k, v in (client_kwargs.get("default_headers") or {}).items()
+                   if k.lower() != "user-agent"}
+        headers.update(hermes_xai_default_headers())
+        client_kwargs["default_headers"] = xai_oauth_proxy_headers(base_url, provider=provider, headers=headers)
+
+
+def _xai_oauth_proxy_client_provider(client) -> Optional[str]:
+    provider = getattr(client, "_hermes_aux_effective_provider", None)
+    return provider if provider == "xai-oauth" and is_xai_oauth_proxy_url(str(getattr(client, "base_url", "") or "")) else None
+
+
+def _apply_xai_oauth_proxy_request_headers(kwargs: dict, client) -> None:
+    provider = getattr(client, "_hermes_aux_effective_provider", None)
+    if provider == "xai-oauth" and is_xai_oauth_proxy_url(base_url := str(getattr(client, "base_url", "") or "")):
+        kwargs["extra_headers"] = xai_oauth_proxy_headers(
+            base_url, provider=provider, model=kwargs["model"], headers=kwargs.get("extra_headers"))
+
+
+def _xai_oauth_proxy_host_matches(base_url: str, host: str) -> bool:
+    from utils import base_url_host_matches
+
+    return (is_xai_oauth_proxy_url(base_url) if host == "cli-chat-proxy.grok.com"
+            else base_url_host_matches(base_url, host))
+
+
+def _create_xai_oauth_proxy_client(create_client, api_key: str, base_url: str):
+    """Construct the resolved OAuth SDK client; credential resolution stays in its caller."""
+    client = create_client(api_key=api_key, base_url=base_url, default_headers=xai_oauth_proxy_headers(
+        base_url, provider="xai-oauth", headers=hermes_xai_default_headers()))
+    client._hermes_aux_effective_provider = "xai-oauth"
+    return client
+
+
+def _tag_xai_oauth_proxy_client(client, provider: str) -> None:
+    if provider == "xai-oauth" and is_xai_oauth_proxy_url(str(client.base_url)):
+        client._hermes_aux_effective_provider = provider
 
 
 _TRUE_WORDS = {"1", "true", "yes", "on", "enabled"}

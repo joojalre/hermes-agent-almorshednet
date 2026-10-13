@@ -960,8 +960,8 @@ class ClientLifecycleMixin:
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
 
-        from agent.agent_init import _apply_xai_oauth_proxy_header_policy
-        _apply_xai_oauth_proxy_header_policy(self, self._client_kwargs, base_url)
+        from tools.xai_http import _apply_xai_oauth_proxy_default_headers
+        _apply_xai_oauth_proxy_default_headers(self._client_kwargs, self.provider, base_url)
 
     def _apply_user_default_headers(self) -> None:
         """Merge config ``model.default_headers`` onto the OpenAI client (user wins; WAFs rejecting SDK headers).
