@@ -1673,7 +1673,6 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     ) == _config_model_target()
     if room_plumbing or (_row_follows_profile(row) and not composer_profile_matches):
         return {}
-    overrides: dict = {}
     model = str(row.get("model") or model_config.get("model") or "").strip()
     # Canonical route reader shared with CLI --resume: nested ``gateway_runtime`` (the route the messaging
     # gateway last ran) before the TUI's top-level keys, then a routable ``billing_provider`` (#125942).
@@ -1701,18 +1700,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             base_url = ""  # the healed identity owns a registered endpoint; the snapshot URL must not override it
         else:
             provider = ""
-    if model:
-        # Same dict-shaped override live /model switches use, so a DB-restored session keeps custom endpoint
-        # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
-        overrides["model_override"] = {
-            "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None}
-    if provider:
-        overrides["provider_override"] = provider
-    if isinstance(reasoning_config, dict):
-        overrides["reasoning_config_override"] = reasoning_config
-    if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
-        overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
-    return overrides
+    from tui_gateway.session_resume_runtime import assemble_runtime_overrides
+    return assemble_runtime_overrides(model, provider, base_url, api_mode, reasoning_config, service_tier)
 
 
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:

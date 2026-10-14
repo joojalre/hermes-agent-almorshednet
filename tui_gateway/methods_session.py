@@ -953,8 +953,8 @@ def _resume_lazy(ctx: _Resume) -> dict:
 def _resume_deferred(ctx: _Resume) -> dict:
     """Bounded ack; the transcript hydrates in the background (the ONE history read) and pages over REST."""
     sid, source, cwd = ctx.mint()
-    with _profile_build_scope(ctx.profile_home):
-        overrides = _stored_session_runtime_overrides(ctx.found)
+    from tui_gateway.session_resume_runtime import resume_runtime_overrides
+    overrides = resume_runtime_overrides(ctx.found, ctx.profile_home)
     record = ctx.record(source, cwd, [], overrides,
                         todo_state=_todo_state_from_db(ctx.db, ctx.target))
     record.update(resume_history_ready=threading.Event(), resume_hydrating=True,
@@ -980,8 +980,8 @@ def _resume_cold(ctx: _Resume) -> dict:
         history, display_history, raw_history = ctx.restore()
     except Exception as e:
         return _err(ctx.rid, 5000, resume_failed_message(e))
-    with _profile_build_scope(ctx.profile_home):
-        overrides = _stored_session_runtime_overrides(ctx.found)
+    from tui_gateway.session_resume_runtime import resume_runtime_overrides
+    overrides = resume_runtime_overrides(ctx.found, ctx.profile_home)
     record = ctx.record(source, cwd, history, overrides, display_history_prefix=ctx.display_prefix(),
                         todo_state=_todo_state_from_history(history))
     if (reused := ctx.claim(sid, record)) is not None:
