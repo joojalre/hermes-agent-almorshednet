@@ -841,6 +841,13 @@ def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     welcome = _nous_welcome_tier(c)
     if welcome is not None:
         return welcome
+    # The private xAI OAuth proxy rejects unsupported clients with HTTP 426.
+    # Retrying or switching providers cannot satisfy that version gate.
+    if c.provider_slug == "xai-oauth" and status == 426:
+        from tools.xai_http import is_xai_oauth_proxy_url
+
+        if is_xai_oauth_proxy_url(c.base_url):
+            return _v(_R.format_error, retryable=False, should_fallback=False)
     # Safety refusal before status classification so a 400 block isn't downgraded
     # to format_error and a status-less block isn't left retryable (#18028).
     if any(p in msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
