@@ -393,7 +393,9 @@ pty = []
 # extra that exposes a Starlette-backed server surface so pip/uv can't resolve
 # a vulnerable pre-1.0.1 transitive. Bump in lockstep with uv.lock.
 #
-# mcp 2.0.0 implements MCP revision 2026-07-28 and moved its own HTTP stack
+# mcp 2.2.0 fixes GHSA-84m7-p3x7-pcfv (stateful Streamable HTTP sessions were
+# never expired, so a reachable endpoint could exhaust server memory).
+# mcp 2.x implements MCP revision 2026-07-28 and moved its own HTTP stack
 # from `httpx` to `httpx2`. httpx2 arrives transitively, but tools/mcp_tool.py
 # and tools/mcp_oauth_manager.py import it by name to build the client objects
 # they hand to the SDK, so it is pinned here explicitly rather than left to
@@ -401,7 +403,7 @@ pty = []
 # unaffected — the two distributions install side by side under different
 # module names.
 mcp = [
-  "mcp==2.0.0",
+  "mcp==2.2.0",
   "httpx2==2.12.0",
   "starlette==1.3.1",
 ] # starlette: CVE-2026-48710
@@ -417,7 +419,7 @@ teams = [
 # Computer use talks to PM's pinned cua-driver over MCP stdio. This extra
 # provides the MCP client, independently of the native driver package.
 computer-use = [
-  "mcp==2.0.0",
+  "mcp==2.2.0",
   "httpx2==2.12.0",
   "starlette==1.3.1",
 ] # starlette: CVE-2026-48710
@@ -542,7 +544,7 @@ dev = [
   "debugpy==1.8.20",
   "pytest==9.1.1",
   "pytest-asyncio==1.3.0",
-  "mcp==2.0.0",
+  "mcp==2.2.0",
   "httpx2==2.12.0",
   "starlette==1.3.1",
   "ty==0.0.82",
