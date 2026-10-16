@@ -23,6 +23,13 @@ def test_fork_owner_attribution_exception_is_narrow() -> None:
     assert "Check for unmapped contributor emails" in workflow
 
 
+def test_canary_release_is_upstream_only() -> None:
+    workflow = yaml.safe_load(_read(".github/workflows/canary-release.yml"))
+    condition = workflow["jobs"]["tag"]["if"]
+    assert "github.repository == 'NousResearch/hermes-agent'" in condition
+    assert "github.ref_name == github.event.repository.default_branch" in condition
+
+
 def test_private_runner_assignments_are_removed_from_the_fork() -> None:
     # Upstream can keep its larger runners; every such assignment must select
     # ordinary hosted capacity when the repository is a fork.
