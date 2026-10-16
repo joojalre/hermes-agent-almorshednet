@@ -190,7 +190,8 @@ def _fake_response(status, url, body):
     resp = MagicMock()
     resp.status_code = status
     resp.request = SimpleNamespace(url=url)
-    # Not a redirect: httpx sets next_request only for one, and mcp >= 2.2 follows it.
+    # Not a redirect, so httpx2 builds no follow-up request; the SDK's
+    # redirect-aware auth flow reads this on every response.
     resp.next_request = None
 
     async def _aread():
